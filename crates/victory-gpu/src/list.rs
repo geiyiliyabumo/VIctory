@@ -748,14 +748,15 @@ unsafe fn valid_discard_region(
 }
 
 #[cfg(any(windows, test))]
-fn discard_state_allowed(state: u32, flags: u32) -> bool {
-    let required_flag = match state {
-        0x4 => 0x1,  // RENDER_TARGET
-        0x10 => 0x2, // DEPTH_WRITE / ALLOW_DEPTH_STENCIL
-        0x8 => 0x4,  // UNORDERED_ACCESS
-        _ => return false,
-    };
-    flags & required_flag != 0
+fn direct_discard_state_allowed(state: u32, flags: u32) -> bool {
+    // All VIctory host lists are DIRECT. An RT or DS texture must be
+    // discarded in its corresponding state even if it also allows UAVs.
+    match flags & 0x3 {
+        0x1 => state == 0x4,                   // ALLOW_RENDER_TARGET / RENDER_TARGET
+        0x2 => state == 0x10,                  // ALLOW_DEPTH_STENCIL / DEPTH_WRITE
+        0 => flags & 0x4 != 0 && state == 0x8, // Existing UAV-only path
+        _ => false,
+    }
 }
 
 extern "system" fn discard_resource(this: This, resource: This, region: *const DiscardRegion) {
@@ -771,7 +772,7 @@ extern "system" fn discard_resource(this: This, resource: This, region: *const D
         };
         // SAFETY: a live host texture.
         let desc = unsafe { copy.texture.GetDesc() };
-        if !discard_state_allowed(state, desc.Flags.0 as u32) || !region.is_aligned() {
+        if !direct_discard_state_allowed(state, desc.Flags.0 as u32) || !region.is_aligned() {
             return;
         }
         // SAFETY: the title passes a discard region or null.
@@ -1630,13 +1631,15 @@ mod tests {
     #[test]
     fn discard_requires_matching_state_and_flags() {
         for (state, flag) in [(0x4, 1), (0x10, 2), (0x8, 4)] {
-            assert!(discard_state_allowed(state, flag));
-            assert!(discard_state_allowed(state, flag | 0x20)); // simultaneous access
-            assert!(!discard_state_allowed(state, 0x7 ^ flag));
-            assert!(!discard_state_allowed(state | 0x80, flag));
+            assert!(direct_discard_state_allowed(state, flag));
+            assert!(direct_discard_state_allowed(state, flag | 0x20)); // simultaneous access
+            assert!(!direct_discard_state_allowed(state, 0x7 ^ flag));
+            assert!(!direct_discard_state_allowed(state | 0x80, flag));
         }
+        assert!(direct_discard_state_allowed(0x4, 0x5));
+        assert!(!direct_discard_state_allowed(0x8, 0x5));
         for state in [0, 0x400, 0x80] {
-            assert!(!discard_state_allowed(state, 0x7));
+            assert!(!direct_discard_state_allowed(state, 0x7));
         }
     }
 
