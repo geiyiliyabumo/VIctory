@@ -1153,8 +1153,8 @@ struct Hosted {
     /// The state and clear value the title created the texture with.
     state: u32,
     clear: Option<[u32; 5]>,
-    /// When the host copy was last asked for (`crate::host::moment`),
-    /// written under `made`'s lock.
+    /// When the host copy or an installed view was last asked for
+    /// (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// The host refused to make it: not tried again.
     refused: std::sync::atomic::AtomicBool,
@@ -1339,6 +1339,16 @@ pub(crate) fn title_fills(this: This) -> bool {
     !this.is_null() && fills(&resource(this).desc)
 }
 
+/// Marks a filled texture used while its current descriptor is locked.
+#[cfg(windows)]
+pub(crate) fn use_descriptor(this: This) {
+    if title_fills(this) {
+        let host = &resource(this).host;
+        let _made = host.made.lock().unwrap_or_else(|e| e.into_inner());
+        host.used.store(crate::host::moment(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Whether `this` is a texture whose host copy is not made yet (and may
 /// still be): a descriptor slot written with a view of it waits
 /// (`crate::descriptor::make_waiting`).
@@ -1357,15 +1367,39 @@ pub(crate) fn host_waits(this: This) -> bool {
 /// `make` says so. `None` for buffers and for textures the host refuses.
 #[cfg(windows)]
 fn hosted(this: This, make: bool) -> Option<Made> {
+    try_hosted(this, make).ok().flatten()
+}
+
+/// Reports a temporary admission failure separately so descriptor mirrors can retry.
+#[cfg(windows)]
+fn try_hosted(this: This, make: bool) -> Result<Option<Made>, ()> {
     use std::sync::atomic::Ordering::Relaxed;
     let r = resource(this);
     if r.desc.dimension == BUFFER {
-        return None;
+        return Ok(None);
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     if made.is_none() {
         if !make || r.host.refused.load(Relaxed) {
-            return None;
+            return Ok(None);
+        }
+        let filled = fills(&r.desc);
+        // Each admission sees the preceding allocation before making its own.
+        static FILLED_ALLOCATIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let admission = (filled && explicit_texture_budget().is_none())
+            .then(|| FILLED_ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner()));
+        if admission.is_some()
+            && emergency_vram_redline(crate::host::host().and_then(|h| h.video_memory()))
+        {
+            static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let skipped = SKIPPED.fetch_add(1, Relaxed) + 1;
+            if skipped.is_power_of_two() {
+                tracing::warn!(
+                    skipped,
+                    "VRAM redline reached; skipping new filled texture copy until sweep frees room"
+                );
+            }
+            return Err(());
         }
         let clear = r
             .host
@@ -1374,8 +1408,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
         let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
             r.host.refused.store(true, Relaxed);
-            return None;
+            return Ok(None);
         };
+        drop(admission);
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
@@ -1390,7 +1425,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = HostTexture::new(texture, state);
-        host.filled = fills(&r.desc);
+        host.filled = filled;
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
@@ -1406,7 +1441,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         crate::descriptor::texture_made(this as usize);
     }
     r.host.used.store(crate::host::moment(), Relaxed);
-    made.clone()
+    Ok(made.clone())
 }
 
 /// The host copy of title texture `this` if it is made, without making it
@@ -1437,10 +1472,17 @@ fn texture_floor_bytes(video_memory: Option<[u64; 4]>) -> u64 {
 fn adaptive_texture_cap(video_memory: Option<[u64; 4]>) -> Option<u64> {
     match video_memory {
         Some([budget, ..]) if budget > 0 && budget < (9 << 30) => {
-            Some((budget * 38 / 100).clamp(1536 << 20, 2560 << 20))
+            Some((budget * 34 / 100).clamp(1280 << 20, 2176 << 20))
         }
         _ => None,
     }
+}
+
+#[cfg(any(windows, test))]
+fn emergency_vram_redline(video_memory: Option<[u64; 4]>) -> bool {
+    video_memory.is_some_and(|[budget, used, ..]| {
+        budget > 0 && budget < (9 << 30) && used >= budget * 96 / 100
+    })
 }
 
 #[cfg(any(windows, test))]
@@ -1472,8 +1514,8 @@ fn vram_reclaim_target(
         return texture_target(limit);
     }
     let budget_target = match video_memory {
-        Some([budget, used, ..]) if budget > 0 && used >= percent(budget, 85) => {
-            used.saturating_sub(percent(budget, 78)).max(256 << 20)
+        Some([budget, used, ..]) if budget > 0 && used >= percent(budget, 80) => {
+            used.saturating_sub(percent(budget, 72)).max(256 << 20)
         }
         _ => 0,
     };
@@ -1492,6 +1534,103 @@ fn explicit_texture_budget() -> Option<u64> {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
         mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
     })
+}
+
+#[cfg(windows)]
+fn texture_sweep_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0"))
+}
+
+/// Bytes to reclaim from idle filled textures before admitting more copies.
+#[cfg(windows)]
+pub(crate) fn vram_reclaim_needed() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !texture_sweep_enabled() {
+        return 0;
+    }
+    let vm = crate::host::host().and_then(|h| h.video_memory());
+    vram_reclaim_target(vm, KINDS[1].load(Relaxed), explicit_texture_budget())
+}
+
+/// Keeps the title resources alive between the resource and descriptor scans.
+/// The raw host identities are only used as keys, never dereferenced.
+#[cfg(windows)]
+#[derive(Default)]
+pub(crate) struct EvictableFilledResources(std::collections::HashMap<usize, ResourceRef>);
+
+#[cfg(windows)]
+impl EvictableFilledResources {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Recheck under the same lock as `hosted`: a recording thread may have
+    /// used the texture since the sweep selected it.
+    pub(crate) fn with_idle_copy(&self, raw: usize, unpin: &mut dyn FnMut()) {
+        use windows::core::Interface;
+        let Some(title) = self.0.get(&raw) else { return };
+        let r = resource(title.as_ptr());
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if made.as_ref().is_some_and(|(host, _)| {
+            host.texture.as_raw() as usize == raw
+                && idle_for_unpin(r, host)
+                && !crate::texture::host_wrote(title.0)
+        }) {
+            unpin();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn idle_for_unpin(r: &Resource, host: &std::sync::Arc<HostTexture>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    crate::host::long_ago(r.host.used.load(Relaxed), 500, 2)
+        && std::sync::Arc::strong_count(host) == 1
+}
+
+/// Select the oldest descriptor-pinned filled textures first.
+#[cfg(windows)]
+pub(crate) fn evictable_filled_resources(target_bytes: u64) -> EvictableFilledResources {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    let mut targets = EvictableFilledResources::default();
+    if target_bytes == 0 {
+        return targets;
+    }
+    let all = textures();
+    let mut candidates = Vec::new();
+    for &at in all.iter() {
+        // SAFETY: the registry lock excludes destruction.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((host, _)) = made.as_ref()
+            && idle_for_unpin(r, host)
+            && crate::host::references(&host.texture) > 1
+        {
+            candidates.push((
+                r.host.used.load(Relaxed),
+                at,
+                host.texture.as_raw() as usize,
+                host.bytes,
+            ));
+        }
+    }
+    candidates.sort_unstable_by_key(|&(last_used, at, ..)| (last_used, at));
+    let mut bytes = 0u64;
+    for (_, at, raw, size) in candidates {
+        if object::try_add_ref(at as This) {
+            targets.0.insert(raw, ResourceRef(at));
+            bytes = bytes.saturating_add(size);
+            if bytes >= target_bytes {
+                break;
+            }
+        }
+    }
+    targets
 }
 
 /// Whether more host copies of textures the title fills may be made for
@@ -1768,8 +1907,9 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
 ///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for the idle time and four frames, or for
-///   200 ms and one frame during pressure-driven eviction.
+/// - nothing asked for it for the idle time and four frames, for 500 ms
+///   and two frames when selected for unpinning, or for 200 ms and one
+///   frame during pressure-driven eviction.
 ///
 /// The next use makes the host copy anew and uploads the title's memory
 /// again (its staging state goes with it). The title resource stays: its
@@ -1781,13 +1921,13 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
-pub(crate) fn let_go_idle() {
+pub(crate) fn let_go_idle(targets: &EvictableFilledResources) {
     use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
     const IDLE_FRAMES: u64 = 4;
     const LRU_MS: u64 = 200;
     const LRU_FRAMES: u64 = 1;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+    if !texture_sweep_enabled() {
         return;
     }
     let vm = crate::host::host().and_then(|h| h.video_memory());
@@ -1808,7 +1948,9 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                (crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                    || (targets.0.contains_key(&(host.texture.as_raw() as usize))
+                        && idle_for_unpin(r, host)))
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -2052,6 +2194,15 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     hosted(this, true).map(|made| made.0)
+}
+
+/// A descriptor holds the copy while it creates and pins its view.
+#[cfg(windows)]
+pub(crate) fn descriptor_copy(this: This) -> Result<Option<std::sync::Arc<HostTexture>>, ()> {
+    if this.is_null() {
+        return Ok(None);
+    }
+    try_hosted(this, true).map(|made| made.map(|(host, _)| host))
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -2921,17 +3072,29 @@ mod tests {
     #[test]
     fn adaptive_texture_cap_scales_with_budget() {
         let gib = 1 << 30;
-        let measured_budget = 617 * gib / 100;
+        let measured_budget = 6298 << 20;
         assert_eq!(adaptive_texture_cap(None), None);
         assert_eq!(adaptive_texture_cap(Some([0; 4])), None);
-        assert_eq!(adaptive_texture_cap(Some([gib, 0, 0, 0])), Some(1536 << 20));
+        assert_eq!(adaptive_texture_cap(Some([gib, 0, 0, 0])), Some(1280 << 20));
         assert_eq!(
             adaptive_texture_cap(Some([measured_budget, 0, 0, 0])),
-            Some(measured_budget * 38 / 100)
+            Some(measured_budget * 34 / 100)
         );
-        assert_eq!(adaptive_texture_cap(Some([73 * gib / 10, 0, 0, 0])), Some(2560 << 20));
+        assert_eq!(adaptive_texture_cap(Some([73 * gib / 10, 0, 0, 0])), Some(2176 << 20));
         assert_eq!(adaptive_texture_cap(Some([9 * gib, 0, 0, 0])), None);
         assert_eq!(adaptive_texture_cap(Some([24 * gib, 0, 0, 0])), None);
+    }
+
+    #[test]
+    fn emergency_vram_redline_starts_at_96_percent_of_small_budgets() {
+        let budget = 6298 << 20;
+        let redline = budget * 96 / 100;
+        assert!(!emergency_vram_redline(None));
+        assert!(!emergency_vram_redline(Some([0, redline, 0, 0])));
+        assert!(!emergency_vram_redline(Some([budget, redline - 1, 0, u64::MAX])));
+        assert!(emergency_vram_redline(Some([budget, redline, 0, 0])));
+        assert!(emergency_vram_redline(Some([budget, budget, 0, 0])));
+        assert!(!emergency_vram_redline(Some([9 << 30, 9 << 30, 0, 0])));
     }
 
     #[test]
@@ -2951,28 +3114,28 @@ mod tests {
         let mib = 1 << 20;
         let budget = 6000 * mib;
         let vm = Some([budget, 4600 * mib, 0, 0]);
-        let cap = 2280 * mib;
-        let threshold = 2052 * mib;
+        let cap = 2040 * mib;
+        let threshold = 1836 * mib;
         assert_eq!(vram_reclaim_target(vm, threshold - 1, None), 0);
-        assert_eq!(vram_reclaim_target(vm, threshold, None), 228 * mib);
+        assert_eq!(vram_reclaim_target(vm, threshold, None), 204 * mib);
         assert_eq!(vram_reclaim_target(vm, threshold, Some(0)), 0);
         assert_eq!(vram_reclaim_target(vm, threshold, Some(3000 * mib)), 0);
-        assert_eq!(vram_reclaim_target(Some([budget, 5100 * mib, 0, 0]), cap, None), 456 * mib);
+        assert_eq!(vram_reclaim_target(Some([budget, 4800 * mib, 0, 0]), cap, None), 480 * mib);
     }
 
     #[test]
     fn vram_reclaim_target_responds_to_pressure() {
         let mib = 1 << 20;
         let budget = 6000 * mib;
-        let at_pressure = Some([budget, 5100 * mib, 0, 0]);
-        assert_eq!(vram_reclaim_target(Some([budget, 5100 * mib - 1, 0, 0]), 0, None), 0);
-        assert_eq!(vram_reclaim_target(at_pressure, 0, None), 420 * mib);
-        assert_eq!(vram_reclaim_target(Some([budget, 6500 * mib, 0, 0]), 0, None), 1820 * mib);
-        assert_eq!(vram_reclaim_target(Some([1000 * mib, 850 * mib, 0, 0]), 0, None), 256 * mib);
+        let at_pressure = Some([budget, 4800 * mib, 0, 0]);
+        assert_eq!(vram_reclaim_target(Some([budget, 4800 * mib - 1, 0, 0]), 0, None), 0);
+        assert_eq!(vram_reclaim_target(at_pressure, 0, None), 480 * mib);
+        assert_eq!(vram_reclaim_target(Some([budget, 6500 * mib, 0, 0]), 0, None), 2180 * mib);
+        assert_eq!(vram_reclaim_target(Some([1000 * mib, 800 * mib, 0, 0]), 0, None), 256 * mib);
         assert_eq!(vram_reclaim_target(at_pressure, 899 * mib, Some(1000 * mib)), 0);
         assert_eq!(vram_reclaim_target(None, 900 * mib, Some(1000 * mib)), 128 * mib);
         assert_eq!(vram_reclaim_target(None, 950 * mib, Some(1000 * mib)), 150 * mib);
-        assert_eq!(vram_reclaim_target(at_pressure, 0, Some(0)), 420 * mib);
+        assert_eq!(vram_reclaim_target(at_pressure, 0, Some(0)), 480 * mib);
         assert_eq!(vram_reclaim_target(Some([0, budget, 0, 0]), budget, None), 0);
         assert_eq!(vram_reclaim_target(None, budget, None), 0);
     }

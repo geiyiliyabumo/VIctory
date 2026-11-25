@@ -168,6 +168,24 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32, discarded: bool) 
     }
 }
 
+/// Clears views of idle filled textures while submission is settled.
+#[cfg(windows)]
+pub(crate) fn unpin_textures(targets: &crate::resource::EvictableFilledResources) -> usize {
+    if targets.is_empty() {
+        return 0;
+    }
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut unpinned = 0;
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: heaps remove themselves under this lock before destruction.
+        let heap = unsafe { &*(at as *const Heap) };
+        if !heap.samplers() && let Some(Some(host)) = heap.host.get() {
+            unpinned += host.unpin_textures(|raw, unpin| targets.with_idle_copy(raw, unpin));
+        }
+    }
+    unpinned
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::core::Interface;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
@@ -461,6 +462,9 @@ pub(crate) struct TextureQueue {
     /// Kept apart: they wait for nothing, and a slot in here is not one
     /// that will be brought up to date anyway.
     rechecks: std::collections::BTreeMap<u32, Recheck>,
+    /// Slots recently unpinned under pressure. The background scan gives
+    /// reclamation time to take effect before it can enqueue them again.
+    evicted: std::collections::HashMap<u32, u64>,
     writes: u64,
 }
 
@@ -476,12 +480,14 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         self.rechecks.remove(&index);
+        self.evicted.remove(&index);
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, recovered: false });
     }
 
     fn remove(&mut self, index: u32) {
         self.slots.remove(&index);
         self.rechecks.remove(&index);
+        self.evicted.remove(&index);
     }
 
     /// Slot `index` was uploaded whole in `frame` from memory `at`, whose
@@ -604,6 +610,7 @@ impl TextureQueue {
         let recovered = self.slots.get(&index).is_some_and(|w| w.recovered);
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         self.rechecks.remove(&index);
+        self.evicted.remove(&index);
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, recovered });
     }
 
@@ -1565,7 +1572,9 @@ impl HostHeap {
             }
             if put_back && back < MOST && matches!(claim, Claim::Own | Claim::Free) {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.len() < SHORT {
+                if textures.slots.len() < SHORT
+                    && textures.evicted.get(&index).is_none_or(|&at| crate::host::long_ago(at, 500, 2))
+                {
                     textures.written(index, frame, frame + 1, false);
                     back += 1;
                     next = index.saturating_add(1);
@@ -1805,6 +1814,50 @@ impl HostHeap {
             .store(full, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Clears idle copies while the submission lock keeps the GPU settled.
+    pub(super) fn unpin_textures(
+        &self,
+        mut with_idle_copy: impl FnMut(usize, &mut dyn FnMut()),
+    ) -> usize {
+        // Mirror takes made before touching kept or the texture queue.
+        // Dynamic allocation and release take next before kept.
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let now = crate::host::moment();
+        let mut unpinned = 0;
+        for (index, slot) in kept.iter_mut().enumerate() {
+            let Some(resource) = slot.as_ref() else { continue };
+            // A reserved table can still be submitted even when the GPU is idle.
+            if index >= made.len() && next.1.get(index - made.len()) == Some(&true) {
+                continue;
+            }
+            with_idle_copy(resource.as_raw() as usize, &mut || {
+                let at = self.cpu(index as u32);
+                let view = made.get_mut(index).and_then(|key| {
+                    let key = std::mem::take(key);
+                    view_at(key as u32, (key >> 32) as u32)
+                });
+                match view {
+                    Some(View::Shader(_, Some(desc))) => null_like(&desc, at),
+                    Some(View::Placed(false, _, desc)) => {
+                        null_like(desc[..10].try_into().unwrap(), at);
+                    }
+                    _ => null_view(at),
+                }
+                drop(slot.take());
+                if index < made.len() {
+                    let index = index as u32;
+                    textures.remove(index);
+                    textures.evicted.insert(index, now);
+                }
+                unpinned += 1;
+            });
+        }
+        unpinned
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
@@ -1861,7 +1914,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
+        let kept = make(view, self.cpu(index), &mut false);
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
@@ -2167,6 +2220,11 @@ impl HostHeap {
         if !allow(&view, current) {
             return Err(());
         }
+        if current && for_draw && let Some(texture) = sampled_texture(&view) {
+            // A table read can return an existing view before its caller
+            // records the texture use. Protect that interval from the sweep.
+            crate::resource::use_descriptor(texture);
+        }
         if !current {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
@@ -2211,12 +2269,13 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(Some(view));
             }
-            made[index as usize] = if later { 0 } else { key };
+            let mut retry = false;
             let kept = if later {
                 None
             } else {
-                make(&view, self.cpu(index))
+                make(&view, self.cpu(index), &mut retry)
             };
+            made[index as usize] = if later || retry { 0 } else { key };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -3004,7 +3063,7 @@ fn twin_uav(
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, retry: &mut bool) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -3028,7 +3087,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
-            if let Some(texture) = crate::resource::host_resource(resource) {
+            let copy = match crate::resource::descriptor_copy(resource) {
+                Ok(copy) => copy,
+                Err(()) => {
+                    *retry = true;
+                    return None;
+                }
+            };
+            if let Some(copy) = copy {
+                let texture = &copy.texture;
                 // The title's views of textures with a stencil plane, as it
                 // describes them (format, dimension, component mapping, a
                 // pad, then first level, levels, plane): each distinct one
@@ -3148,7 +3215,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                let made = make(&view.view, at);
+                let made = make(&view.view, at, retry);
                 #[cfg(feature = "diagnostics")]
                 if *unordered && made.as_ref().is_some_and(Option::is_some) {
                     static FIRST: std::sync::Once = std::sync::Once::new();
@@ -3211,16 +3278,19 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
 /// Pins the existing GPU copy a sampled view would use. New mip views and
 /// different descriptor slots can point at the same allocation.
 fn resident_sampled_texture(view: &View) -> Option<crate::resource::ResidentTexture> {
-    let texture = match view {
-        View::Shader(object, _) => *object as crate::object::This,
+    crate::resource::resident_copy(sampled_texture(view)?)
+}
+
+fn sampled_texture(view: &View) -> Option<crate::object::This> {
+    match view {
+        View::Shader(object, _) => Some(*object as crate::object::This),
         // Writable allocations may have a different current owner.
         View::Placed(false, resource, desc) if resource[0] != 1 && resource[12] & 7 == 0 => {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            crate::resource::placed_known(address, resource)?
+            crate::resource::placed_known(address, resource)
         }
-        _ => return None,
-    };
-    crate::resource::resident_copy(texture)
+        _ => None,
+    }
 }
 
 pub(crate) struct PlacedTexture {
@@ -4291,6 +4361,60 @@ mod tests {
         assert!(kept[1].is_some());
         assert!(kept[first as usize].is_none() && kept[first as usize + 1].is_none());
         assert!(kept[first as usize + 2].is_some());
+    }
+
+    #[test]
+    fn pressure_unpin_clears_matching_idle_slots_and_releases_com_references() {
+        let Some(host) = host() else {
+            eprintln!("COM reference assertions skipped because no D3D12 device was available");
+            return;
+        };
+        let heap = HostHeap::new(false, 4).unwrap();
+        let (target, _) = host.upload_buffer(256).unwrap();
+        let (other, _) = host.upload_buffer(256).unwrap();
+        let dynamic = heap.dynamic(2).unwrap();
+        let targets = std::collections::HashSet::from([target.as_raw() as usize]);
+        let unpin = || {
+            heap.unpin_textures(|raw, clear| {
+                if targets.contains(&raw) {
+                    clear();
+                }
+            })
+        };
+
+        for slot in [0, 1, dynamic, dynamic + 1] {
+            heap.keep(slot, Some(target.clone()));
+        }
+        heap.keep(2, Some(other.clone()));
+        heap.made.lock().unwrap()[..3].copy_from_slice(&[1, 2, 3]);
+        {
+            let mut queue = heap.textures.lock().unwrap();
+            queue.written(0, 1, 1, false);
+            queue.recheck(1, 1, (0, 1), 0);
+            queue.written(2, 1, 1, false);
+        }
+        heap.release(dynamic, 1, false);
+        assert_eq!(crate::host::references(&target), 5);
+        assert_eq!(unpin(), 3);
+        assert_eq!(crate::host::references(&target), 2);
+        assert_eq!(crate::host::references(&other), 2);
+        assert_eq!(&heap.made.lock().unwrap()[..3], &[0, 0, 3]);
+        {
+            let queue = heap.textures.lock().unwrap();
+            assert!(queue.slots.contains_key(&2));
+            assert!(!queue.slots.contains_key(&0) && !queue.rechecks.contains_key(&1));
+            assert!(queue.evicted.contains_key(&0) && queue.evicted.contains_key(&1));
+        }
+        assert_eq!(heap.shows(0, &target), None);
+        assert_eq!(heap.shows(1, &target), None);
+        assert_eq!(heap.shows(2, &other), Some(true));
+        assert_eq!(heap.shows(dynamic, &target), None);
+        assert_eq!(heap.shows(dynamic + 1, &target), Some(true));
+
+        heap.release(dynamic + 1, 1, false);
+        assert_eq!(unpin(), 1);
+        assert_eq!(crate::host::references(&target), 1);
+        assert_eq!(unpin(), 0);
     }
 
     #[test]

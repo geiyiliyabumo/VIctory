@@ -245,7 +245,19 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
-/// Once a second, before a submission starts: lets go of what nothing
+const PRESSURE_SWEEP_MS: u64 = 500;
+
+fn sweep_interval(video_memory: Option<[u64; 4]>, normal_ms: u64) -> u64 {
+    if video_memory.is_some_and(|[budget, used, ..]| {
+        budget > 0 && u128::from(used) >= u128::from(budget) * 85 / 100
+    }) {
+        PRESSURE_SWEEP_MS
+    } else {
+        normal_ms
+    }
+}
+
+/// Before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
 /// `VICTORY_SWEEP=0` keeps everything, as before.
@@ -259,7 +271,11 @@ fn sweep() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    if now < last + PRESSURE_SWEEP_MS {
+        return;
+    }
+    let vm = host().and_then(|h| h.video_memory());
+    if now < last + sweep_interval(vm, 1000)
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -269,7 +285,12 @@ fn sweep() {
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
-    crate::resource::let_go_idle();
+    let targets = crate::resource::evictable_filled_resources(crate::resource::vram_reclaim_needed());
+    let unpinned = crate::descriptor::unpin_textures(&targets);
+    if unpinned > 0 {
+        trail(|| format!("sweep: unpinned {unpinned} idle texture descriptor slots under VRAM pressure"));
+    }
+    crate::resource::let_go_idle(&targets);
     let vm = host().and_then(|h| h.video_memory());
     let prev = L0_SPILL_TO_VRAM.load(Ordering::Relaxed);
     let next = next_l0_spill_state(prev, vm);
@@ -4689,12 +4710,15 @@ impl Host {
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
-            // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
-            sweep();
-            SWEPT.store(now_ms(), Ordering::Relaxed);
+        } else if late_free_present() {
+            let elapsed = now_ms().saturating_sub(SWEPT.load(Ordering::Relaxed));
+            if elapsed > PRESSURE_SWEEP_MS && elapsed > sweep_interval(self.video_memory(), 1500) {
+                // With the present sent ahead nothing else brings a moment
+                // with nothing in the air: one is made for the sweep.
+                self.settle(&mut submitted, WHY_SYNC);
+                sweep();
+                SWEPT.store(now_ms(), Ordering::Relaxed);
+            }
         }
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
