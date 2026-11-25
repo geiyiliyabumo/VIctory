@@ -6679,7 +6679,7 @@ impl Host {
             match self.create_upload_buffer(D3D12_HEAP_TYPE_GPU_UPLOAD, size) {
                 Ok(ok) => {
                     let n = SPILLS.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n == 1 || n % 256 == 0 {
+                    if n == 1 || n.is_multiple_of(256) {
                         tracing::warn!(
                             error = %err,
                             size,

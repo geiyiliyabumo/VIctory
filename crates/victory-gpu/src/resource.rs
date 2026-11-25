@@ -1369,9 +1369,50 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+#[cfg(any(windows, test))]
+fn texture_floor_bytes(video_memory: Option<[u64; 4]>) -> u64 {
+    match video_memory {
+        Some([budget, ..]) if budget > 0 && budget < (10 << 30) => {
+            (budget / 5).clamp(512 << 20, 1536 << 20)
+        }
+        _ => 2 << 30,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn vram_reclaim_target(
+    video_memory: Option<[u64; 4]>,
+    filled: u64,
+    explicit_limit: Option<u64>,
+) -> u64 {
+    let percent = |bytes: u64, share: u8| (u128::from(bytes) * u128::from(share) / 100) as u64;
+    if let Some(limit) = explicit_limit.filter(|&limit| limit > 0) {
+        return if filled >= percent(limit, 90) {
+            filled.saturating_sub(percent(limit, 80)).max(128 << 20)
+        } else {
+            0
+        };
+    }
+    match video_memory {
+        Some([budget, used, ..]) if budget > 0 && used >= percent(budget, 85) => {
+            used.saturating_sub(percent(budget, 78)).max(256 << 20)
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(windows)]
+fn explicit_texture_budget() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    })
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
+/// up to the floor for the adapter's budget, beyond that while the card's memory in use
 /// by this process is under nine tenths of the budget the system gives it
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
@@ -1379,21 +1420,16 @@ pub(crate) fn host_made<'a>(
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
     let filled = KINDS[1].load(Relaxed);
-    if let Some(limit) = limit {
+    if let Some(limit) = explicit_texture_budget() {
         return filled < limit;
     }
-    if filled < FLOOR {
+    let vm = crate::host::host().and_then(|h| h.video_memory());
+    if filled < texture_floor_bytes(vm) {
         return true;
     }
-    match crate::host::host().and_then(|h| h.video_memory()) {
+    match vm {
         Some([budget, used, ..]) => used < budget / 100 * room_percent(),
         None => filled < WITHOUT_BUDGET,
     }
@@ -1651,7 +1687,8 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
 ///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+/// - nothing asked for it for the idle time and four frames, or for
+///   200 ms and one frame during pressure-driven eviction.
 ///
 /// The next use makes the host copy anew and uploads the title's memory
 /// again (its staging state goes with it). The title resource stays: its
@@ -1666,11 +1703,16 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    const LRU_MS: u64 = 200;
+    const LRU_FRAMES: u64 = 1;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let vm = crate::host::host().and_then(|h| h.video_memory());
+    let idle_ms = crate::host::vram_idle_ms(vm);
+    // Both pressure measurements precede the sweep so its bytes are credited once.
+    let filled = KINDS[1].load(Relaxed);
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1717,6 +1759,68 @@ pub(crate) fn let_go_idle() {
                 bytes >> 10,
                 first.unwrap_or(0)
             )
+        });
+    }
+
+    if vm.is_some_and(|[budget, ..]| budget >= (10 << 30)) {
+        return;
+    }
+    let remaining_target = vram_reclaim_target(vm, filled, explicit_texture_budget()).saturating_sub(bytes);
+    if remaining_target == 0 {
+        return;
+    }
+
+    // Keep the table locked to pin the resources while sorting their addresses.
+    let mut candidates = Vec::new();
+    for &at in all.iter() {
+        // SAFETY: the table lock still prevents the resource from being freed.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let last_used = r.host.used.load(Relaxed);
+        if crate::host::long_ago(last_used, LRU_MS, LRU_FRAMES)
+            && made.as_ref().is_some_and(|(host, _)| {
+                std::sync::Arc::strong_count(host) == 1
+                    && crate::host::references(&host.texture) == 1
+            })
+        {
+            candidates.push((last_used, at));
+        }
+    }
+    candidates.sort_unstable();
+
+    let (mut lru_went, mut lru_bytes) = (0, 0);
+    for (_, at) in candidates {
+        // SAFETY: the table lock still prevents the resource from being freed.
+        let r = unsafe { &*(at as *const Resource) };
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if !made.as_ref().is_some_and(|(host, _)| {
+            std::sync::Arc::strong_count(host) == 1
+                && crate::host::references(&host.texture) == 1
+                && crate::host::long_ago(r.host.used.load(Relaxed), LRU_MS, LRU_FRAMES)
+                && !crate::texture::host_wrote(at)
+        }) {
+            continue;
+        }
+        crate::texture::unstage(at as This);
+        if let Some((host, _)) = made.take() {
+            r.host.gone.store(true, Relaxed);
+            drop(made);
+            KINDS[2].fetch_add(1, Relaxed);
+            KINDS[3].fetch_add(host.bytes, Relaxed);
+            lru_went += 1;
+            lru_bytes += host.bytes;
+            crate::host::retire(host);
+            if lru_bytes >= remaining_target {
+                break;
+            }
+        }
+    }
+    if lru_went > 0 {
+        crate::host::trail(|| {
+            format!("sweep: LRU eviction let go of {lru_went} texture copies ({} KiB)", lru_bytes >> 10)
         });
     }
 }
@@ -2683,6 +2787,36 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn texture_floor_bytes_scales_with_budget() {
+        let gib = 1 << 30;
+        assert_eq!(texture_floor_bytes(None), 2 * gib);
+        assert_eq!(texture_floor_bytes(Some([0; 4])), 2 * gib);
+        assert_eq!(texture_floor_bytes(Some([gib, 0, 0, 0])), 512 << 20);
+        assert_eq!(texture_floor_bytes(Some([62 * gib / 10, 0, 0, 0])), 62 * gib / 50);
+        assert_eq!(texture_floor_bytes(Some([72 * gib / 10, 0, 0, 0])), 72 * gib / 50);
+        assert_eq!(texture_floor_bytes(Some([8 * gib, 0, 0, 0])), 1536 << 20);
+        assert_eq!(texture_floor_bytes(Some([10 * gib, 0, 0, 0])), 2 * gib);
+        assert_eq!(texture_floor_bytes(Some([24 * gib, 0, 0, 0])), 2 * gib);
+    }
+
+    #[test]
+    fn vram_reclaim_target_responds_to_pressure() {
+        let mib = 1 << 20;
+        let budget = 6000 * mib;
+        let at_pressure = Some([budget, 5100 * mib, 0, 0]);
+        assert_eq!(vram_reclaim_target(Some([budget, 5100 * mib - 1, 0, 0]), 0, None), 0);
+        assert_eq!(vram_reclaim_target(at_pressure, 0, None), 420 * mib);
+        assert_eq!(vram_reclaim_target(Some([budget, 6500 * mib, 0, 0]), 0, None), 1820 * mib);
+        assert_eq!(vram_reclaim_target(Some([1000 * mib, 850 * mib, 0, 0]), 0, None), 256 * mib);
+        assert_eq!(vram_reclaim_target(at_pressure, 899 * mib, Some(1000 * mib)), 0);
+        assert_eq!(vram_reclaim_target(None, 900 * mib, Some(1000 * mib)), 128 * mib);
+        assert_eq!(vram_reclaim_target(None, 950 * mib, Some(1000 * mib)), 150 * mib);
+        assert_eq!(vram_reclaim_target(at_pressure, 0, Some(0)), 420 * mib);
+        assert_eq!(vram_reclaim_target(Some([0, budget, 0, 0]), budget, None), 0);
+        assert_eq!(vram_reclaim_target(None, budget, None), 0);
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;

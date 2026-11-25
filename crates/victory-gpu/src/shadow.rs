@@ -141,22 +141,47 @@ pub(crate) fn cards() -> bool {
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
-/// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// shaders write takes its size twice), both in bytes.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` defaults to 1 MiB.
+/// `VICTORY_CARD_BUFFERS_MB` defaults to 384 MiB below a known 9 GiB
+/// local budget and to 1,024 MiB otherwise.
 fn card_limits() -> (u64, u64) {
-    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
-        // the shader writes of the smaller buffers are then found by the
-        // card's hashes too, and with that the first room's walls were
-        // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
-    })
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static LIMIT_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let mb = |name| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let min = *MIN.get_or_init(|| (mb("VICTORY_CARD_BUFFERS_MIN_MB").unwrap_or(1) << 20).max(1 << 20));
+    let explicit_mb = *LIMIT_MB.get_or_init(|| mb("VICTORY_CARD_BUFFERS_MB"));
+    let vm = if explicit_mb.is_none() {
+        crate::host::host().and_then(|h| h.video_memory())
+    } else {
+        None
+    };
+    (min, default_card_buffers_limit(explicit_mb, vm))
+}
+
+fn default_card_buffers_limit(explicit_mb: Option<u64>, video_memory: Option<[u64; 4]>) -> u64 {
+    if let Some(mb) = explicit_mb {
+        return mb << 20;
+    }
+    match video_memory {
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 384 << 20,
+        _ => 1024 << 20,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn default_card_buffers_limit_adapts_to_local_budget() {
+    let gib = 1 << 30;
+    let low = Some([62 * gib / 10, 0, 0, 0]);
+    assert_eq!(default_card_buffers_limit(Some(768), low), 768 << 20);
+    assert_eq!(default_card_buffers_limit(Some(0), low), 0);
+    assert_eq!(default_card_buffers_limit(None, low), 384 << 20);
+    assert_eq!(default_card_buffers_limit(None, Some([73 * gib / 10, 0, 0, 0])), 384 << 20);
+    assert_eq!(default_card_buffers_limit(None, Some([9 * gib, 0, 0, 0])), 1024 << 20);
+    assert_eq!(default_card_buffers_limit(None, Some([24 * gib, 0, 0, 0])), 1024 << 20);
+    assert_eq!(default_card_buffers_limit(None, Some([0; 4])), 1024 << 20);
+    assert_eq!(default_card_buffers_limit(None, None), 1024 << 20);
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
