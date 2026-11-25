@@ -61,7 +61,7 @@ impl Fields {
             ComparisonFunc: D3D12_COMPARISON_FUNC(self.compare.max(1) as i32),
             BorderColor: self.border,
             MinLOD: self.min_lod,
-            // Without a mip filter the console samples mip 0 only.
+            // Without a mip filter the console clamps sampling to MinLOD.
             MaxLOD: if self.mip == 0 {
                 self.min_lod
             } else {
@@ -96,6 +96,15 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mip_none_clamps_to_min_lod() {
+        let mut words = [0; 27];
+        words[9] = 3.0_f32.to_bits();
+        words[10] = 8.0_f32.to_bits();
+        let desc = console(&words);
+        assert_eq!((desc.MinLOD, desc.MaxLOD), (3.0, 3.0));
+    }
 
     #[test]
     fn console_descriptions_decode() {

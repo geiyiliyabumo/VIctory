@@ -53,8 +53,8 @@ pub(crate) struct Pending {
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if without_structures(shaders) {
         Some("shades ray-tracing hits, left out")
-    } else if too_dear(shaders) {
-        Some("too dear to compile, left out")
+    } else if activates_without_rays(shaders) {
+        Some("activates screen probe rays, left out")
     } else {
         None
     }
@@ -90,16 +90,13 @@ pub(crate) fn ambient(stage: &str, container: &[u8]) -> Ambient {
     }
 }
 
-/// Whether a shader is left out for what it costs the host's driver:
-/// `CS_ScreenProbes_ActivateRays` of the title
-/// (39f0e9aeb156a61c, 66,501 instructions, 9,948 branches). As translated
-/// before the clean-up passes (`emit::shader_opt`), AMD's took a core and
-/// 0.8 GB more every 10 s for it and did not finish (RX 7800 XT: 47 GB after
-/// 8 minutes); cleaned up, it takes 85 s and 1.3 GB, once.
-/// `VICTORY_ACTIVATE_RAYS=0` leaves it out.
-fn too_dear(shaders: &[Arc<Shader>]) -> bool {
+/// Screen probe ray activation is expensive to compile and expects traced
+/// inputs. Run it with the RT builder or an explicit opt-in.
+fn activates_without_rays(shaders: &[Arc<Shader>]) -> bool {
     static OUT: OnceLock<bool> = OnceLock::new();
-    let out = *OUT.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
+    let out = *OUT.get_or_init(|| {
+        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v != "1") && !super::builder_allowed()
+    });
     out && named(shaders, b"CS_ScreenProbes_ActivateRays")
 }
 

@@ -6,6 +6,9 @@ use std::sync::OnceLock;
 
 use windows::Win32::Foundation::RECT;
 
+/// Batch glyph rectangles below the count that can crash a driver.
+pub(crate) const MAX_CLEAR_RECTS: usize = 16;
+
 /// Whether the readout is drawn.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

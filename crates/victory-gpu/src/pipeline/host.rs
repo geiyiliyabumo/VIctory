@@ -281,13 +281,15 @@ impl GraphicsState {
             .map(|e| {
                 let slot = e.InputSlot.min(31) as usize;
                 let format = e.Format.0 as u32;
+                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
                 let offset = if e.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT {
                     next[slot]
+                        .checked_next_multiple_of(bytes.clamp(1, 4))
+                        .unwrap_or(u32::MAX)
                 } else {
                     e.AlignedByteOffset
                 };
-                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
-                next[slot] = offset + bytes;
+                next[slot] = offset.saturating_add(bytes);
                 Input {
                     slot: slot as u32,
                     offset,
@@ -1025,6 +1027,31 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn appended_elements_align_within_each_input_slot() {
+        let element = |format, slot, offset| D3D12_INPUT_ELEMENT_DESC {
+            Format: format,
+            InputSlot: slot,
+            AlignedByteOffset: offset,
+            ..Default::default()
+        };
+        let append = D3D12_APPEND_ALIGNED_ELEMENT;
+        let state = GraphicsState {
+            inputs: vec![
+                element(DXGI_FORMAT_R8_UNORM, 0, 0),
+                element(DXGI_FORMAT_R8G8_UNORM, 1, 4),
+                element(DXGI_FORMAT_R16_FLOAT, 0, append),
+                element(DXGI_FORMAT_R32G32_FLOAT, 1, append),
+                element(DXGI_FORMAT_R8_UNORM, 0, append),
+                element(DXGI_FORMAT_R32G32B32A32_FLOAT, 2, u32::MAX - 8),
+                element(DXGI_FORMAT_R32_FLOAT, 2, append),
+            ],
+            ..GraphicsState::default()
+        };
+        let offsets: Vec<_> = state.elements().iter().map(|e| e.offset).collect();
+        assert_eq!(offsets, [0, 4, 2, 8, 4, u32::MAX - 8, u32::MAX]);
+    }
 
     #[test]
     fn integer_target_bypasses_blending_and_preserves_mixed_target_masks() {

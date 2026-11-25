@@ -1188,7 +1188,8 @@ impl HostHeap {
         if resource[0] == 1 { return None; }
         let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
         let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-        let len = placed.bytes(&resource, crate::resource::first_mip(&desc))?;
+        let first = placed_first_mip(&resource, &desc);
+        let len = placed.bytes(&resource, first)?;
         let end = start.checked_add(len)?;
         if len == 0 || start == 0 { return None; }
         let claim = placed.claim(index, start, end, &resource).0;
@@ -1214,7 +1215,7 @@ impl HostHeap {
         static REVIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = REVIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n <= 16 || n.is_power_of_two() {
-            tracing::info!(frame, slot=index, first_mip=desc[4], bytes=len, revived=n, format=desc[0], "queued a mapped null material texture referenced by the GPU");
+            tracing::info!(frame, slot=index, first_mip=first, bytes=len, revived=n, format=desc[0], "queued a mapped null material texture referenced by the GPU");
         }
         Some((index, textures.slots[&index].write, true))
     }
@@ -1222,13 +1223,24 @@ impl HostHeap {
     /// Between observation and upload the queue can be delayed by budgeting, a writable
     /// resource can appear over the same pages, or streaming can remove a mip.
     pub(crate) fn material_upload_allowed(&self, index: u32, write: u64, start: u64, len: u64, mapped: u64) -> bool {
+        let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&(claimed_start, end)) = placed.by_slot.get(&index) else {
+            return false;
+        };
+        let Some(bytes) = end.checked_sub(start) else {
+            return false;
+        };
+        // The queue may have probed a longer range from MostDetailedMip.
+        if claimed_start != start || bytes == 0 || bytes > len || mapped < bytes {
+            return false;
+        }
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         let Some(waiting) = textures.slots.get(&index).filter(|w| w.write == write) else { return false };
         if !waiting.recovered { return false; }
         drop(textures);
-        start.checked_add(len).is_some_and(|end| mapped == len
-            && !crate::resource::writable_texture_overlaps(start, end)
-            && !crate::texture::host_written_overlaps(start, end))
+        drop(placed);
+        !crate::resource::writable_texture_overlaps(start, end)
+            && !crate::texture::host_written_overlaps(start, end)
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -1463,7 +1475,7 @@ impl HostHeap {
         let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
         let end = {
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            let end = start.checked_add(placed.bytes(&resource, crate::resource::first_mip(&desc))?)?;
+            let end = start.checked_add(placed.bytes(&resource, placed_first_mip(&resource, &desc))?)?;
             if !matches!(placed.claim(index, start, end, &resource).0, Claim::Free | Claim::Own) {
                 return None;
             }
@@ -1547,7 +1559,7 @@ impl HostHeap {
             let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let (bytes, claim, against) = {
                 let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-                let Some(bytes) = placed.bytes(&resource, crate::resource::first_mip(&desc)) else {
+                let Some(bytes) = placed.bytes(&resource, placed_first_mip(&resource, &desc)) else {
                     continue;
                 };
                 let (claim, against) = placed.claim(index, start, start.saturating_add(bytes), &resource);
@@ -1742,7 +1754,7 @@ impl HostHeap {
             Some(View::Placed(false, resource, desc))
                 if resource[0] != 1 && !self.tabled_lately(index, crate::frame::current()) =>
             {
-                let first = crate::resource::first_mip(desc);
+                let first = placed_first_mip(resource, desc);
                 Some((resource, u64::from(desc[10]) | u64::from(desc[11]) << 32, first))
             }
             _ => None,
@@ -2203,7 +2215,7 @@ impl HostHeap {
                 // Only install a displaced view once its exact span was
                 // reclaimed. A later alias revokes that claim under 'made'.
                 let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let span = placed.bytes(resource, crate::resource::first_mip(desc))
+                let span = placed.bytes(resource, placed_first_mip(resource, desc))
                     .map(|bytes| (start, start.saturating_add(bytes)));
                 if span.is_none() || placed.by_slot.get(&index) != span.as_ref() {
                     return Ok(None);
@@ -2356,7 +2368,7 @@ impl HostHeap {
     pub(crate) fn texture_slot_state(&self, index: u32, frame: u64, view: Option<&View>) -> String {
         let residency = if let Some(View::Placed(false, resource, desc)) = view && resource[0] != 1 {
             let start = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
-            let first = crate::resource::first_mip(desc);
+            let first = placed_first_mip(resource, desc);
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let bytes = placed.bytes(resource, first).unwrap_or(0);
             let (claim, overlap) = placed.claim(index, start, start.saturating_add(bytes), resource);
@@ -3214,8 +3226,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, retry: &mut bool) -> Optio
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
-            if let Some(view) = placed_texture(view) {
-                let made = make(&view.view, at, retry);
+            if let Some(placed) = placed_texture(view) {
+                // Keep the original SRV, including its fractional clamp and
+                // mip indices as seen by shader loads and dimension queries.
+                let made = match placed.view {
+                    View::Shader(texture, _) => {
+                        make(&View::Shader(texture, desc[..10].try_into().ok()), at, retry)
+                    }
+                    view => make(&view, at, retry),
+                };
                 #[cfg(feature = "diagnostics")]
                 if *unordered && made.as_ref().is_some_and(Option::is_some) {
                     static FIRST: std::sync::Once = std::sync::Once::new();
@@ -3298,7 +3317,33 @@ pub(crate) struct PlacedTexture {
     _owner: Option<crate::resource::ResourceRef>,
 }
 
-/// A placed texture's original view on its host resource. A writable
+/// The first mip needed in guest memory for a placed SRV. Partial staging
+/// supports a single 2D slice. For fractional clamps keep the lower mip
+/// because linear mip filtering can still use it. `VICTORY_LOD_CLAMP=0`
+/// uses only MostDetailedMip for staging and span accounting.
+fn placed_first_mip(resource: &[u32; 14], desc: &[u32; 16]) -> u32 {
+    static CLAMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let first = crate::resource::first_mip(desc);
+    if resource[0] != 3
+        || resource[7] as u16 != 1
+        || desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32
+        || !*CLAMP.get_or_init(|| std::env::var_os("VICTORY_LOD_CLAMP").is_none_or(|v| v != "0"))
+    {
+        return first;
+    }
+    let Some(words) = desc.first_chunk() else {
+        return first;
+    };
+    // SAFETY: the view dimension selects Texture2D.
+    let clamp = unsafe { srv_desc(words).Anonymous.Texture2D.ResourceMinLODClamp };
+    if !clamp.is_finite() || clamp < 1.0 {
+        return first;
+    }
+    let last = (resource[7] >> 16).saturating_sub(1).min(15);
+    first.max((clamp.floor() as u32).min(last))
+}
+
+/// A placed texture's binding on its host resource. A writable
 /// allocation may already be owned by a resource object created by the title.
 pub(crate) fn placed_texture(view: &View) -> Option<PlacedTexture> {
     const BUFFER: u32 = 1;
@@ -3320,11 +3365,15 @@ pub(crate) fn placed_texture(view: &View) -> Option<PlacedTexture> {
         // Read-only reinterpretations retain the existing placed SRV path.
         None => crate::resource::texture_at(address, resource)?,
     };
-    let words = desc[..10].try_into().ok();
+    let mut words = *desc.first_chunk::<10>()?;
     let view = if *unordered {
-        View::Unordered(texture as usize, 0, words)
+        View::Unordered(texture as usize, 0, Some(words))
     } else {
-        View::Shader(texture as usize, words)
+        // The upload path reads MostDetailedMip as its staging start.
+        if words[1] == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 {
+            words[4] = placed_first_mip(resource, desc);
+        }
+        View::Shader(texture as usize, Some(words))
     };
     Some(PlacedTexture {
         view,
@@ -4053,6 +4102,26 @@ mod tests {
         spans.forget(4);
         spans.forget(7);
         assert!(spans.spans.is_empty() && spans.by_slot.is_empty());
+    }
+
+    #[test]
+    fn placed_srv_clamp_limits_the_mips_that_need_backing() {
+        let resource = [3, 0, 0, 0, 512, 0, 512, 0x8_0001, 99, 1, 0, 0x105, 0, 0];
+        let mut desc = [0; 16];
+        desc[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        desc[4] = 1;
+        desc[7] = 3.75_f32.to_bits();
+        if std::env::var_os("VICTORY_LOD_CLAMP").is_some_and(|v| v == "0") {
+            assert_eq!(placed_first_mip(&resource, &desc), 1);
+            return;
+        }
+        assert_eq!(placed_first_mip(&resource, &desc), 3);
+        desc[4] = 4;
+        assert_eq!(placed_first_mip(&resource, &desc), 4);
+        desc[7] = 25.0_f32.to_bits();
+        assert_eq!(placed_first_mip(&resource, &desc), 7);
+        desc[7] = f32::NAN.to_bits();
+        assert_eq!(placed_first_mip(&resource, &desc), 4);
     }
 
     /// Views of one texture that show more and fewer of its mips are all

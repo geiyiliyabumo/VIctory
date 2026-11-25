@@ -2,7 +2,9 @@
 //! The title normally gets this light from traced screen probes. With their
 //! inputs unwritten, replace the resolve's output before lighting samples it.
 //! `VICTORY_AMBIENT=off` disables both passes. A finite nonnegative level
-//! overrides the default of 0.6, or opts in when the RT builder is enabled.
+//! sets the constant level, or opts in when the RT builder is enabled.
+//! With RT disabled, the light follows the sky dome when available.
+//! `VICTORY_AMBIENT_SKY=off` uses the constant level throughout.
 
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,7 +16,7 @@ use windows::core::s;
 use crate::descriptor::{View, host::placed_texture};
 use crate::host::{HostList, host};
 use crate::object::This;
-use crate::resource::{ResourceRef, host_resource};
+use crate::resource::{HostTexture, host_copy, host_resource};
 
 pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 pub(crate) const REFLECTED: &[u8] = b"CS_UpdateHistory";
@@ -66,21 +68,30 @@ fn values<const N: usize>(name: &str, mut defaults: [f32; N]) -> [f32; N] {
 }
 
 fn settings(level: f32) -> Settings {
+    static SKY_SETTING: OnceLock<Option<String>> = OnceLock::new();
+    let sky_setting = SKY_SETTING.get_or_init(|| std::env::var("VICTORY_AMBIENT_SKY").ok());
+    let sky_off = sky_setting.as_deref().is_some_and(|v| v.trim() == "off");
     static BASE: OnceLock<Settings> = OnceLock::new();
     let base = *BASE.get_or_init(|| Settings {
         level,
         tint: values("VICTORY_AMBIENT_TINT", [1.0, 0.98, 0.94]).map(|v| v.max(0.0)),
         shade: values("VICTORY_AMBIENT_SHADE", [1.0, 0.6, 0.1, 0.45]),
-        // Experimental opt-in, subject to finding a compatible sky target.
-        sky: match std::env::var("VICTORY_AMBIENT_SKY") {
-            Ok(v) if v.trim() != "off" => values("VICTORY_AMBIENT_SKY", [0.5, 0.05]),
-            _ => [0.0; 2],
+        sky: if !sky_off && (sky_setting.is_some() || !crate::pipeline::builder_allowed()) {
+            values("VICTORY_AMBIENT_SKY", [0.5, 0.05])
+        } else {
+            [0.0; 2]
         },
         held: values("VICTORY_AMBIENT_REFLECT", [0.5])[0].max(0.0),
         floor: 0.0,
     });
     #[cfg(feature = "diagnostics")]
-    return tuned(base);
+    {
+        let mut live = tuned(base);
+        if sky_off {
+            live.sky = [0.0; 2];
+        }
+        live
+    }
     #[cfg(not(feature = "diagnostics"))]
     base
 }
@@ -146,27 +157,30 @@ fn tuned(base: Settings) -> Settings {
         .unwrap_or(base)
 }
 
-static SKY_IMAGE: Mutex<Option<Arc<ResourceRef>>> = Mutex::new(None);
+/// The sky dome's host copy can outlive the resource that supplied it.
+static SKY_IMAGE: Mutex<Option<Arc<HostTexture>>> = Mutex::new(None);
 
 pub(crate) fn sky_drawn(image: This) {
     let Some(level) = level() else { return };
     if settings(level).sky[0] <= 0.0 {
         return;
     }
-    let Some(texture) = host_resource(image) else {
+    let Some(copy) = host_copy(image) else {
         return;
     };
     // SAFETY: the target is live on the recording list.
-    let desc = unsafe { texture.GetDesc() };
+    let desc = unsafe { copy.texture.GetDesc() };
+    // The same shader also draws into a packed float target. Following both
+    // targets would make ambient depend on which list was recorded last.
     if texture_2d(&desc)
-        && desc.Format == DXGI_FORMAT_R11G11B10_FLOAT
+        && desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
         && !desc
             .Flags
             .contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
     {
         let mut sky = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner());
-        if sky.as_ref().is_none_or(|s| s.as_ptr() != image) {
-            let old = sky.replace(Arc::new(ResourceRef::new(image)));
+        if sky.as_ref().is_none_or(|held| !Arc::ptr_eq(held, &copy)) {
+            let old = sky.replace(copy);
             drop(sky);
             drop(old);
         }
@@ -442,15 +456,16 @@ fn record(list: &HostList, output: &View, depth: Option<&View>, reflection: bool
     } else {
         None
     };
-    let sky = sky.as_ref().and_then(|image| {
-        let ptr = image.as_ptr();
-        let texture = host_resource(ptr)?;
-        crate::list::ensure_state(
-            list,
-            ptr,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32,
-        );
-        Some(texture)
+    let sky = sky.as_ref().map(|image| {
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        if let Some(before) = list.transition_copy(image, read.0 as u32) {
+            let barrier =
+                crate::host::transition(&image.texture, D3D12_RESOURCE_STATES(before as i32), read);
+            // SAFETY: the list is open and its state tracker holds the copy.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+        &image.texture
     });
 
     let [r, g, b] = settings.tint;
@@ -514,7 +529,7 @@ fn record(list: &HostList, output: &View, depth: Option<&View>, reflection: bool
             at(1),
         );
         host.device
-            .CreateShaderResourceView(sky, Some(&srv(DXGI_FORMAT_R11G11B10_FLOAT)), at(2));
+            .CreateShaderResourceView(sky, Some(&srv(DXGI_FORMAT_R16G16B16A16_FLOAT)), at(2));
         l.SetDescriptorHeaps(&[Some(heap.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
