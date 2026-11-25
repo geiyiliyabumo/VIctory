@@ -1099,6 +1099,10 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
+fn default_wide_workers(cores: usize) -> usize {
+    (cores / 2).clamp(2, 8)
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1107,7 +1111,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = std::thread::available_parallelism().map_or(4, |n| default_wide_workers(n.get()));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1363,9 +1367,16 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, WIDE_JOB, copy_jobs, default_wide_workers, find_pieces, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn default_wide_workers_scales_with_available_cpus() {
+        for (cores, expected) in [(1, 2), (2, 2), (4, 2), (8, 4), (12, 6), (16, 8), (32, 8)] {
+            assert_eq!(default_wide_workers(cores), expected, "cores {cores}");
+        }
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.

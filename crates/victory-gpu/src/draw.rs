@@ -8,6 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
@@ -585,6 +586,18 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
         roots.resize(slot + 1, Root::None);
     }
     roots[slot] = root;
+}
+
+fn rescan_slice_bounds(total: usize, pass: u64, stride: usize) -> std::ops::Range<usize> {
+    if stride == 0 {
+        return 0..0;
+    }
+    let phase = (pass % stride as u64) as usize;
+    let base = total / stride;
+    let extra = total % stride;
+    let start = phase * base + phase.min(extra);
+    let end = start + base + usize::from(phase < extra);
+    start..end
 }
 
 impl State {
@@ -1600,19 +1613,21 @@ impl State {
         pass.frame = Some(frame);
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
+        // reads, kept from pass to pass. Recheck changed slots and a slice
+        // of live slots each pass. This catches views that went stale
+        // without a write and views whose memory gained a host copy.
+        const RESCAN_STRIDE: usize = 16;
         let crate::descriptor::host::BufferPass { passes, ranges, .. } = &mut *pass;
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        let mut slots = host.buffer_changes();
+        let all_slots = host.buffer_slots();
+        if (*passes).is_multiple_of(RESCAN_STRIDE as u64) {
+            let live: HashSet<u32> = all_slots.iter().copied().collect();
+            ranges.retain(|index, _| live.contains(index));
+        }
+        let slice = &all_slots[rescan_slice_bounds(all_slots.len(), *passes, RESCAN_STRIDE)];
+        // Both snapshots come from sets, so only their overlap needs filtering.
+        let changed: HashSet<u32> = slots.iter().copied().collect();
+        slots.extend(slice.iter().copied().filter(|index| !changed.contains(index)));
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -3863,6 +3878,24 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescan_slice_bounds_covers_each_slot_once_per_cycle() {
+        const STRIDE: usize = 16;
+        for total in [0, 7, 64, 83_000, usize::MAX] {
+            let mut end = 0;
+            for pass in 0..STRIDE as u64 {
+                let slice = rescan_slice_bounds(total, pass, STRIDE);
+                assert_eq!(slice.start, end, "total {total}, pass {pass}");
+                assert!(slice.start <= slice.end && slice.end <= total);
+                assert!(slice.len() <= total.div_ceil(STRIDE));
+                assert_eq!(slice, rescan_slice_bounds(total, pass + STRIDE as u64, STRIDE));
+                end = slice.end;
+            }
+            assert_eq!(end, total);
+        }
+        assert_eq!(rescan_slice_bounds(83_000, 17, 0), 0..0);
+    }
 
     #[test]
     fn raw_address_candidates_use_only_the_current_stages_constants() {
