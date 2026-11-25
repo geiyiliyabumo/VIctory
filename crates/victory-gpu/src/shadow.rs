@@ -15,9 +15,10 @@
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -1755,7 +1756,7 @@ pub(crate) fn let_go_idle() {
         } else {
             let idle_ms = *idle_ms.get_or_insert_with(|| {
                 crate::host::shared_ram_idle_ms(
-                    crate::host::available_physical_ram(),
+                    crate::host::available_system_memory(),
                     crate::host::host().and_then(|h| h.video_memory()),
                 )
             });
@@ -2955,28 +2956,55 @@ pub(crate) fn buffer_generation() -> u64 {
     BUFFER_GENERATION.load(Ordering::Acquire)
 }
 
+/// A recording thread's last registered-buffer hit. A direct-mapped entry is
+/// enough for the repeated binds of one draw; a weak reference keeps the cache
+/// from holding a copy the title has released, and a generation change drops
+/// it before another lookup can use it.
+struct FindCache {
+    generation: u64,
+    key: (u64, u64, bool),
+    shadow: Weak<Shadow>,
+}
+
+thread_local! {
+    static FIND_CACHE: RefCell<FindCache> = const {
+        RefCell::new(FindCache {
+            generation: 0,
+            key: (0, 0, false),
+            shadow: Weak::new(),
+        })
+    };
+}
+
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    let old = buffers().insert(
+    let mut map = buffers();
+    // Bump before the change is visible, so a second generation read on a
+    // recording thread cannot miss an invalidation.
+    BUFFER_GENERATION.fetch_add(1, Ordering::Release);
+    let old = map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    drop(map);
     crate::memory::ownership_changed(start, old.map_or(len, |e| len.max(e.end - start)));
-    BUFFER_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if let Some(old) = buffers().remove(&(start, resource)) {
-        crate::memory::ownership_changed(start, old.end - start);
+    let mut map = buffers();
+    if let std::collections::btree_map::Entry::Occupied(entry) = map.entry((start, resource)) {
         BUFFER_GENERATION.fetch_add(1, Ordering::Release);
+        let old = entry.remove();
+        drop(map);
+        crate::memory::ownership_changed(start, old.end - start);
     }
 }
 
@@ -3011,16 +3039,25 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
-                gone.extend(entry.shadow.take());
-            }
+        let mut entries = map
+            .range_mut(..(end, 0))
+            .rev()
+            .take(256)
+            .map(|(_, entry)| entry)
+            .filter(|entry| {
+                entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some())
+            })
+            .peekable();
+        if !gone.is_empty() || entries.peek().is_some() {
+            // Invalidate under the map lock before removing registered copies.
+            // A lookup at the new generation then waits for the removal.
+            BUFFER_GENERATION.fetch_add(1, Ordering::Release);
         }
+        gone.extend(entries.filter_map(|entry| entry.shadow.take()));
     }
     let n = gone.len() as u64;
     if n != 0 {
         crate::memory::ownership_changed(at, len);
-        BUFFER_GENERATION.fetch_add(1, Ordering::Release);
     }
     for shadow in gone {
         crate::host::retire(shadow);
@@ -3042,7 +3079,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    cached_lookup(address, len, false)
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -3067,10 +3104,45 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !fine() {
         return find(address, len);
     }
-    lookup(address, len, true)
+    cached_lookup(address, len, true)
 }
 
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+/// `lookup`, with a per-recording-thread cache of registered-buffer hits.
+/// Only those hits are cached: loose windows have no generation and can be
+/// let go under another thread's lock.
+fn cached_lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    let generation = buffer_generation();
+    let key = (address, len.max(1), any);
+    let cached = FIND_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.generation != generation {
+            cache.shadow = Weak::new();
+            cache.generation = generation;
+            return None;
+        }
+        (cache.key == key).then(|| cache.shadow.upgrade()).flatten()
+    });
+    if cached.is_some() && buffer_generation() == generation {
+        return cached;
+    }
+    let (shadow, registered) = lookup(address, len, any)?;
+    if registered {
+        FIND_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let now = buffer_generation();
+            if now != generation {
+                cache.shadow = Weak::new();
+                cache.generation = now;
+            } else {
+                cache.key = key;
+                cache.shadow = Arc::downgrade(&shadow);
+            }
+        });
+    }
+    Some(shadow)
+}
+
+fn lookup(address: u64, len: u64, any: bool) -> Option<(Arc<Shadow>, bool)> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -3081,7 +3153,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return loose(address, end, len <= 1, any).map(|shadow| (shadow, false));
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -3096,7 +3168,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && size >= card_limits().0;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+            return Some((entry.shadow.clone()?, true));
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
@@ -3144,7 +3216,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(shadow);
     }
-    entry.shadow.clone()
+    Some((entry.shadow.clone()?, true))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -3519,4 +3591,74 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod find_cache_tests {
+    use super::*;
+
+    /// A generation change must make the next ask resolve the new owner, not
+    /// hand out the copy cached before the title buffer was replaced.
+    #[test]
+    fn cached_find_follows_buffer_generation() {
+        if host().is_none() {
+            return;
+        }
+        static DATA: [u8; 0x100] = [0; 0x100];
+        let address = DATA.as_ptr() as u64;
+        const FIRST: usize = 0x46434331;
+        const SECOND: usize = 0x46434332;
+        register(FIRST, address, DATA.len() as u64);
+        let first = find(address, DATA.len() as u64).unwrap();
+        let again = find(address, DATA.len() as u64).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        unregister(FIRST, address);
+        register(SECOND, address, DATA.len() as u64);
+        let second = find(address, DATA.len() as u64).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        unregister(SECOND, address);
+    }
+
+    /// CPU-only A/B of the global buffer-map lookup against the cached fast
+    /// path. Run with
+    /// `cargo test --release -p victory-gpu --lib cached_find_lookup -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "synthetic CPU release benchmark"]
+    fn cached_find_lookup() {
+        if host().is_none() {
+            return;
+        }
+        static DATA: [u8; 0x100] = [0; 0x100];
+        let address = DATA.as_ptr() as u64;
+        const ID: usize = 0x46434333;
+        register(ID, address, DATA.len() as u64);
+        let held = find(address, DATA.len() as u64).unwrap();
+        const CALLS: usize = 300_000;
+        let mut samples = Vec::new();
+        for sample in 0..5 {
+            let started = std::time::Instant::now();
+            for _ in 0..CALLS {
+                std::hint::black_box(find(address, DATA.len() as u64));
+            }
+            let cached = started.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
+            let started = std::time::Instant::now();
+            for _ in 0..CALLS {
+                std::hint::black_box(lookup(address, DATA.len() as u64, false));
+            }
+            let locked = started.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
+            println!("sample {sample}: locked {locked:.1} ns, cached {cached:.1} ns");
+            samples.push((locked, cached));
+        }
+        let mut locked: Vec<f64> = samples.iter().map(|s| s.0).collect();
+        let mut cached: Vec<f64> = samples.iter().map(|s| s.1).collect();
+        locked.sort_by(f64::total_cmp);
+        cached.sort_by(f64::total_cmp);
+        println!(
+            "median: locked {:.1} ns, cached {:.1} ns",
+            locked[locked.len() / 2],
+            cached[cached.len() / 2]
+        );
+        drop(held);
+        unregister(ID, address);
+    }
 }

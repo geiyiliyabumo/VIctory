@@ -439,7 +439,7 @@ pub(crate) fn let_go_idle() {
         return;
     }
     let idle_ms = crate::host::shared_ram_idle_ms(
-        crate::host::available_physical_ram(),
+        crate::host::available_system_memory(),
         crate::host::host().and_then(|h| h.video_memory()),
     );
     // A list that recorded an upload or a check holds the staging until it

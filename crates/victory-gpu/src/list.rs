@@ -117,8 +117,10 @@ struct List {
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
+    /// The title serializes recording, submission and reset of this list,
+    /// as required for access to its host list and parts.
     #[cfg(windows)]
-    state: std::sync::Mutex<crate::draw::State>,
+    state: std::cell::UnsafeCell<crate::draw::State>,
     /// The parts of the recording before `host`, in order, each closed: the
     /// list is cut at its waits for memory values ([`cut`]).
     #[cfg(windows)]
@@ -146,9 +148,11 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the title passes one of our lists.
-    let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    // SAFETY: the title serializes access to this list. These callbacks
+    // record directly on the host list or update draw state, with no
+    // recursive calls into the title list.
+    let state = unsafe { &mut *(*this.cast::<List>()).state.get() };
+    f(list, state);
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
 }
@@ -165,7 +169,9 @@ pub(crate) fn tables_done(lists: &[This]) {
         // SAFETY: the title passes our lists.
         let list = unsafe { &*this.cast::<List>() };
         if list.earlier.is_empty() {
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).tables_done();
+            // SAFETY: synchronous submission owns access to this list.
+            // Deferred submissions have already moved its state out.
+            unsafe { &mut *list.state.get() }.tables_done();
         }
     }
 }
@@ -334,10 +340,7 @@ fn cut(this: This, wait: ValueWait) {
     }
     // What the title set so far, on the new host list.
     if let Some(host) = list.host.as_ref() {
-        list.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replay(host);
+        list.state.get_mut().replay(host);
     }
 }
 
@@ -407,7 +410,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-        let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        let state = std::mem::take(list.state.get_mut());
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
@@ -472,15 +475,14 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
+        // into it until the title resets it. Later work owns the detached state.
         let (host, uploads, state) = unsafe {
             let Some(host) = (*list).host.replace(fresh) else {
                 continue;
             };
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let state =
-                std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
+            let state = std::mem::take(&mut *(*list).state.get());
             (host, uploads, state)
         };
         order.push(taken.len());
@@ -588,7 +590,7 @@ fn new_list(
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
-            std::sync::Mutex::new(state)
+            std::cell::UnsafeCell::new(state)
         },
         #[cfg(windows)]
         earlier: Vec::new(),
@@ -2028,10 +2030,7 @@ fn value_written(this: This, address: u64, value: u64) {
             list.earlier.push(Part { waits, host: done });
         }
         if let Some(host) = list.host.as_ref() {
-            list.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .replay(host);
+            list.state.get_mut().replay(host);
         }
     }
     #[cfg(not(windows))]

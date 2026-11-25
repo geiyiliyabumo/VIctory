@@ -1931,7 +1931,7 @@ pub(crate) fn let_go_idle(targets: &EvictableFilledResources) {
         return;
     }
     let vm = crate::host::host().and_then(|h| h.video_memory());
-    let idle_ms = crate::host::vram_idle_ms(vm);
+    let idle_ms = crate::host::texture_idle_ms(vm, crate::host::available_system_memory());
     // Both pressure measurements precede the sweep so its bytes are credited once.
     let filled = KINDS[1].load(Relaxed);
     // For the trail (`crate::host::trail`): how many went, their bytes,
@@ -3055,6 +3055,9 @@ pub(crate) fn test_present_target(address: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    mod output_merger;
 
     #[test]
     fn texture_floor_bytes_scales_with_budget() {

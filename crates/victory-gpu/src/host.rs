@@ -120,21 +120,22 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+/// Available physical RAM and commit headroom in bytes, from
+/// `GlobalMemoryStatusEx`.
+pub(crate) fn available_system_memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
-pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
+fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
     const NORMAL_MS: u64 = 5_000;
     const MODERATE_MS: u64 = 2_500;
     const HIGH_MS: u64 = 1_000;
@@ -157,7 +158,7 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
-pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
@@ -174,13 +175,41 @@ pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     }
 }
 
+/// Idle timeout when the process nears its Windows commit limit.
+fn commit_idle_ms(avail_commit: Option<u64>) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let Some(avail) = avail_commit else {
+        return 10_000;
+    };
+    if avail < 512 * MIB {
+        250
+    } else if avail < GIB {
+        500
+    } else if avail < 2 * GIB {
+        1_000
+    } else if avail < 4 * GIB {
+        2_500
+    } else {
+        10_000
+    }
+}
+
+/// Effective idle timeout for caches backed by system memory.
+pub(crate) fn system_ram_idle_ms(available: Option<(u64, u64)>) -> u64 {
+    ram_idle_ms(available.map(|(phys, _)| phys))
+        .min(commit_idle_ms(available.map(|(_, commit)| commit)))
+}
+
 /// Effective idle timeout for L0-backed caches (`shadow` windows and texture
-/// `staging` buffers), combining host physical RAM pressure with WDDM
-/// non-local (L0 shared GPU) memory pressure. On 16 GiB RAM machines WDDM
-/// caps L0 at 8 GiB even with large pagefiles, so `avail_phys` alone can stay
-/// comfortable while L0 approaches `E_OUTOFMEMORY`.
-pub(crate) fn shared_ram_idle_ms(avail_phys: Option<u64>, video_memory: Option<[u64; 4]>) -> u64 {
-    let base = ram_idle_ms(avail_phys);
+/// staging buffers). On 16 GiB RAM machines WDDM caps L0 at 8 GiB even with
+/// large pagefiles, so L0 can approach `E_OUTOFMEMORY` with RAM and commit
+/// headroom still available.
+pub(crate) fn shared_ram_idle_ms(
+    available: Option<(u64, u64)>,
+    video_memory: Option<[u64; 4]>,
+) -> u64 {
+    let base = system_ram_idle_ms(available);
     let Some([_, _, shared_budget, shared_used]) = video_memory else {
         return base;
     };
@@ -198,6 +227,11 @@ pub(crate) fn shared_ram_idle_ms(avail_phys: Option<u64>, video_memory: Option<[
         10_000
     };
     base.min(l0_ms)
+}
+
+/// Title-filled host textures consume VRAM and system commit.
+pub(crate) fn texture_idle_ms(video_memory: Option<[u64; 4]>, available: Option<(u64, u64)>) -> u64 {
+    vram_idle_ms(video_memory).min(shared_ram_idle_ms(available, video_memory))
 }
 
 /// Hysteresis state for proactively routing `upload_buffer` allocations to
@@ -8256,12 +8290,46 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         use super::shared_ram_idle_ms;
         let gib = 1024 * 1024 * 1024;
         // Plenty of free physical RAM (6 GiB), but L0 shared memory tight
-        assert_eq!(shared_ram_idle_ms(Some(6 * gib), Some([16 * gib, 4 * gib, 100, 69])), 10_000);
-        assert_eq!(shared_ram_idle_ms(Some(6 * gib), Some([16 * gib, 4 * gib, 100, 70])), 5_000);
-        assert_eq!(shared_ram_idle_ms(Some(6 * gib), Some([16 * gib, 4 * gib, 100, 80])), 2_000);
-        assert_eq!(shared_ram_idle_ms(Some(6 * gib), Some([16 * gib, 4 * gib, 100, 90])), 1_000);
+        let enough = Some((6 * gib, 8 * gib));
+        assert_eq!(shared_ram_idle_ms(enough, Some([16 * gib, 4 * gib, 100, 69])), 10_000);
+        assert_eq!(shared_ram_idle_ms(enough, Some([16 * gib, 4 * gib, 100, 70])), 5_000);
+        assert_eq!(shared_ram_idle_ms(enough, Some([16 * gib, 4 * gib, 100, 80])), 2_000);
+        assert_eq!(shared_ram_idle_ms(enough, Some([16 * gib, 4 * gib, 100, 90])), 1_000);
         // Physical RAM pressure still applies when L0 is low
-        assert_eq!(shared_ram_idle_ms(Some(gib), Some([16 * gib, 4 * gib, 100, 20])), 2_000);
+        assert_eq!(shared_ram_idle_ms(Some((gib, 8 * gib)), Some([16 * gib, 4 * gib, 100, 20])), 2_000);
+        assert_eq!(shared_ram_idle_ms(enough, None), 10_000);
+        assert_eq!(shared_ram_idle_ms(Some((6 * gib, gib / 2)), None), 500);
+    }
+
+    #[test]
+    fn commit_idle_ms_scales_with_commit_headroom() {
+        use super::commit_idle_ms;
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        assert_eq!(commit_idle_ms(Some(4 * gib)), 10_000);
+        assert_eq!(commit_idle_ms(Some(2 * gib)), 2_500);
+        assert_eq!(commit_idle_ms(Some(gib)), 1_000);
+        assert_eq!(commit_idle_ms(Some(903 * mib)), 500);
+        assert_eq!(commit_idle_ms(Some(267 * mib)), 250);
+        assert_eq!(commit_idle_ms(Some(0)), 250);
+        assert_eq!(commit_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn texture_idle_ms_uses_the_shortest_pressure_timeout() {
+        use super::{system_ram_idle_ms, texture_idle_ms};
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let enough_memory = Some((8 * gib, 8 * gib));
+        let low_commit = Some((4 * gib, 903 * mib));
+        let room_on_card = Some([15 * gib, 8 * gib, 100, 20]);
+        assert_eq!(system_ram_idle_ms(enough_memory), 10_000);
+        assert_eq!(system_ram_idle_ms(low_commit), 500);
+        assert_eq!(texture_idle_ms(room_on_card, enough_memory), 5_000);
+        assert_eq!(texture_idle_ms(room_on_card, low_commit), 500);
+        assert_eq!(texture_idle_ms(room_on_card, Some((gib, 8 * gib))), 2_000);
+        assert_eq!(texture_idle_ms(Some([100, 75, 100, 20]), enough_memory), 2_500);
+        assert_eq!(texture_idle_ms(Some([100, 10, 100, 90]), enough_memory), 1_000);
     }
 
     #[test]

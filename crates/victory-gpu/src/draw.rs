@@ -235,6 +235,19 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
+/// A CPU output descriptor is consumed when recorded. Keep the title resource
+/// for transitions and the exact native allocation used to create the view.
+struct BoundOutput<D> {
+    resource: Option<(crate::resource::ResourceRef, std::sync::Arc<crate::resource::HostTexture>)>,
+    desc: Option<D>,
+}
+
+impl<D> BoundOutput<D> {
+    fn texture(&self) -> Option<&ID3D12Resource> {
+        self.resource.as_ref().map(|(_, host)| &host.texture)
+    }
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -248,17 +261,19 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// The title resource in the first RTV slot, for the ambient sky pass.
+    first_target: usize,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
     /// the host list that continues this one after a cut ([`State::replay`]):
-    /// whether a topology was set, the render target and depth handles, the
+    /// whether a topology was set, the render target and depth views, the
     /// viewports, the scissors, the blend factor and the stencil reference.
     topology_set: bool,
-    target_handles: Vec<u64>,
-    depth_handle: u64,
+    target_views: Vec<BoundOutput<D3D12_RENDER_TARGET_VIEW_DESC>>,
+    depth_view: Option<BoundOutput<D3D12_DEPTH_STENCIL_VIEW_DESC>>,
     targets_set: bool,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
@@ -779,13 +794,11 @@ impl State {
         let Some(host) = crate::host::host() else {
             return;
         };
-        self.target_handles.clear();
-        self.target_handles.extend_from_slice(handles);
-        self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
-        for &h in handles {
+        self.first_target = 0;
+        self.target_views.clear();
+        for (slot, &h) in handles.iter().enumerate() {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
@@ -793,7 +806,7 @@ impl State {
                 );
                 continue;
             };
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
+            let Some(texture) = crate::resource::host_copy(record.resource) else {
                 // A typed null view (or a target without a host copy) still
                 // takes its slot: left out, the next live target would move
                 // into it and the pixel shader's outputs reach the wrong
@@ -804,27 +817,61 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    self.target_views.push(BoundOutput {
+                        resource: None,
+                        desc: Some(desc),
+                    });
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
+            if slot == 0 {
+                self.first_target = record.resource as usize;
+            }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            self.target_views.push(BoundOutput {
+                resource: Some((crate::resource::ResourceRef::new(record.resource), texture)),
+                desc: record.desc(),
+            });
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
+        self.depth_view = crate::descriptor::dsv_record(depth).and_then(|record| {
+            let texture = crate::resource::host_copy(record.resource)?;
+            let desc = record.depth_desc();
             self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+            self.depth_state = depth_state(&texture.texture, desc.as_ref());
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some(BoundOutput {
+                resource: Some((crate::resource::ResourceRef::new(record.resource), texture)),
+                desc,
+            })
+        });
+        self.bind_outputs(host, list);
+    }
+
+    fn bind_outputs(&self, host: &crate::host::Host, list: &HostList) {
+        let rtvs: Vec<_> = self
+            .target_views
+            .iter()
+            .map(|view| {
+                let texture = view.texture();
+                if let Some(texture) = texture {
+                    // This list can still use the view after a later bind.
+                    list.keep(texture);
+                }
+                host.rtv(texture, view.desc.as_ref())
+            })
+            .collect();
+        let dsv = self.depth_view.as_ref().and_then(|view| {
+            let texture = view.texture()?;
+            list.keep(texture);
+            Some(host.dsv(texture, view.desc.as_ref()))
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -895,9 +942,8 @@ impl State {
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
-        if self.targets_set {
-            let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
+        if self.targets_set && let Some(host) = crate::host::host() {
+            self.bind_outputs(host, list);
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
@@ -917,9 +963,8 @@ impl State {
     /// draw anyway. The dynamic descriptor slots and the tables made in
     /// them stay: the parts before the cut have not run yet, and they are
     /// given back when the title's list is reset.
-    /// shortcut: the render target views are made again from the handles'
-    /// descriptors as they are now, not as they were when the title set
-    /// the targets (a descriptor rewritten in between names another view).
+    /// Restore the output views the title bound before the cut. The title
+    /// can rewrite its CPU descriptor slots as soon as the bind is recorded.
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -927,9 +972,8 @@ impl State {
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
-        if self.targets_set {
-            let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
+        if self.targets_set && let Some(host) = crate::host::host() {
+            self.bind_outputs(host, list);
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
@@ -1182,10 +1226,10 @@ impl State {
             };
             crate::list::ensure_state(list, self.depth as This, state);
         }
-        if p.stages.iter().any(|stage| stage.shader.ambient == crate::pipeline::Ambient::DrawsSky)
-            && let Some(target) = self.target_handles.first().and_then(|&h| crate::descriptor::rtv_record(h))
+        if self.first_target != 0
+            && p.stages.iter().any(|stage| stage.shader.ambient == crate::pipeline::Ambient::DrawsSky)
         {
-            crate::ambient::sky_drawn(target.resource);
+            crate::ambient::sky_drawn(self.first_target as This);
         }
         true
     }
