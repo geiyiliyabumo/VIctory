@@ -408,17 +408,14 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ),
     ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
+    let second = [transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    )];
     let skip = usize::from(!waits);
     unsafe {
-        // Earlier shader writes (the title's argument and count passes) first.
+        // Wait for the title's earlier writes and the previous clamp's budget writes.
         l.ResourceBarrier(&first[skip..]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
@@ -430,7 +427,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second);
     }
     true
 }
@@ -999,22 +996,14 @@ void main() {
         }
         done_on(&warp.list, &dst_buf);
 
-        // Snapshot `dst_buf` after Call #1 (from `COMMON`, copy 5 * STRIDE bytes,
-        // then return `dst_buf` to `COMMON` before Call #2).
-        // SAFETY: open command list; `dst_buf` returned to `COMMON` by `done_on`.
+        // Reuse the first clamped record as on a window hit, and copy the
+        // first five for inspection. Both reads promote scratch from COMMON
+        // without a barrier or a second charge to the budget.
+        // SAFETY: the open list still has the worker bound and scratch is live.
         unsafe {
-            warp.list.ResourceBarrier(&[transition(
-                &dst_buf,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
+            warp.list.ExecuteIndirect(&sig, 1, &dst_buf, 0, None, 0);
             warp.list
                 .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, u64::from(STRIDE * 5));
-            warp.list.ResourceBarrier(&[transition(
-                &dst_buf,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
         }
 
         // Call #2 in the SAME command list (`eff_count = 2` -> records 0 and 1:
@@ -1064,8 +1053,8 @@ void main() {
         // Call #2: (3*2*1) + (5*1*1) = 11 groups.
         let expected_groups = (6 + 5 + 65_535) + (6 + 5);
         assert_eq!(
-            hits, expected_groups,
-            "valid indirect dispatches must all execute"
+            hits, expected_groups + 6,
+            "valid indirect dispatches and the reused record must all execute"
         );
         assert_eq!(
             spent,
@@ -1096,6 +1085,55 @@ void main() {
         );
         // Inactive slot 3 was never copied from `src_args`.
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn warp_consecutive_clamps_share_the_list_budget() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const STRIDE: u32 = 16;
+        const DRAWS: usize = 3;
+        let (src, src_ptr, _) = warp.shared_buffer(u64::from(STRIDE));
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback, readback_ptr, _) = warp.shared_buffer(u64::from(STRIDE) * DRAWS as u64);
+        let scratch: [_; DRAWS] = std::array::from_fn(|_| warp.default_uav(u64::from(STRIDE)));
+        // SAFETY: the mappings cover a draw record and the budget word.
+        unsafe {
+            src_ptr.cast::<[u32; 4]>().write([u32::MAX, u32::MAX, 7, 9]);
+            budget_ptr.cast::<u32>().write(0);
+        }
+
+        for dst in &scratch {
+            assert!(record_clamp_as(
+                &warp.clamp,
+                &warp.list,
+                dst,
+                budget_gpu,
+                (&src, 0),
+                None,
+                (0, STRIDE, 1),
+                0,
+            ));
+        }
+        for (i, dst) in scratch.iter().enumerate() {
+            done_on(&warp.list, dst);
+            // SAFETY: the list is open and each copy fits its buffers.
+            unsafe {
+                warp.list.CopyBufferRegion(&readback, i as u64 * u64::from(STRIDE), dst, 0, u64::from(STRIDE));
+            }
+        }
+        warp.submit_and_wait();
+
+        // SAFETY: the GPU has finished writing both mapped buffers.
+        let (spent, draws) = unsafe {
+            (
+                budget_ptr.cast::<u32>().read_volatile(),
+                readback_ptr.cast::<[[u32; 4]; DRAWS]>().read_volatile(),
+            )
+        };
+        assert_eq!(spent, 1 << 27);
+        assert_eq!(draws, [[1 << 24, 4, 7, 9], [1 << 24, 4, 7, 9], [0, 0, 7, 9]]);
     }
 
     /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned

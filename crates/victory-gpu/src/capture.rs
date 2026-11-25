@@ -220,9 +220,9 @@ pub(crate) enum Records<'a> {
     /// In the argument clamp's scratch buffer at an offset, in the
     /// indirect-argument state (`crate::indirect::bound`).
     Clamped(&'a ID3D12Resource, u64),
-    /// In a title buffer's host copy at an offset, whose state the host
-    /// does not name (buffers are promoted from COMMON on use).
-    Title(&'a ID3D12Resource, u64),
+    /// In a title buffer's host copy or cached clamp scratch at an offset.
+    /// Buffers implicitly promote from COMMON into read states.
+    Implicit(&'a ID3D12Resource, u64),
 }
 
 /// The work `records` of `kind` ask for, in `words` (`stride` bytes
@@ -273,8 +273,8 @@ pub(crate) fn read_indirect(
     let mut buffer: Option<ID3D12Resource> = None;
     let l = &list.list;
     // SAFETY: plain creation; an open list. The clamp's scratch buffer goes
-    // from the indirect-argument state to copy source and back; a title
-    // buffer's copy is promoted to copy source by the copy itself.
+    // from the explicit indirect-argument state to copy source and back.
+    // For an implicitly promoted buffer, the copy adds the copy-source read state.
     unsafe {
         if host
             .device
@@ -291,7 +291,7 @@ pub(crate) fn read_indirect(
                 l.CopyBufferRegion(&buffer, 0, scratch, at, len);
                 l.ResourceBarrier(&[crate::host::transition(scratch, copy, args)]);
             }
-            Records::Title(copy, at) => l.CopyBufferRegion(&buffer, 0, copy, at, len),
+            Records::Implicit(copy, at) => l.CopyBufferRegion(&buffer, 0, copy, at, len),
         }
         if let Some((c, at)) = count {
             l.CopyBufferRegion(&buffer, len, c, at, 4);
@@ -1289,7 +1289,7 @@ mod tests {
         // SAFETY: inside the mapping: two mesh records and a count.
         unsafe { (data as *mut [u32; 7]).write([2, 1, 1, 0, 1, 1, 1]) };
         let list = host.new_list().unwrap();
-        super::read_indirect(&list, super::Records::Title(&buffer, 0), Some((&buffer, 24)), (10, 12, 2), "test".to_owned());
+        super::read_indirect(&list, super::Records::Implicit(&buffer, 0), Some((&buffer, 24)), (10, 12, 2), "test".to_owned());
         list.close();
         host.execute(&[&list]);
         // SAFETY: a plain device query.

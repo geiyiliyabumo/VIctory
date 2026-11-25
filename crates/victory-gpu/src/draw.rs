@@ -700,10 +700,28 @@ fn rescan_slice_bounds(total: usize, pass: u64, stride: usize) -> std::ops::Rang
     start..end
 }
 
+fn clears_indirect_window(stage_stores: Option<impl IntoIterator<Item = bool>>) -> bool {
+    stage_stores.is_none_or(|stages| stages.into_iter().any(|stores| stores))
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    pub(crate) fn invalidate_window(&mut self) {
+        self.window = None;
+    }
+
+    fn invalidate_window_for_pipeline(&mut self) {
+        if self.window.is_some()
+            && clears_indirect_window(crate::pipeline::host_pipeline(self.pipeline as This).map(
+                |pipeline| pipeline.stages.iter().map(|stage| stage.translated().stores),
+            ))
+        {
+            self.invalidate_window();
+        }
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -2371,8 +2389,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: Option<u32>) {
-        // It may write the arguments a window holds clamped.
-        self.window = None;
+        self.invalidate_window_for_pipeline();
         let builder = crate::pipeline::is_builder(self.pipeline as This);
         #[cfg(feature = "diagnostics")]
         if builder {
@@ -2822,7 +2839,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-        self.window = None;
+        self.invalidate_window_for_pipeline();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3218,7 +3235,7 @@ impl State {
         first_instance: u32,
     ) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-        self.window = None;
+        self.invalidate_window_for_pipeline();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3326,7 +3343,7 @@ impl State {
         first_instance: u32,
     ) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-        self.window = None;
+        self.invalidate_window_for_pipeline();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3420,7 +3437,7 @@ impl State {
             s.refresh(list, *at, 4);
         }
         list.keep(&args.buffer);
-        let records = crate::capture::Records::Title(&args.buffer, args.offset(arguments));
+        let records = crate::capture::Records::Implicit(&args.buffer, args.offset(arguments));
         let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
         let name = format!("DROPPED {}", crate::pipeline::shaders_of(self.pipeline as This));
         crate::capture::read_indirect(list, records, count, (kind, stride, max), name);
@@ -3552,6 +3569,7 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        let is_hit = hit.is_some();
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -3620,7 +3638,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !is_hit {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -3673,9 +3693,17 @@ impl State {
         if crate::capture::recording_listed() {
             let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
             let name = crate::pipeline::shaders_of(self.pipeline as This);
-            crate::capture::read_indirect(list, crate::capture::Records::Clamped(&bounded, at), count, (kind, stride, max), name);
+            let records = if is_hit {
+                crate::capture::Records::Implicit(&bounded, at)
+            } else {
+                crate::capture::Records::Clamped(&bounded, at)
+            };
+            crate::capture::read_indirect(list, records, count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &bounded);
+        // Cached scratch uses implicit read promotion from COMMON.
+        if !is_hit {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -4051,6 +4079,13 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_pipeline_preserves_indirect_window() {
+        assert!(!clears_indirect_window(Some([false, false])));
+        assert!(clears_indirect_window(Some([false, true])));
+        assert!(clears_indirect_window(None::<[bool; 2]>));
+    }
 
     #[test]
     fn root_slots_iterate_in_order_without_duplicates() {

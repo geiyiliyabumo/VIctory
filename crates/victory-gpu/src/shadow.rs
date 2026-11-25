@@ -144,9 +144,8 @@ pub(crate) fn cards() -> bool {
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes.
 /// Below a known 9 GiB local budget (8 GB VRAM GPUs), `VICTORY_CARD_BUFFERS_MIN_MB`
-/// defaults to 8 MiB and `VICTORY_CARD_BUFFERS_MB` to 640 MiB so large hot
-/// shader-written buffers stay on the GPU instead of being starved by dozens of
-/// small 1-4 MiB buffers; otherwise defaults remain 1 MiB and 1,024 MiB.
+/// defaults to 4 MiB and `VICTORY_CARD_BUFFERS_MB` to 896 MiB to admit more
+/// hot shader-written buffers. Otherwise the defaults are 1 MiB and 1,024 MiB.
 fn card_limits() -> (u64, u64) {
     static MIN_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     static LIMIT_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -169,7 +168,7 @@ fn default_card_buffers_min(explicit_mb: Option<u64>, video_memory: Option<[u64;
         return (mb << 20).max(1 << 20);
     }
     match video_memory {
-        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 8 << 20,
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 4 << 20,
         _ => 1 << 20,
     }
 }
@@ -179,7 +178,7 @@ fn default_card_buffers_limit(explicit_mb: Option<u64>, video_memory: Option<[u6
         return mb << 20;
     }
     match video_memory {
-        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 640 << 20,
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 896 << 20,
         _ => 1024 << 20,
     }
 }
@@ -191,13 +190,13 @@ fn default_card_buffers_limit_adapts_to_local_budget() {
     let low = Some([62 * gib / 10, 0, 0, 0]);
     assert_eq!(default_card_buffers_min(Some(2), low), 2 << 20);
     assert_eq!(default_card_buffers_min(Some(0), low), 1 << 20);
-    assert_eq!(default_card_buffers_min(None, low), 8 << 20);
+    assert_eq!(default_card_buffers_min(None, low), 4 << 20);
     assert_eq!(default_card_buffers_min(None, Some([9 * gib, 0, 0, 0])), 1 << 20);
     assert_eq!(default_card_buffers_min(None, None), 1 << 20);
     assert_eq!(default_card_buffers_limit(Some(768), low), 768 << 20);
     assert_eq!(default_card_buffers_limit(Some(0), low), 0);
-    assert_eq!(default_card_buffers_limit(None, low), 640 << 20);
-    assert_eq!(default_card_buffers_limit(None, Some([73 * gib / 10, 0, 0, 0])), 640 << 20);
+    assert_eq!(default_card_buffers_limit(None, low), 896 << 20);
+    assert_eq!(default_card_buffers_limit(None, Some([73 * gib / 10, 0, 0, 0])), 896 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([9 * gib, 0, 0, 0])), 1024 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([24 * gib, 0, 0, 0])), 1024 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([0; 4])), 1024 << 20);
@@ -234,20 +233,26 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 64 * 16
 }
 
-fn card_vram_limit_percent(video_memory: Option<[u64; 4]>) -> u64 {
-    match video_memory {
-        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 90,
-        _ => 80,
-    }
+fn card_vram_has_room(video_memory: Option<[u64; 4]>, size: u64) -> bool {
+    let Some([budget, used, ..]) = video_memory else {
+        return true;
+    };
+    let percent = if budget > 0 && budget < (9 << 30) { 85 } else { 80 };
+    let limit = (u128::from(budget) * percent / 100) as u64;
+    used.saturating_add(size) <= limit
 }
 
 #[cfg(test)]
 #[test]
-fn card_vram_limit_percent_adapts_to_local_budget() {
-    assert_eq!(card_vram_limit_percent(Some([6170 << 20, 0, 0, 0])), 90);
-    assert_eq!(card_vram_limit_percent(Some([9 << 30, 0, 0, 0])), 80);
-    assert_eq!(card_vram_limit_percent(Some([0; 4])), 80);
-    assert_eq!(card_vram_limit_percent(None), 80);
+fn card_vram_admission_counts_the_new_buffer_against_the_budget() {
+    let size = 4 << 20;
+    for (budget, percent) in [(6170 << 20, 85), (9 << 30, 80)] {
+        let used = budget * percent / 100 - size;
+        assert!(card_vram_has_room(Some([budget, used, 0, 0]), size));
+        assert!(!card_vram_has_room(Some([budget, used + 1, 0, 0]), size));
+    }
+    assert!(!card_vram_has_room(Some([0; 4]), size));
+    assert!(card_vram_has_room(None, size));
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -268,12 +273,8 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     // On smaller adapters the card copy limit leaves room for buffers
     // after textures reach their admission threshold in `resource::room`.
-    let vm = host.video_memory();
-    if let Some([budget, used, ..]) = vm {
-        let limit = (u128::from(budget) * u128::from(card_vram_limit_percent(vm)) / 100) as u64;
-        if used.saturating_add(size) > limit {
-            return None;
-        }
+    if !card_vram_has_room(host.video_memory(), size) {
+        return None;
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);

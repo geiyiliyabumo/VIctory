@@ -822,12 +822,14 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && let Some(to) = buffer_range(dst, dst_offset, len)
-        && let Some(from) = buffer_range(src, src_offset, len)
-    {
-        list.defer_copy(to, from, len as usize);
-    }
+    with_state(this, |list, state| {
+        if let Some(to) = buffer_range(dst, dst_offset, len)
+            && let Some(from) = buffer_range(src, src_offset, len)
+        {
+            state.invalidate_window();
+            list.defer_copy(to, from, len as usize);
+        }
+    });
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
@@ -849,10 +851,7 @@ fn unlike(dst: This, src: This) -> bool {
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
-    {
-        let Some(list) = host_list(this) else {
-            return;
-        };
+    with_state(this, |list, state| {
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -879,9 +878,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
+            state.invalidate_window();
             list.defer_copy(to, from, a.min(b) as usize);
         }
-    }
+    });
     #[cfg(not(windows))]
     let _ = (this, dst, src);
 }
