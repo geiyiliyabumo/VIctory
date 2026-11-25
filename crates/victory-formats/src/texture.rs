@@ -68,7 +68,7 @@ impl Swizzle {
         matches!(self.0, 1 | 5 | 9 | 17 | 21 | 25)
     }
 
-    fn display(self) -> bool {
+    pub(crate) fn display(self) -> bool {
         matches!(self.0, 2 | 6 | 10 | 18 | 22 | 26)
     }
 
@@ -176,7 +176,7 @@ pub struct Layout {
     pub mips: Vec<Mip>,
     /// Byte offsets inside a block of each element coordinate bit, per
     /// axis; empty for linear and unsupported modes.
-    pattern: [Vec<u32>; 3],
+    pub(crate) pattern: [Vec<u32>; 3],
 }
 
 /// Micro tile (256 bytes) patterns by log2 of the element size: for each
@@ -257,7 +257,7 @@ const MAX_MIPS: u32 = 16;
 const MAX_EXTENT: u32 = 1 << 14;
 
 /// 256-byte micro tile dimensions by log2 element size, 2D and 3D.
-const BLOCK_256_2D: [[u32; 2]; 5] = [[16, 16], [16, 8], [8, 8], [8, 4], [4, 4]];
+pub(crate) const BLOCK_256_2D: [[u32; 2]; 5] = [[16, 16], [16, 8], [8, 8], [8, 4], [4, 4]];
 const BLOCK_256_3D: [[u32; 3]; 5] = [[8, 4, 8], [4, 4, 8], [4, 4, 4], [4, 2, 4], [2, 2, 4]];
 const BLOCK_1K_3D: [[u32; 3]; 5] = [[16, 8, 8], [8, 8, 8], [8, 8, 4], [8, 4, 4], [4, 4, 4]];
 
@@ -578,7 +578,7 @@ impl Layout {
 
     /// The slice and the depth inside it for `z` (an array slice or a 3D
     /// depth slice).
-    fn split(&self, z: u32) -> (u32, u32) {
+    pub(crate) fn split(&self, z: u32) -> (u32, u32) {
         if self.thick {
             (z / self.block[2], z % self.block[2])
         } else {
@@ -615,7 +615,8 @@ impl Layout {
         Ok(base + self.row(m, y, z) + self.column(m, x))
     }
 
-    fn render_xor_offset(&self, mip: &Mip, x: u32, y: u32) -> u64 {
+    #[inline]
+    pub(crate) fn render_xor_offset(&self, mip: &Mip, x: u32, y: u32) -> u64 {
         let [w, h, _] = self.block;
         let block = u64::from(y / h) * u64::from(mip.pitch / w) + u64::from(x / w);
         let ox = &self.pattern[0];
@@ -625,7 +626,8 @@ impl Layout {
 
     /// The part of an address that depends on the row (and depth in a
     /// thick block).
-    fn row(&self, m: &Mip, y: u32, z: u32) -> u64 {
+    #[inline]
+    pub(crate) fn row(&self, m: &Mip, y: u32, z: u32) -> u64 {
         let [bw, bh, _] = self.block;
         let log2 = self.alignment.trailing_zeros();
         // In the tail the pattern of the shifted position gives the mip's
@@ -636,7 +638,8 @@ impl Layout {
     }
 
     /// The part of an address that depends on the column.
-    fn column(&self, m: &Mip, x: u32) -> u64 {
+    #[inline]
+    pub(crate) fn column(&self, m: &Mip, x: u32) -> u64 {
         let bw = self.block[0];
         let x = x + m.tail.map_or(0, |t| t.x);
         (u64::from(x / bw) << self.alignment.trailing_zeros())
@@ -679,7 +682,8 @@ impl Layout {
     /// [`Layout::size`] bytes, or the [`Layout::bytes_from`] of the mip)
     /// into linear rows: mip `mip` of array slice
     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
-    /// `row_pitch` bytes apart, depth slices `depth_pitch`.
+    /// `row_pitch` bytes apart. For a mip with multiple depth slices,
+    /// `depth_pitch` must span the last active row of a slice.
     pub fn detile(
         &self,
         tiled: &[u8],
@@ -689,9 +693,16 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-        })
+        crate::detile::detile(
+            self,
+            tiled,
+            mip,
+            slice,
+            linear,
+            row_pitch,
+            depth_pitch,
+            true,
+        )
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -704,121 +715,16 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
-        })
-    }
-
-    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
-        &self,
-        tiled_len: usize,
-        mip: u32,
-        slice: u32,
-        linear_len: usize,
-        row_pitch: usize,
-        depth_pitch: usize,
-        mut copy: impl FnMut(usize, usize, usize),
-    ) -> Result<(), Error> {
-        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
-        let depth = m.depth;
-        let first = if self.desc.dimension == Dimension::Tex3d {
-            if slice != 0 {
-                return Err(Error::Invalid);
-            }
-            0
-        } else {
-            slice
-        };
-        if first >= self.slices {
-            return Err(Error::Invalid);
-        }
-        if !self.addressable() {
-            return Err(Error::Unsupported);
-        }
-        let n = self.desc.element_bytes as usize;
-        let bytes = m.width as usize * n;
-        let need = (depth as usize - 1)
-            .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
-            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
-            .and_then(|offset| offset.checked_add(bytes))
-            .ok_or(Error::TooSmall)?;
-        if tiled_len < self.bytes_from(mip) as usize || linear_len < need || row_pitch < bytes {
-            return Err(Error::TooSmall);
-        }
-        if self.desc.swizzle == Swizzle::SW_64KB_R_X {
-            // The low four byte-address bits are column/element bits only.
-            // All supported element sizes therefore have 16-byte runs.
-            for y in 0..m.height {
-                for x in (0..m.width).step_by(16 / n) {
-                    let lx = x as usize * n;
-                    let at = self.render_xor_offset(m, x, y) as usize;
-                    copy(at, y as usize * row_pitch + lx, 16.min(bytes - lx));
-                }
-            }
-            return Ok(());
-        }
-        let linear = self.desc.swizzle == Swizzle::LINEAR;
-        // The row and depth contribute one common base to every column, so
-        // the same contiguous runs repeat on every row, including mip tails.
-        let mut runs = Vec::new();
-        if !linear {
-            let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
-            for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
-                let at = x as usize * n;
-                if offset != first_tiled + (at - first_linear) {
-                    runs.push((first_tiled, first_linear, at - first_linear));
-                    first_tiled = offset;
-                    first_linear = at;
-                }
-            }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
-        }
-        // A mip can end partway through the last run. Check the other runs
-        // once so each row can copy them with a compile-time length.
-        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
-        let run_len = body
-            .first()
-            .map(|run| run.2)
-            .filter(|&len| body.iter().all(|run| run.2 == len));
-        for z in 0..depth {
-            let (s, inner) = self.split(first + z);
-            let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                if linear {
-                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
-                    copy(tiled_row as usize, linear_row, bytes);
-                } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    match run_len {
-                        Some(8) => copy_runs::<8>(body, tiled_row, linear_row, &mut copy),
-                        Some(16) => copy_runs::<16>(body, tiled_row, linear_row, &mut copy),
-                        Some(32) => copy_runs::<32>(body, tiled_row, linear_row, &mut copy),
-                        _ => copy_runs::<0>(body, tiled_row, linear_row, &mut copy),
-                    }
-                    copy_runs::<0>(last, tiled_row, linear_row, &mut copy);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Copy micro-tile runs inline at a known width, or use each run's length for N = 0.
-fn copy_runs<const N: usize>(
-    runs: &[(usize, usize, usize)],
-    tiled_row: usize,
-    linear_row: usize,
-    copy: &mut impl FnMut(usize, usize, usize),
-) {
-    for &(tiled, linear, len) in runs {
-        let len = if N == 0 { len } else { N };
-        copy(tiled_row + tiled, linear_row + linear, len);
+        crate::detile::tile(
+            self,
+            tiled,
+            mip,
+            slice,
+            linear,
+            row_pitch,
+            depth_pitch,
+            true,
+        )
     }
 }
 
@@ -842,10 +748,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1, false),
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
+        60..=65 | 190 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -1263,5 +1169,546 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    /// Pure element-by-element scalar reference using `Layout::offset`.
+    fn detile_scalar_ref(
+        layout: &Layout,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        let m = layout.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let n = layout.desc.element_bytes as usize;
+        let first = if layout.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= layout.slices {
+            return Err(Error::Invalid);
+        }
+        if !layout.addressable() {
+            return Err(Error::Unsupported);
+        }
+        for z in 0..m.depth {
+            for y in 0..m.height {
+                let row_base = z as usize * depth_pitch + y as usize * row_pitch;
+                for x in 0..m.width {
+                    let t = layout.offset(mip, x, y, first + z)? as usize;
+                    let l = row_base + x as usize * n;
+                    linear[l..l + n].copy_from_slice(&tiled[t..t + n]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pure element-by-element scalar reference for tiling.
+    fn tile_scalar_ref(
+        layout: &Layout,
+        tiled: &mut [u8],
+        mip: u32,
+        slice: u32,
+        linear: &[u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        let m = layout.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let n = layout.desc.element_bytes as usize;
+        let first = if layout.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= layout.slices {
+            return Err(Error::Invalid);
+        }
+        if !layout.addressable() {
+            return Err(Error::Unsupported);
+        }
+        for z in 0..m.depth {
+            for y in 0..m.height {
+                let row_base = z as usize * depth_pitch + y as usize * row_pitch;
+                for x in 0..m.width {
+                    let t = layout.offset(mip, x, y, first + z)? as usize;
+                    let l = row_base + x as usize * n;
+                    tiled[t..t + n].copy_from_slice(&linear[l..l + n]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// or misaddressed micro-tile is caught immediately.
+    fn fill_pattern(len: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed ^ 0x9e37_79b9_7f4a_7c15;
+        let mut out = vec![0u8; len];
+        for b in &mut out {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *b = (s >> 24) as u8;
+        }
+        out
+    }
+
+    /// Exhaustively compares optimized `detile`/`tile` (and forced portable
+    /// fallback) bit-for-bit against the exact scalar `Layout::offset`
+    /// reference across every addressable swizzle mode, every element size
+    /// (1, 2, 4, 8, 16 bytes -> R8, RG8/R16, RGBA8/R32, BC1..BC7), block
+    /// sizes 1 and 4, NPOT sizes, odd pitches, array slices, 3D textures, and
+    /// partial mip chains (`reach`).
+    #[test]
+    fn optimized_detile_and_tile_match_scalar_reference_exhaustively() {
+        let swizzles = [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ];
+        // Diverse power-of-two and NPOT sizes exercising full micro-tiles,
+        // right-edge remainders, bottom-edge remainders, and mip tails.
+        let dims = [
+            (1u32, 1u32, 1u32),
+            (3, 5, 2),
+            (17, 31, 5),
+            (63, 65, 6),
+            (109, 71, 6),
+            (128, 128, 8),
+            (257, 131, 6),
+        ];
+        for &swizzle in &swizzles {
+            for &bpe in &[1u32, 2, 4, 8, 16] {
+                let blocks: &[u32] = if bpe >= 8 { &[1, 4] } else { &[1] };
+                for &block in blocks {
+                    for &(w, h, mips) in &dims {
+                        let d = Desc {
+                            dimension: Dimension::Tex2d,
+                            width: w * block,
+                            height: h * block,
+                            depth: 1,
+                            mips,
+                            element_bytes: bpe,
+                            block,
+                            samples: 1,
+                            swizzle,
+                        };
+                        let layout = Layout::new(&d).unwrap();
+                        let tiled_src = fill_pattern(
+                            layout.size as usize,
+                            u64::from(swizzle.0) * 97 + u64::from(bpe) * 31 + u64::from(w),
+                        );
+                        for mip in 0..d.mips {
+                            let m = layout.mips[mip as usize];
+                            let active = m.width as usize * bpe as usize;
+                            // Test both tightly packed and odd/unaligned pitches.
+                            for extra_pitch in [0usize, 1, 7, 13] {
+                                let row_pitch = active + extra_pitch;
+                                let plane = row_pitch * m.height as usize + 5;
+                                let partial_len = layout.bytes_from(mip) as usize;
+                                let partial = &tiled_src[..partial_len];
+
+                                let mut ref_lin = vec![0xA5u8; plane];
+                                let mut opt_lin = vec![0xA5u8; plane];
+                                let mut port_lin = vec![0xA5u8; plane];
+
+                                detile_scalar_ref(
+                                    &layout,
+                                    partial,
+                                    mip,
+                                    0,
+                                    &mut ref_lin,
+                                    row_pitch,
+                                    plane,
+                                )
+                                .unwrap();
+                                layout
+                                    .detile(partial, mip, 0, &mut opt_lin, row_pitch, plane)
+                                    .unwrap();
+                                crate::detile::detile(
+                                    &layout,
+                                    partial,
+                                    mip,
+                                    0,
+                                    &mut port_lin,
+                                    row_pitch,
+                                    plane,
+                                    false,
+                                )
+                                .unwrap();
+
+                                assert_eq!(
+                                    opt_lin, ref_lin,
+                                    "detile mismatch: {d:?} mip={mip} extra_pitch={extra_pitch}"
+                                );
+                                assert_eq!(
+                                    port_lin, ref_lin,
+                                    "portable detile mismatch: {d:?} mip={mip} extra_pitch={extra_pitch}"
+                                );
+
+                                // Verify tiling matches scalar reference bit-for-bit too.
+                                let mut ref_tiled = vec![0x5Au8; partial_len];
+                                let mut opt_tiled = vec![0x5Au8; partial_len];
+                                let mut port_tiled = vec![0x5Au8; partial_len];
+                                tile_scalar_ref(
+                                    &layout,
+                                    &mut ref_tiled,
+                                    mip,
+                                    0,
+                                    &ref_lin,
+                                    row_pitch,
+                                    plane,
+                                )
+                                .unwrap();
+                                layout
+                                    .tile(&mut opt_tiled, mip, 0, &ref_lin, row_pitch, plane)
+                                    .unwrap();
+                                crate::detile::tile(
+                                    &layout,
+                                    &mut port_tiled,
+                                    mip,
+                                    0,
+                                    &ref_lin,
+                                    row_pitch,
+                                    plane,
+                                    false,
+                                )
+                                .unwrap();
+
+                                assert_eq!(
+                                    opt_tiled, ref_tiled,
+                                    "tile mismatch: {d:?} mip={mip} extra_pitch={extra_pitch}"
+                                );
+                                assert_eq!(
+                                    port_tiled, ref_tiled,
+                                    "portable tile mismatch: {d:?} mip={mip} extra_pitch={extra_pitch}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Verifies multi-slice arrays, 1D textures, and 3D thick/linear textures
+    /// match scalar reference bit-for-bit.
+    #[test]
+    fn arrays_1d_and_3d_match_scalar_reference() {
+        let modes = [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ];
+        let shapes = [
+            (Dimension::Tex1d, 137, 1, 3, 5),
+            (Dimension::Tex2d, 193, 117, 3, 5),
+            (Dimension::Tex3d, 45, 29, 11, 4),
+        ];
+        let cases = shapes
+            .into_iter()
+            .flat_map(|(dimension, w, h, depth, mips)| {
+                modes
+                    .into_iter()
+                    .filter(move |&mode| {
+                        dimension != Dimension::Tex3d
+                            || matches!(
+                                mode,
+                                Swizzle::LINEAR | Swizzle::SW_4KB_S | Swizzle::SW_64KB_S
+                            )
+                    })
+                    .flat_map(move |swizzle| {
+                        [1, 2, 4, 8, 16].map(|element_bytes| Desc {
+                            dimension,
+                            depth,
+                            ..desc(w, h, mips, element_bytes, swizzle)
+                        })
+                    })
+            });
+        for d in cases {
+            let layout = Layout::new(&d).unwrap();
+            let tiled_src = fill_pattern(
+                layout.size as usize,
+                u64::from(d.width) * 131 + u64::from(d.swizzle.0),
+            );
+            let slices = if d.dimension == Dimension::Tex3d {
+                1
+            } else {
+                d.depth
+            };
+            for slice in 0..slices {
+                for mip in 0..d.mips {
+                    let m = layout.mips[mip as usize];
+                    let active = m.width as usize * d.element_bytes as usize;
+                    let row_pitch = active + 19;
+                    let depth_pitch = row_pitch * (m.height as usize - 1) + active;
+                    let total = depth_pitch * m.depth as usize;
+
+                    let mut ref_lin = vec![0x3Cu8; total];
+                    let mut opt_lin = vec![0x3Cu8; total];
+                    detile_scalar_ref(
+                        &layout,
+                        &tiled_src,
+                        mip,
+                        slice,
+                        &mut ref_lin,
+                        row_pitch,
+                        depth_pitch,
+                    )
+                    .unwrap();
+                    layout
+                        .detile(&tiled_src, mip, slice, &mut opt_lin, row_pitch, depth_pitch)
+                        .unwrap();
+                    assert_eq!(
+                        opt_lin, ref_lin,
+                        "array/3D detile mismatch: {d:?} mip={mip} slice={slice}"
+                    );
+
+                    let mut ref_tiled = vec![0xC3u8; layout.size as usize];
+                    let mut opt_tiled = vec![0xC3u8; layout.size as usize];
+                    tile_scalar_ref(
+                        &layout,
+                        &mut ref_tiled,
+                        mip,
+                        slice,
+                        &ref_lin,
+                        row_pitch,
+                        depth_pitch,
+                    )
+                    .unwrap();
+                    layout
+                        .tile(&mut opt_tiled, mip, slice, &ref_lin, row_pitch, depth_pitch)
+                        .unwrap();
+                    assert_eq!(
+                        opt_tiled, ref_tiled,
+                        "array/3D tile mismatch: {d:?} mip={mip} slice={slice}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exercises the parallel worker pool (`>= 512 KiB`) on both power-of-two
+    /// and NPOT textures (e.g. 1024x1024 BC7, 1027x515 RGBA8, 1024x1024 R8),
+    /// plus concurrent multi-caller `try_lock` fallback, verifying bit-exact
+    /// parity for both `detile` and `tile`.
+    #[test]
+    fn parallel_threshold_and_concurrent_callers_match_scalar_reference() {
+        let cases = [
+            // 1024x1024 BC7 -> 256x256x16 = 1 MiB (SW_64KB_D)
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 1024,
+                height: 1024,
+                depth: 1,
+                mips: 1,
+                element_bytes: 16,
+                block: 4,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_D,
+            },
+            // 1024x1024 BC7 -> 256x256x16 = 1 MiB (SW_64KB_S)
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 1024,
+                height: 1024,
+                depth: 1,
+                mips: 1,
+                element_bytes: 16,
+                block: 4,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_S,
+            },
+            // NPOT 1027x515 RGBA8 -> ~2.1 MiB with right & bottom remainders
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 1027,
+                height: 515,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_D,
+            },
+            // 1024x1024 R8 -> 1 MiB (SW_4KB_D)
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 1024,
+                height: 1024,
+                depth: 1,
+                mips: 1,
+                element_bytes: 1,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::SW_4KB_D,
+            },
+        ];
+
+        for d in cases {
+            let layout = Layout::new(&d).unwrap();
+            let tiled_src = fill_pattern(
+                layout.size as usize,
+                u64::from(d.width) * 17 + u64::from(d.element_bytes),
+            );
+            let m = layout.mips[0];
+            let active = m.width as usize * d.element_bytes as usize;
+            let row_pitch = active + 11;
+            let plane = row_pitch * m.height as usize + 7;
+
+            let mut ref_lin = vec![0xEEu8; plane];
+            detile_scalar_ref(&layout, &tiled_src, 0, 0, &mut ref_lin, row_pitch, plane).unwrap();
+
+            // Run 4 concurrent threads calling detile + tile simultaneously to
+            // exercise both pool dispatch and `try_lock` inline fallback.
+            std::thread::scope(|s| {
+                for tid in 0..4 {
+                    let layout = &layout;
+                    let tiled_src = &tiled_src;
+                    let ref_lin = &ref_lin;
+                    s.spawn(move || {
+                        let mut opt_lin = vec![0xEEu8; plane];
+                        layout
+                            .detile(tiled_src, 0, 0, &mut opt_lin, row_pitch, plane)
+                            .unwrap();
+                        assert_eq!(
+                            opt_lin, *ref_lin,
+                            "parallel detile mismatch tid={tid} {d:?}"
+                        );
+
+                        let mut opt_tiled = vec![0x11u8; layout.size as usize];
+                        let mut ref_tiled = vec![0x11u8; layout.size as usize];
+                        layout
+                            .tile(&mut opt_tiled, 0, 0, &opt_lin, row_pitch, plane)
+                            .unwrap();
+                        tile_scalar_ref(layout, &mut ref_tiled, 0, 0, &opt_lin, row_pitch, plane)
+                            .unwrap();
+                        assert_eq!(
+                            opt_tiled, ref_tiled,
+                            "parallel tile mismatch tid={tid} {d:?}"
+                        );
+                    });
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn unsupported_swizzles_and_multisample_copies_leave_buffers_untouched() {
+        let xor_modes = [
+            Swizzle::SW_64KB_S_T,
+            Swizzle::SW_64KB_D_T,
+            Swizzle::SW_4KB_S_X,
+            Swizzle::SW_4KB_D_X,
+            Swizzle::SW_4KB_R_X,
+            Swizzle::SW_64KB_Z_X,
+            Swizzle::SW_64KB_S_X,
+            Swizzle::SW_64KB_D_X,
+        ];
+        let cases = xor_modes.map(|mode| desc(17, 31, 3, 4, mode));
+        let multisampled = Desc {
+            samples: 4,
+            ..desc(17, 31, 1, 4, Swizzle::SW_4KB_S)
+        };
+        let unsupported_render_xor = desc(17, 31, 1, 16, Swizzle::SW_64KB_R_X);
+        for d in cases
+            .into_iter()
+            .chain([multisampled, unsupported_render_xor])
+        {
+            let layout = Layout::new(&d).unwrap();
+            let mut tiled = [0x55];
+            let mut linear = [0xaa];
+            assert_eq!(
+                layout.detile(&tiled, 0, 0, &mut linear, 0, 0),
+                Err(Error::Unsupported)
+            );
+            assert_eq!(
+                layout.tile(&mut tiled, 0, 0, &linear, 0, 0),
+                Err(Error::Unsupported)
+            );
+            assert_eq!((tiled, linear), ([0x55], [0xaa]));
+        }
+    }
+
+    #[test]
+    fn console_formats_use_the_expected_color_layouts() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_D_X] {
+            // Compare against RGBA8 (28) or R8 (61), which have the same texel size.
+            for (format, reference) in [(189, 28), (190, 61)] {
+                let desc = TextureDesc {
+                    dimension: Dimension::Tex2d,
+                    width: 257,
+                    height: 129,
+                    depth_or_array: 2,
+                    mips: 4,
+                    format,
+                    samples: 1,
+                    swizzle,
+                };
+                let expected = Texture::new(&TextureDesc {
+                    format: reference,
+                    ..desc
+                })
+                .unwrap();
+                assert_eq!(
+                    Texture::new(&desc),
+                    Ok(expected),
+                    "format {format}, {swizzle:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn volume_depth_pitch_must_cover_the_last_active_row() {
+        let pixels = [1, 2, 0xcc, 0xcc, 3, 4, 5, 6, 0xcc, 0xcc, 7, 8];
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex3d,
+                depth: 2,
+                ..desc(2, 2, 2, 1, swizzle)
+            })
+            .unwrap();
+            let mut tiled = vec![0xaa; layout.size as usize];
+            let mut back = [0xcc; 12];
+            for pitch in [0, 5] {
+                assert_eq!(
+                    layout.tile(&mut tiled, 0, 0, &pixels, 4, pitch),
+                    Err(Error::TooSmall)
+                );
+                assert!(tiled.iter().all(|&b| b == 0xaa));
+                assert_eq!(
+                    layout.detile(&tiled, 0, 0, &mut back, 4, pitch),
+                    Err(Error::TooSmall)
+                );
+                assert_eq!(back, [0xcc; 12]);
+            }
+            // The next slice may start immediately after the last active pixel.
+            layout.tile(&mut tiled, 0, 0, &pixels, 4, 6).unwrap();
+            layout.detile(&tiled, 0, 0, &mut back, 4, 6).unwrap();
+            assert_eq!(back, pixels);
+            // Mip 1 has only one slice and needs no depth pitch.
+            layout.tile(&mut tiled, 1, 0, &[42], 1, 0).unwrap();
+            let mut mip = [0];
+            layout.detile(&tiled, 1, 0, &mut mip, 1, 0).unwrap();
+            assert_eq!(mip, [42]);
+        }
     }
 }
