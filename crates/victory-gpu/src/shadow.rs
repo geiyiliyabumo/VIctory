@@ -142,21 +142,35 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes.
-/// `VICTORY_CARD_BUFFERS_MIN_MB` defaults to 1 MiB.
-/// `VICTORY_CARD_BUFFERS_MB` defaults to 384 MiB below a known 9 GiB
-/// local budget and to 1,024 MiB otherwise.
+/// Below a known 9 GiB local budget (8 GB VRAM GPUs), `VICTORY_CARD_BUFFERS_MIN_MB`
+/// defaults to 8 MiB and `VICTORY_CARD_BUFFERS_MB` to 512 MiB so large hot
+/// shader-written buffers stay on the GPU instead of being starved by dozens of
+/// small 1-4 MiB buffers; otherwise defaults remain 1 MiB and 1,024 MiB.
 fn card_limits() -> (u64, u64) {
-    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static MIN_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     static LIMIT_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let mb = |name| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
-    let min = *MIN.get_or_init(|| (mb("VICTORY_CARD_BUFFERS_MIN_MB").unwrap_or(1) << 20).max(1 << 20));
+    let explicit_min = *MIN_MB.get_or_init(|| mb("VICTORY_CARD_BUFFERS_MIN_MB"));
     let explicit_mb = *LIMIT_MB.get_or_init(|| mb("VICTORY_CARD_BUFFERS_MB"));
-    let vm = if explicit_mb.is_none() {
+    let vm = if explicit_min.is_none() || explicit_mb.is_none() {
         crate::host::host().and_then(|h| h.video_memory())
     } else {
         None
     };
-    (min, default_card_buffers_limit(explicit_mb, vm))
+    (
+        default_card_buffers_min(explicit_min, vm),
+        default_card_buffers_limit(explicit_mb, vm),
+    )
+}
+
+fn default_card_buffers_min(explicit_mb: Option<u64>, video_memory: Option<[u64; 4]>) -> u64 {
+    if let Some(mb) = explicit_mb {
+        return (mb << 20).max(1 << 20);
+    }
+    match video_memory {
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 8 << 20,
+        _ => 1 << 20,
+    }
 }
 
 fn default_card_buffers_limit(explicit_mb: Option<u64>, video_memory: Option<[u64; 4]>) -> u64 {
@@ -164,7 +178,7 @@ fn default_card_buffers_limit(explicit_mb: Option<u64>, video_memory: Option<[u6
         return mb << 20;
     }
     match video_memory {
-        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 384 << 20,
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 512 << 20,
         _ => 1024 << 20,
     }
 }
@@ -174,10 +188,15 @@ fn default_card_buffers_limit(explicit_mb: Option<u64>, video_memory: Option<[u6
 fn default_card_buffers_limit_adapts_to_local_budget() {
     let gib = 1 << 30;
     let low = Some([62 * gib / 10, 0, 0, 0]);
+    assert_eq!(default_card_buffers_min(Some(2), low), 2 << 20);
+    assert_eq!(default_card_buffers_min(Some(0), low), 1 << 20);
+    assert_eq!(default_card_buffers_min(None, low), 8 << 20);
+    assert_eq!(default_card_buffers_min(None, Some([9 * gib, 0, 0, 0])), 1 << 20);
+    assert_eq!(default_card_buffers_min(None, None), 1 << 20);
     assert_eq!(default_card_buffers_limit(Some(768), low), 768 << 20);
     assert_eq!(default_card_buffers_limit(Some(0), low), 0);
-    assert_eq!(default_card_buffers_limit(None, low), 384 << 20);
-    assert_eq!(default_card_buffers_limit(None, Some([73 * gib / 10, 0, 0, 0])), 384 << 20);
+    assert_eq!(default_card_buffers_limit(None, low), 512 << 20);
+    assert_eq!(default_card_buffers_limit(None, Some([73 * gib / 10, 0, 0, 0])), 512 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([9 * gib, 0, 0, 0])), 1024 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([24 * gib, 0, 0, 0])), 1024 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([0; 4])), 1024 << 20);

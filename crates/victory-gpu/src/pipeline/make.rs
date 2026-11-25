@@ -84,16 +84,13 @@ fn too_dear(shaders: &[Arc<Shader>]) -> bool {
 /// were hit by: about 1,000 compute programs of the title
 /// (`CS_RaytracingResolve`, the `raytracingresolve_dispatch` pass of each
 /// material), all bound at the world's first frame, each 5 to 9 s of AMD's
-/// compiler. They stood in the queue before the passes that make the
-/// picture, and with the structure builder off there is no hit to shade.
-/// Made by default, the picture before loading time (with the builder on
-/// they shade what reflections and indirect light hit);
-/// `VICTORY_RT_RESOLVE=0` leaves them out while the builder is off.
+/// compiler. Left out by default while the structure builder is off
+/// (`VICTORY_RT_RESOLVE=1` or `VICTORY_BVH_BUILDER=1` enables them).
 fn without_structures(shaders: &[Arc<Shader>]) -> bool {
     static OUT: OnceLock<bool> = OnceLock::new();
     let out = *OUT.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0") && !builder
+        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v != "1") && !builder
     });
     out && named(shaders, b"CS_RaytracingResolve")
 }
