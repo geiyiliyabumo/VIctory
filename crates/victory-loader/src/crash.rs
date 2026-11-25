@@ -168,23 +168,18 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 let mut bytes = [0u8; 32];
                 let n = room.min(bytes.len());
                 std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-                if let Some(pass) = clwb_loop(&bytes[..n]) {
+                if let Some(pass) = clwb_loop(&bytes[..n])
+                    && let Some(end) =
+                        clwb_loop_end(*gpr(context, pass.base), *gpr(context, pass.limit))
+                {
                     // A whole write-back loop in one exception (see `clwb_loop`).
-                    let limit = *gpr(context, pass.limit);
-                    let base = gpr(context, pass.base);
-                    *base = if *base <= limit {
-                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
-                    } else {
-                        base.wrapping_add(64)
-                    };
-                    let flags = cmp_flags(*base, limit);
-                    context.EFlags = context.EFlags & !CMP_FLAGS | flags;
+                    *gpr(context, pass.base) = end;
+                    context.EFlags =
+                        context.EFlags & !CMP_FLAGS | cmp_flags(end, *gpr(context, pass.limit));
                     context.Rip += pass.len as u64;
                     return true;
                 }
-                if n >= 15
-                    && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
-                {
+                if let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15])).filter(|&len| len <= n) {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
                     return true;
@@ -246,6 +241,13 @@ struct ClwbLoop {
     limit: u8,
     /// Bytes from `clwb` to the instruction after `jbe`.
     len: usize,
+}
+
+/// If the loop wraps, emulate only the current `clwb` and let the CPU
+/// execute the add, compare and branch.
+fn clwb_loop_end(base: u64, limit: u64) -> Option<u64> {
+    let steps = limit.saturating_sub(base) / 64 + 1;
+    base.checked_add(steps.checked_mul(64)?)
 }
 
 fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
@@ -807,6 +809,43 @@ mod tests {
         // The flags the last cmp leaves: base just past limit.
         assert_eq!(cmp_flags(0x1040, 0x1000) & 0x41, 0); // CF and ZF clear: the loop ends
         assert_eq!(cmp_flags(0x1000, 0x1000) & 0x40, 0x40);
+    }
+
+    #[test]
+    fn clwb_loop_wrap_falls_back_to_single_instruction() {
+        assert_eq!(clwb_loop_end(0x10c0, 0x1080), Some(0x1100));
+        assert_eq!(clwb_loop_end(u64::MAX - 63, u64::MAX), None);
+
+        // Place the complete loop at the end of a page. The single
+        // instruction still fits when the handler has fewer than 15 bytes.
+        #[repr(align(4096))]
+        struct Code([u8; 4096]);
+        let mut code = Code([0xcc; 4096]);
+        let tail = &mut code.0[4096 - 13..];
+        tail.copy_from_slice(&[
+            0x66, 0x0f, 0xae, 0x31, 0x48, 0x83, 0xc1, 0x40, 0x48, 0x39, 0xc1, 0x76, 0xf3,
+        ]);
+        let run = |base, limit| {
+            let start = tail.as_ptr() as u64;
+            // SAFETY: the record, context and instruction bytes are live.
+            unsafe {
+                let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+                record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = start;
+                context.Rcx = base;
+                context.Rax = limit;
+                let mut pointers = EXCEPTION_POINTERS {
+                    ExceptionRecord: &mut record,
+                    ContextRecord: &mut context,
+                };
+                assert!(emulate_amd_only(&mut pointers));
+                (context.Rip - start, context.Rcx)
+            }
+        };
+        assert_eq!(run(0x1000, 0x1080), (13, 0x10c0));
+        assert_eq!(run(0, u64::MAX - 10), (4, 0));
+        assert_eq!(run(u64::MAX - 16, 0x100), (4, u64::MAX - 16));
     }
 
     #[test]

@@ -74,10 +74,9 @@ pub(crate) struct Shadow {
     window: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
-    /// the title's own bytes and nothing is copied either way. The heap,
-    /// and the bytes from the buffer's first byte to `start` (the heap
-    /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// the title's own bytes and nothing is copied either way. This must
+    /// come after `buffer` so the heap and any view outlive the resource.
+    place: Option<Box<crate::inplace::Backing>>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1565,7 +1564,6 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -1859,14 +1857,19 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start + self.place.as_ref().map_or(0, |place| place.1)
+        address - self.start + self.place.as_ref().map_or(0, |place| place.bias)
+    }
+
+    fn is_stretch(&self) -> bool {
+        self.place.as_deref().is_some_and(crate::inplace::Backing::is_stretch)
     }
 
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
     /// over it in a heap opened on it. Shaped as a copy so that everything
     /// that binds, views or keeps a copy works on it unchanged; what
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
-    fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
+    fn placed(placed: crate::inplace::Placed, window: bool) -> Shadow {
+        let (start, len) = (placed.start, placed.len);
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
         // Not a copy: not counted with them, and nothing asks what the
@@ -1875,7 +1878,7 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
-        shadow.place = Some((placed.heap, placed.bias));
+        shadow.place = Some(Box::new(placed.backing));
         shadow
     }
 
@@ -3030,8 +3033,12 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut low = at.saturating_sub(WINDOW);
+        if crate::inplace::stretch_enabled() {
+            low = low.min(stretch_cell(at));
+        }
         let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+            .range((low, 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
@@ -3061,9 +3068,35 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         crate::memory::ownership_changed(at, len);
     }
     for shadow in gone {
+        if shadow.is_stretch() {
+            crate::memory::ownership_changed(shadow.start, shadow.len);
+            REMAPPED_STRETCHES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(shadow);
+        } else {
+            crate::host::retire(shadow);
+        }
+    }
+    retire_stretches();
+    n
+}
+
+/// A descriptor slot can still hold a COM reference to a remapped window's
+/// buffer. Keep the whole window until those references and any lists let go.
+static REMAPPED_STRETCHES: Mutex<Vec<Arc<Shadow>>> = Mutex::new(Vec::new());
+
+pub(crate) fn retire_stretches() {
+    let ready: Vec<_> = REMAPPED_STRETCHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extract_if(.., |shadow| {
+            Arc::strong_count(shadow) == 1 && crate::host::references(&shadow.buffer) == 1
+        })
+        .collect();
+    for shadow in ready {
         crate::host::retire(shadow);
     }
-    n
 }
 
 /// For the in-place census (`crate::inplace`): the title buffers (start,
@@ -3167,8 +3200,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<(Arc<Shadow>, bool)> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, None) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, false)));
             return Some((entry.shadow.clone()?, true));
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
@@ -3355,6 +3388,10 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+fn stretch_cell(address: u64) -> u64 {
+    address - address % crate::inplace::STRETCH_REACH
+}
+
 pub(crate) const MAX_ALIGNED_COPY: u64 = 16 << 20;
 static ALIGNED: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
@@ -3413,11 +3450,27 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+    if crate::inplace::level() > 0 {
+        // Unsized views may use the rest of their ordinary window.
+        let ask_end = if unsized_ask { start + len } else { end };
+        if crate::inplace::stretch_enabled()
+            && let Some((_, shadow)) = map
+                .range((stretch_cell(address), 0)..=(address, u64::MAX))
+                .rev()
+                .find(|(key, shadow)| key.0 + key.1 >= ask_end && shadow.is_stretch())
+        {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        if let Some(placed) = crate::inplace::place_for(start, len, Some(address..ask_end)) {
+            let key = (placed.start, placed.len);
+            let shadow = Arc::new(Shadow::placed(placed, true));
+            note(&shadow);
+            if let Some(before) = map.insert(key, shadow.clone()) {
+                crate::host::retire(before);
+            }
+            return Some(shadow);
+        }
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
