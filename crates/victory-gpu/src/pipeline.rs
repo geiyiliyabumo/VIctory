@@ -62,6 +62,8 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
+    pub(crate) ambient: make::Ambient,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -112,6 +114,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
+                ambient: make::ambient(stage, bytes),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
@@ -130,6 +134,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         stage,
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
+        ambient: make::ambient(stage, container),
         translated: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
@@ -339,7 +344,7 @@ pub(crate) fn builder_runs() -> bool {
 }
 
 #[cfg(windows)]
-fn builder_allowed() -> bool {
+pub(crate) fn builder_allowed() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
     *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
 }
@@ -774,6 +779,8 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub(crate) use make::Ambient;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

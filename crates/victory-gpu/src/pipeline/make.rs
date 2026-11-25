@@ -60,11 +60,34 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
 }
 
+fn contains_name(container: &[u8], name: &[u8]) -> bool {
+    container.windows(name.len()).any(|w| w == name)
+}
+
 /// Whether some compute shader of `shaders` holds `name`.
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
         .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+        .any(|s| s.stage == "compute" && contains_name(&s.container, name))
+}
+
+/// The title shaders that supply the inputs and outputs of the ambient passes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ambient {
+    Other,
+    ResolvesLight,
+    EndsReflections,
+    DrawsSky,
+}
+
+pub(crate) fn ambient(stage: &str, container: &[u8]) -> Ambient {
+    use crate::ambient::{PROGRAM, REFLECTED, SKY};
+    match stage {
+        "compute" if contains_name(container, PROGRAM) => Ambient::ResolvesLight,
+        "compute" if contains_name(container, REFLECTED) => Ambient::EndsReflections,
+        "pixel" if contains_name(container, SKY) => Ambient::DrawsSky,
+        _ => Ambient::Other,
+    }
 }
 
 /// Whether a shader is left out for what it costs the host's driver:
@@ -89,8 +112,7 @@ fn too_dear(shaders: &[Arc<Shader>]) -> bool {
 fn without_structures(shaders: &[Arc<Shader>]) -> bool {
     static OUT: OnceLock<bool> = OnceLock::new();
     let out = *OUT.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v != "1") && !builder
+        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v != "1") && !super::builder_allowed()
     });
     out && named(shaders, b"CS_RaytracingResolve")
 }

@@ -1006,6 +1006,8 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Shader-visible views written by the ambient passes on this list.
+    pub(crate) ambient_views: Mutex<crate::ambient::Views>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -3603,6 +3605,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                ambient_views: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -5260,6 +5263,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.ambient_views.lock().unwrap_or_else(|e| e.into_inner()).reset();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -6861,6 +6865,55 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     compositor: Option<PresentCompositor>,
+    /// One readout RTV per swap-chain buffer, including presents sent ahead.
+    rtv: Option<ID3D12DescriptorHeap>,
+}
+
+impl Presenter {
+    /// Draws the readout, returning the back buffer's resulting state.
+    ///
+    /// SAFETY: `back` is this swap chain's buffer at `index`, in `before`
+    /// on the open list. The presenter lock serializes recording.
+    unsafe fn readout(
+        &self,
+        host: &Host,
+        list: &ID3D12GraphicsCommandList,
+        back: &ID3D12Resource,
+        index: u32,
+        before: D3D12_RESOURCE_STATES,
+    ) -> D3D12_RESOURCE_STATES {
+        let (Some(rtv), Some((fps, ms))) = (&self.rtv, self.meter.shown) else {
+            return before;
+        };
+        let text = format!("{fps:.1} FPS  {ms:.0} MS");
+        let dot = (self.height as i32 / 216).max(2);
+        let at = (dot * 3, dot * 3);
+        let (width, height) = crate::readout::size(&text);
+        let background = RECT {
+            left: at.0,
+            top: at.1,
+            right: at.0 + width * dot,
+            bottom: at.1 + height * dot,
+        };
+        if background.right > self.width as i32 || background.bottom > self.height as i32 {
+            return before;
+        }
+        let marks = crate::readout::rects(&text, at, dot);
+        let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        // SAFETY: the rectangles fit and the index selects this back buffer's
+        // CPU-only descriptor, which the clears consume while recording.
+        unsafe {
+            let mut view = rtv.GetCPUDescriptorHandleForHeapStart();
+            view.ptr += index as usize * host.rtv_size as usize;
+            host.device.CreateRenderTargetView(back, None, view);
+            if before != target {
+                list.ResourceBarrier(&[transition(back, before, target)]);
+            }
+            list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[background]));
+            list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
+        }
+        target
+    }
 }
 
 /// The process's CPU time in microseconds, kernel and user.
@@ -6984,6 +7037,8 @@ struct Meter {
     gpu_pct: f64,
     /// Working set in MB.
     ram_mb: f64,
+    /// Frame rate and frame time from the last completed sample.
+    shown: Option<(f64, f64)>,
 }
 
 impl Meter {
@@ -7000,6 +7055,7 @@ impl Meter {
             cpu_pct: 0.0,
             gpu_pct: 0.0,
             ram_mb: 0.0,
+            shown: None,
         }
     }
 
@@ -7022,6 +7078,7 @@ impl Meter {
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
+        self.shown = Some((fps, ms));
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
@@ -7450,17 +7507,24 @@ impl Host {
                         [(texture, state), (overlay, overlay_state)],
                         extent,
                     );
+                    let back_state = p.readout(
+                        self,
+                        list,
+                        &back,
+                        index,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    );
                     #[cfg(feature = "diagnostics")]
                     {
                         list.ResourceBarrier(&[transition(
                             &back,
-                            D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            back_state,
                             copy_source,
                         )]);
                         (&back, copy_source)
                     }
                     #[cfg(not(feature = "diagnostics"))]
-                    (&back, D3D12_RESOURCE_STATE_RENDER_TARGET)
+                    (&back, back_state)
                 } else {
                     let barriers = [
                         transition(texture, state, copy_source),
@@ -7472,7 +7536,14 @@ impl Host {
                     ];
                     list.ResourceBarrier(&barriers[usize::from(state == copy_source)..]);
                     list.CopyResource(&back, texture);
-                    (texture, D3D12_RESOURCE_STATE_COPY_DEST)
+                    let back_state = p.readout(
+                        self,
+                        list,
+                        &back,
+                        index,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    );
+                    (texture, back_state)
                 };
             #[cfg(feature = "diagnostics")]
             let capture_wanted = crate::capture::wanted(frame);
@@ -7553,6 +7624,18 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
+            let rtv = if crate::readout::on() {
+                self.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                        NumDescriptors: BUFFERS,
+                        ..Default::default()
+                    })
+                    .inspect_err(|error| tracing::warn!(%error, "no FPS readout"))
+                    .ok()
+            } else {
+                None
+            };
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
@@ -7565,6 +7648,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 compositor: None,
+                rtv,
             })
         }
     }

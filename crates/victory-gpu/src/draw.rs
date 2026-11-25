@@ -1182,6 +1182,11 @@ impl State {
             };
             crate::list::ensure_state(list, self.depth as This, state);
         }
+        if p.stages.iter().any(|stage| stage.shader.ambient == crate::pipeline::Ambient::DrawsSky)
+            && let Some(target) = self.target_handles.first().and_then(|&h| crate::descriptor::rtv_record(h))
+        {
+            crate::ambient::sky_drawn(target.resource);
+        }
         true
     }
 
@@ -2433,6 +2438,9 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         crate::memory::ray_probe::after_dispatch(list, p);
+        if x != 0 && y != 0 && z != 0 {
+            self.after_ambient_dispatch(list, p);
+        }
         #[cfg(feature = "diagnostics")]
         crate::capture::dump_with_input(list, self.pipeline as This, &[], input);
         #[cfg(feature = "diagnostics")]
@@ -2440,6 +2448,45 @@ impl State {
             crate::pipeline::builder_recorded(self.pipeline as This, false);
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn after_ambient_dispatch(&mut self, list: &HostList, p: &HostPipeline) {
+        use crate::ambient::{self, DEPTH, LIGHT, REFLECTIONS};
+        use crate::pipeline::Ambient;
+
+        let Some(stage) = p.stages.first().filter(|s| {
+            matches!(s.shader.ambient, Ambient::ResolvesLight | Ambient::EndsReflections)
+        }) else {
+            return;
+        };
+        if ambient::level().is_none() {
+            return;
+        }
+        let view = |kind, (slot, dword): (u8, u32)| {
+            if !stage.translated().used.iter().any(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, dword)
+            }) {
+                return None;
+            }
+            let Root::Table(table) = self.compute.get(usize::from(slot))? else { return None };
+            let handle = table.checked_add(u64::from(dword) * 4)?;
+            self.heap_of(handle).filter(|heap| !heap.samplers())?;
+            crate::descriptor::view(handle)
+        };
+        let recorded = match stage.shader.ambient {
+            Ambient::ResolvesLight => view(ResourceType::Uav, LIGHT)
+                .is_some_and(|light| ambient::raise(list, &light, view(ResourceType::Srv, DEPTH).as_ref())),
+            Ambient::EndsReflections => view(ResourceType::Uav, REFLECTIONS)
+                .is_some_and(|image| ambient::hold(list, &image)),
+            _ => false,
+        };
+        if recorded {
+            // The pass set its own heaps as well as its compute signature
+            // and PSO. The next bind must restore the title's heaps and roots.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [usize::MAX; 2];
+        }
     }
 
     #[cfg(feature = "diagnostics")]
@@ -3564,9 +3611,15 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        if kind == DISPATCH {
+            #[cfg(feature = "diagnostics")]
+            crate::memory::ray_probe::after_dispatch(list, p);
+            if max != 0 {
+                self.after_ambient_dispatch(list, p);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if kind == DISPATCH {
-            crate::memory::ray_probe::after_dispatch(list, p);
             crate::capture::dump_after(list, self.pipeline as This, &[]);
         } else {
             self.dump_after(list);
