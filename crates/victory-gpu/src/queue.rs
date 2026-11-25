@@ -750,10 +750,7 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Shows the primary resource, with an overlay for the Series S two-plane layout.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -825,6 +822,47 @@ extern "system" fn present(
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+        #[cfg(feature = "diagnostics")]
+        let show_spec = crate::capture::show_spec();
+        #[cfg(not(feature = "diagnostics"))]
+        let show_spec: Option<()> = None;
+        #[cfg(feature = "diagnostics")]
+        if let Some((_target, copy)) = show_spec.and_then(crate::resource::present_target_by_desc) {
+            let state = copy.state.load(Ordering::Relaxed);
+            let shown = host.present(&copy.texture, state, frame);
+            if shown.is_some() {
+                blinks(frame, resource, state, shown);
+                return S_OK;
+            }
+        }
+
+        static TWO_PLANES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if planes == 2
+            && plane.count == 1
+            && crate::console::current() == crate::console::Console::SeriesS
+            && show_spec.is_none()
+            && *TWO_PLANES
+                .get_or_init(|| std::env::var_os("VICTORY_PRESENT_TWO_PLANES").is_none_or(|v| v != "0"))
+            && let Some(overlay) = retain_present_overlay(plane_parameters, resource)
+            && let Some(overlay_copy) = overlay.existing_host_copy()
+            && let Some(base) = crate::resource::host_copy(resource)
+        {
+            let state = base.state.load(Ordering::Relaxed);
+            let overlay_state = overlay_copy.state.load(Ordering::Relaxed);
+            let shown = host.present_overlay(
+                &base.texture,
+                state,
+                &overlay_copy.texture,
+                overlay_state,
+                frame,
+            );
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, resource, state, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+            return S_OK;
+        }
+
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
@@ -839,6 +877,37 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+
+/// Reads the second Series S plane, whose stride exceeds the common prefix.
+#[cfg(windows)]
+fn retain_present_overlay(
+    plane_parameters: *const Plane,
+    primary: This,
+) -> Option<crate::resource::ResourceRef> {
+    const SERIES_S_PLANE_STRIDE: usize = 0x48;
+    let plane = (plane_parameters as usize).checked_add(SERIES_S_PLANE_STRIDE)?;
+    let count_at = plane.checked_add(std::mem::offset_of!(Plane, count))?;
+    let mut count = [0; size_of::<u32>()];
+    if !crate::host::read_into(count_at as *const u8, &mut count) || u32::from_ne_bytes(count) != 1 {
+        return None;
+    }
+    let resources_at = plane.checked_add(std::mem::offset_of!(Plane, resources))?;
+    let mut resources = [0; size_of::<usize>()];
+    if !crate::host::read_into(resources_at as *const u8, &mut resources) {
+        return None;
+    }
+    let resources = usize::from_ne_bytes(resources);
+    let mut overlay = [0; size_of::<usize>()];
+    if resources == 0 || !crate::host::read_into(resources as *const u8, &mut overlay) {
+        return None;
+    }
+    let overlay = usize::from_ne_bytes(overlay) as This;
+    if overlay == primary {
+        return None;
+    }
+    crate::resource::retain_present_target(overlay)
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -1004,6 +1073,65 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn series_s_overlay_uses_second_plane_stride_and_retains_the_target() {
+        #[repr(C)]
+        struct FullPlane {
+            prefix: Plane,
+            reserved: [u64; 6],
+        }
+
+        let backing = [0u64; 2];
+        let primary = crate::resource::test_present_target(std::ptr::from_ref(&backing[0]) as u64);
+        let overlay = crate::resource::test_present_target(std::ptr::from_ref(&backing[1]) as u64);
+        let retained = {
+            let primary_resources = [primary];
+            let overlay_resources = [overlay];
+            let mut planes = [
+                FullPlane {
+                    prefix: Plane {
+                        token: 1,
+                        count: 1,
+                        resources: primary_resources.as_ptr(),
+                    },
+                    reserved: [0; 6],
+                },
+                FullPlane {
+                    prefix: Plane {
+                        token: 1,
+                        count: 1,
+                        resources: overlay_resources.as_ptr(),
+                    },
+                    reserved: [0; 6],
+                },
+            ];
+            let retain = |planes: &[FullPlane; 2]| {
+                let parameters = std::hint::black_box(planes.as_ptr().cast::<Plane>());
+                retain_present_overlay(parameters, primary)
+            };
+            planes[1].prefix.count = 2;
+            assert!(retain(&planes).is_none());
+            planes[1].prefix.count = 1;
+            planes[1].prefix.resources = std::ptr::null();
+            assert!(retain(&planes).is_none());
+            planes[1].prefix.resources = primary_resources.as_ptr();
+            assert!(retain(&planes).is_none());
+            let unknown_resources = [std::ptr::dangling::<object::Object>()];
+            planes[1].prefix.resources = unknown_resources.as_ptr();
+            assert!(retain(&planes).is_none());
+            planes[1].prefix.resources = overlay_resources.as_ptr();
+            retain(&planes).expect("second plane retained")
+        };
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(overlay), 1, "present retains its own reference");
+        assert_eq!(retained.as_ptr(), overlay);
+        drop(retained);
+        assert!(crate::resource::retain_present_target(overlay).is_none());
+        assert_eq!(release(primary), 0);
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's

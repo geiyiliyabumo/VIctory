@@ -733,6 +733,27 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// A diagnostic render target to present in place of the title's frame.
+pub(crate) fn show_spec() -> Option<(u64, u32, u32)> {
+    static SPEC: std::sync::OnceLock<Option<(u64, u32, u32)>> = std::sync::OnceLock::new();
+    *SPEC.get_or_init(|| parse_show_spec(&std::env::var("VICTORY_SHOW_TARGET").ok()?))
+}
+
+fn parse_show_spec(value: &str) -> Option<(u64, u32, u32)> {
+    let (width, rest) = value.split_once('x')?;
+    let (height, format) = rest.split_once("-f")?;
+    let (width, height, format) = (width.parse().ok()?, height.parse().ok()?, format.parse().ok()?);
+    (width > 0 && height > 0).then_some((width, height, format))
+}
+
+#[cfg(test)]
+#[test]
+fn present_target_spec_parses_dimensions_and_format() {
+    assert_eq!(parse_show_spec("2560x1440-f28"), Some((2560, 1440, 28)));
+    assert_eq!(parse_show_spec("0x1440-f28"), None);
+    assert_eq!(parse_show_spec("2560x1440-28"), None);
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {

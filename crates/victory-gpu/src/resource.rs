@@ -110,6 +110,8 @@ const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
+#[cfg(any(test, feature = "diagnostics"))]
+const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
 
 /// Bytes per element and the element's width in texels (4 for block
@@ -1188,6 +1190,58 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 #[cfg(windows)]
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Retains a renderable texture before following an optional PresentX plane.
+#[cfg(windows)]
+pub(crate) fn retain_present_target(this: This) -> Option<ResourceRef> {
+    let registry = textures();
+    if !registry.contains(&(this as usize)) || !object::try_add_ref(this) {
+        return None;
+    }
+    let target = ResourceRef(this as usize);
+    drop(registry);
+    (!fills(&resource(this).desc)).then_some(target)
+}
+
+/// Finds a matching diagnostic target with a host copy. Prefer the one
+/// most recently used when multiple resources have the requested shape.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn present_target_by_desc(
+    (width, height, format): (u64, u32, u32),
+) -> Option<(ResourceRef, std::sync::Arc<HostTexture>)> {
+    let candidates: Vec<_> = {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        targets
+            .values()
+            .flatten()
+            .copied()
+            .filter(|&target| object::try_add_ref(target as This))
+            .map(ResourceRef)
+            .collect()
+    };
+    candidates
+        .into_iter()
+        .filter_map(|target| {
+            let r = resource(target.as_ptr());
+            let desc = &r.desc;
+            if desc.dimension != TEXTURE_2D
+                || desc.width != width
+                || desc.height != height
+                || desc.format != format
+                || desc.sample_count > 1
+                || desc.depth_or_array_size != 1
+                || desc.mip_levels != 1
+            {
+                return None;
+            }
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let (copy, _) = made.as_ref()?;
+            let used = r.host.used.load(std::sync::atomic::Ordering::Relaxed);
+            Some((used, (target, copy.clone())))
+        })
+        .max_by_key(|(used, _)| *used)
+        .map(|(_, copy)| copy)
+}
 
 #[cfg(windows)]
 pub(crate) fn writable_texture_overlaps(start: u64, end: u64) -> bool {
@@ -2687,6 +2741,11 @@ impl ResourceRef {
     pub(crate) fn as_ptr(&self) -> This {
         self.0 as This
     }
+
+    /// A present overlay can use a host copy made by preceding work.
+    pub(crate) fn existing_host_copy(&self) -> Option<std::sync::Arc<HostTexture>> {
+        hosted(self.as_ptr(), false).map(|made| made.0)
+    }
 }
 
 #[cfg(windows)]
@@ -2809,6 +2868,37 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[14] = heap_properties as *const (); // 0x70
     Table(f)
 };
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_present_target(address: u64) -> This {
+    let desc = ResourceDesc {
+        dimension: TEXTURE_2D,
+        alignment: 0,
+        width: 1,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 28,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 1,
+    };
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_at_address(
+            std::ptr::null(),
+            address,
+            &desc,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut out,
+        ),
+        S_OK
+    );
+    out
+}
 
 #[cfg(test)]
 mod tests {
