@@ -235,14 +235,47 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
+type OutputKey = (usize, (usize, [u32; 7]));
+
+#[derive(Default)]
+struct OutputBindings(Option<(Vec<OutputKey>, Option<OutputKey>)>);
+
+impl OutputBindings {
+    fn invalidate(&mut self) {
+        self.0 = None;
+    }
+
+    fn needs_bind(
+        &mut self,
+        enabled: bool,
+        targets: impl Iterator<Item = OutputKey> + Clone,
+        depth: Option<OutputKey>,
+    ) -> bool {
+        if enabled
+            && self.0.as_ref().is_some_and(|(old, dsv)| {
+                *dsv == depth && targets.clone().eq(old.iter().copied())
+            })
+        {
+            return false;
+        }
+        self.0 = enabled.then(|| (targets.collect(), depth));
+        true
+    }
+}
+
 /// A CPU output descriptor is consumed when recorded. Keep the title resource
 /// for transitions and the exact native allocation used to create the view.
 struct BoundOutput<D> {
+    record: (usize, [u32; 7]),
     resource: Option<(crate::resource::ResourceRef, std::sync::Arc<crate::resource::HostTexture>)>,
     desc: Option<D>,
 }
 
 impl<D> BoundOutput<D> {
+    fn key(&self) -> OutputKey {
+        (self.texture().map_or(0, |t| t.as_raw() as usize), self.record)
+    }
+
     fn texture(&self) -> Option<&ID3D12Resource> {
         self.resource.as_ref().map(|(_, host)| &host.texture)
     }
@@ -275,6 +308,8 @@ pub(crate) struct State {
     target_views: Vec<BoundOutput<D3D12_RENDER_TARGET_VIEW_DESC>>,
     depth_view: Option<BoundOutput<D3D12_DEPTH_STENCIL_VIEW_DESC>>,
     targets_set: bool,
+    /// The output bindings last recorded on the current native list.
+    host_targets: OutputBindings,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -292,6 +327,8 @@ pub(crate) struct State {
     fresh_tables: std::collections::HashMap<u64, Fresh, std::hash::BuildHasherDefault<Plain>>,
     /// Saved descriptor records for exact comparison on a hash hit.
     fresh_records: Vec<[u32; 3]>,
+    /// Staging descriptors shared among fresh tables in this recording.
+    list_views: crate::descriptor::host::ListViews,
     /// Root slot and fresh table byte offset for the current stage.
     made: Vec<(u8, u32)>,
     /// Reusable indices into the shader's used resources and descriptor table.
@@ -392,6 +429,7 @@ fn record(table: u64, k: u32) -> [u32; 3] {
 
 impl Drop for State {
     fn drop(&mut self) {
+        self.list_views.clear();
         for &(heap, first, n) in &self.dynamic {
             crate::descriptor::release_dynamic(heap, first, n, true);
         }
@@ -427,6 +465,7 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
+        self.list_views.clear();
         for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n, false);
         }
@@ -836,6 +875,7 @@ impl State {
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
                     self.target_views.push(BoundOutput {
+                        record: record.key(),
                         resource: None,
                         desc: Some(desc),
                     });
@@ -849,6 +889,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             self.target_views.push(BoundOutput {
+                record: record.key(),
                 resource: Some((crate::resource::ResourceRef::new(record.resource), texture)),
                 desc: record.desc(),
             });
@@ -866,6 +907,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             Some(BoundOutput {
+                record: record.key(),
                 resource: Some((crate::resource::ResourceRef::new(record.resource), texture)),
                 desc,
             })
@@ -873,7 +915,16 @@ impl State {
         self.bind_outputs(host, list);
     }
 
-    fn bind_outputs(&self, host: &crate::host::Host, list: &HostList) {
+    fn bind_outputs(&mut self, host: &crate::host::Host, list: &HostList) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_none_or(|v| v != "0"));
+        if !self.host_targets.needs_bind(
+            enabled,
+            self.target_views.iter().map(BoundOutput::key),
+            self.depth_view.as_ref().map(BoundOutput::key),
+        ) {
+            return;
+        }
         let rtvs: Vec<_> = self
             .target_views
             .iter()
@@ -960,6 +1011,7 @@ impl State {
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
+        self.host_targets.invalidate();
         if self.targets_set && let Some(host) = crate::host::host() {
             self.bind_outputs(host, list);
         }
@@ -990,6 +1042,7 @@ impl State {
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
+        self.host_targets.invalidate();
         if self.targets_set && let Some(host) = crate::host::host() {
             self.bind_outputs(host, list);
         }
@@ -1784,40 +1837,61 @@ impl State {
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
-        for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
-            };
-            let Some(view) = host.mirror(index, handle, true) else {
-                continue;
-            };
-            // Every 64 views while the device lives (a cheap query).
-            if alive
-                && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
-            {
-                alive = false;
-                GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
-                    .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                    .map(|s| s.chars().take(200).collect())
-                    .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
-                crate::host::log_removal_context();
+        let alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let start = heap.start;
+        let look = move |host: &crate::descriptor::host::HostHeap, slots: &[u32]| {
+            let address = |index| start + 32 * u64::from(index);
+            let mut found = Vec::with_capacity(slots.len());
+            for (n, &index) in slots.iter().enumerate() {
+                if let Some(view) = host.mirror(index, address(index), true)
+                    && let Some((shadow, from, len)) = crate::descriptor::host::buffer_copy(&view)
+                {
+                    #[cfg(feature = "diagnostics")]
+                    if host.shows(index, &shadow.buffer) == Some(false) {
+                        HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                    }
+                    found.push((index, (shadow, from, from + len)));
+                }
+                // Check device health while this chunk's slots are still
+                // known, including the workers' final partial chunks.
+                if alive
+                    && (n % 64 == 63 || n + 1 == slots.len())
+                    && !GONE.load(Ordering::Relaxed)
+                    && let Some(why) = crate::descriptor::host::device_removed()
+                    && !GONE.swap(true, Ordering::Relaxed)
+                {
+                    let last: Vec<String> = slots[n.saturating_sub(63)..=n]
+                        .iter()
+                        .filter_map(|&i| crate::descriptor::view(address(i)).map(|v| format!("{i}: {v:?}")))
+                        .map(|s| s.chars().take(200).collect())
+                        .collect();
+                    tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                    crate::host::log_removal_context();
+                }
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                continue;
-            };
-            #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
-                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
-            }
-            ranges.insert(index, (shadow, address, address + len));
+            found
+        };
+        // The buffer-slot snapshots only contain indices in this view heap.
+        // Resolve each refreshed span beside its mirror, then publish ranges
+        // and record commands on the command-list thread.
+        for index in &slots {
+            ranges.remove(index);
+        }
+        const MIN_BATCH: usize = 256;
+        if slots.len() >= MIN_BATCH
+            && let Some(pool) = crate::descriptor::view_workers()
+            && let Some(host) = heap.shared_host()
+        {
+            let jobs = slots.chunks(slots.len().div_ceil(pool.threads).max(MIN_BATCH / 2))
+                .map(|part| {
+                    let part = part.to_vec();
+                    let host = host.clone();
+                    move || look(&host, &part)
+                })
+                .collect();
+            ranges.extend(pool.run(jobs).into_iter().flatten());
+        } else {
+            ranges.extend(look(host, &slots));
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
@@ -2978,6 +3052,7 @@ impl State {
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
     fn tables(&mut self, list: &HostList, used: &[UsedResource], indexed: &[RootIndexedView], compute: bool) {
         self.made.clear();
+        let list_views = crate::descriptor::host::ListViews::enabled();
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh = Slots::default();
         for u in used
@@ -3115,17 +3190,34 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                let words = record(table, k);
+                let view = if list_views {
+                    self.list_views.view(words)
+                } else {
+                    crate::descriptor::view_record(words)
+                };
+                match view {
+                    Some(view @ View::Constant(address, size)) => {
+                        let gpu = if list_views {
+                            list.fill_scratch(address as *const u8, u64::from(size))
+                        } else {
+                            list.scratch(u64::from(size)).map(|(gpu, to)| {
+                                list.defer_fill(to, address as *const u8, size as usize);
+                                gpu
+                            })
+                        };
+                        let Some(gpu) = gpu else {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
+                        if !list_views || !host.make_listed(index, &mut self.list_views, words, &view, Some(gpu)) {
+                            host.constant_at(index, gpu, size);
+                        }
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        if !list_views || !host.make_listed(index, &mut self.list_views, words, &view, None) {
+                            host.make_at(index, &view);
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -4073,6 +4165,30 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod output_merger_cache {
+    use super::OutputBindings;
+
+    #[test]
+    fn duplicate_binds_are_skipped_until_replay() {
+        let mut cache = OutputBindings::default();
+        let color = (1, (2, [3; 7]));
+        let depth = (4, (5, [6; 7]));
+        let bind = |cache: &mut OutputBindings, enabled, target, depth| {
+            cache.needs_bind(enabled, [target].into_iter(), depth)
+        };
+        assert!(bind(&mut cache, true, color, Some(depth)));
+        assert!(!bind(&mut cache, true, color, Some(depth)));
+        cache.invalidate();
+        assert!(bind(&mut cache, true, color, Some(depth)));
+        assert!(!bind(&mut cache, true, color, Some(depth)));
+        assert!(bind(&mut cache, true, color, None));
+        assert!(bind(&mut cache, true, (7, color.1), None));
+        assert!(bind(&mut cache, false, (7, color.1), None));
+        assert!(bind(&mut cache, false, (7, color.1), None));
     }
 }
 

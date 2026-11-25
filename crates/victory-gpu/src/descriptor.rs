@@ -56,7 +56,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
 }
@@ -78,7 +78,7 @@ impl Heap {
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
         if let Some(h) = self.host.get() {
-            return h.as_ref();
+            return h.as_deref();
         }
         if self.desc.flags & SHADER_VISIBLE == 0 || !matches!(self.desc.kind, VIEWS_KIND | SAMPLERS)
         {
@@ -94,9 +94,14 @@ impl Heap {
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
-                Some(h)
+                Some(std::sync::Arc::new(h))
             })
-            .as_ref()
+            .as_deref()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn shared_host(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
+        self.host.get()?.as_ref()
     }
 
     /// The handle of descriptor `index` of this heap.
@@ -153,6 +158,102 @@ fn mirror(handle: u64) {
             }
         }
     }
+}
+
+// Only copied ranges without cross-slot alias writes are mirrored together.
+#[cfg(windows)]
+fn can_displace(view: &View) -> bool {
+    matches!(view, View::Placed(false, resource, _) if resource[0] != 1)
+}
+
+#[cfg(windows)]
+fn mirror_copy(dst: u64, step: u64, count: u32) {
+    const MIN_BATCH: u32 = 128;
+    let sequential = || {
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+    };
+    if count < MIN_BATCH {
+        sequential();
+        return;
+    }
+    let Some(pool) = view_workers() else {
+        sequential();
+        return;
+    };
+    let Some((heap, first)) = shader_slot(dst) else {
+        sequential();
+        return;
+    };
+    let (Some(host), Some(last)) = (heap.host.get().and_then(Option::as_ref), first.checked_add(count)) else {
+        sequential();
+        return;
+    };
+    if heap.handle(first) != Some(dst) || heap.handle(last - 1) != Some(dst + u64::from(count - 1) * step) {
+        sequential();
+        return;
+    }
+    // Preserve copy order at placed texture writes, which can invalidate
+    // another slot's descriptor. The remaining slots update independently.
+    let end = last.min(host.count());
+    let mut start = first.min(end);
+    for index in first..end {
+        let handle = dst + u64::from(index - first) * step;
+        if view(handle).as_ref().is_some_and(can_displace) {
+            mirror_slots(pool, host, start..index, dst, first, step, MIN_BATCH);
+            host.mirror(index, handle, false);
+            start = index + 1;
+        }
+    }
+    mirror_slots(pool, host, start..end, dst, first, step, MIN_BATCH);
+    for index in end.max(first)..last {
+        host.mirror(index, dst + u64::from(index - first) * step, false);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn view_workers() -> Option<&'static crate::shadow::WorkerPool> {
+    use crate::shadow::WorkerPool;
+    static POOL: std::sync::OnceLock<Option<WorkerPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let limit = crate::shadow::worker_limit();
+        let requested = std::env::var("VICTORY_VIEW_THREADS").ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(limit)
+            .clamp(1, limit);
+        WorkerPool::start("victory-view", requested)
+    }).as_ref()
+}
+
+#[cfg(windows)]
+fn mirror_slots(
+    pool: &crate::shadow::WorkerPool,
+    host: &std::sync::Arc<host::HostHeap>,
+    slots: std::ops::Range<u32>,
+    dst: u64,
+    first: u32,
+    step: u64,
+    minimum: u32,
+) {
+    let run = move |host: &host::HostHeap, slots: std::ops::Range<u32>| {
+        for index in slots {
+            host.mirror(index, dst + u64::from(index - first) * step, false);
+        }
+    };
+    let count = slots.end - slots.start;
+    if count < minimum {
+        run(host, slots);
+        return;
+    }
+    let chunk = count.div_ceil(pool.threads as u32);
+    let jobs = (slots.start..slots.end).step_by(chunk as usize).map(|start| {
+        let host = host.clone();
+        let end = start.saturating_add(chunk).min(slots.end);
+        move || run(&host, start..end)
+    }).collect();
+    // The guest owns the copied range until this synchronous copy returns.
+    pool.run(jobs);
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
@@ -220,6 +321,13 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -752,17 +860,26 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     }
 }
 
+/// A view record's words, with the calling slot already checked.
+pub(crate) fn view_record(words: [u32; 3]) -> Option<View> {
+    let [tag, i, generation] = words;
+    (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
+}
+
+#[cfg(windows)]
+fn record_current([_, i, generation]: [u32; 3]) -> bool {
+    generation >> KIND_SHIFT != 0
+        || VIEWS.read().unwrap_or_else(|e| e.into_inner())
+            .list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    if tag != VIEW_TAG {
-        return None;
-    }
-    view_at(i, generation)
+    view_record(unsafe { (handle as *const [u32; 3]).read_unaligned() })
 }
 
 /// A slot named indirectly by a material may be in the reserved, uncommitted part of a heap.
@@ -859,8 +976,8 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
+        if matches!(kind, VIEWS_KIND | SAMPLERS) {
+            mirror_copy(dst, step, count);
         }
     }
 }
