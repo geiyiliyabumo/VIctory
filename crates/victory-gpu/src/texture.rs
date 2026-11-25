@@ -438,7 +438,10 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let idle_ms = crate::host::shared_ram_idle_ms(
+        crate::host::available_physical_ram(),
+        crate::host::host().and_then(|h| h.video_memory()),
+    );
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.

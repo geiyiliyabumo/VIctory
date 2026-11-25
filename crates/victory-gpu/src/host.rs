@@ -6,7 +6,7 @@
 //! overlap them with per-submission fences once more than clears run.
 
 use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -58,6 +58,10 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Whether the adapter supports `D3D12_HEAP_TYPE_GPU_UPLOAD` (ReBAR),
+    /// used to spill upload buffers into VRAM when WDDM L0 shared memory is
+    /// saturated (e.g. 8 GiB L0 cap on 16 GiB RAM systems).
+    gpu_upload_supported: bool,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -161,6 +165,60 @@ pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     }
 }
 
+/// Effective idle timeout for L0-backed caches (`shadow` windows and texture
+/// `staging` buffers), combining host physical RAM pressure with WDDM
+/// non-local (L0 shared GPU) memory pressure. On 16 GiB RAM machines WDDM
+/// caps L0 at 8 GiB even with large pagefiles, so `avail_phys` alone can stay
+/// comfortable while L0 approaches `E_OUTOFMEMORY`.
+pub(crate) fn shared_ram_idle_ms(avail_phys: Option<u64>, video_memory: Option<[u64; 4]>) -> u64 {
+    let base = ram_idle_ms(avail_phys);
+    let Some([_, _, shared_budget, shared_used]) = video_memory else {
+        return base;
+    };
+    if shared_budget == 0 {
+        return base;
+    }
+    let used_pct = (u128::from(shared_used) * 100) / u128::from(shared_budget);
+    let l0_ms = if used_pct >= 90 {
+        1_000
+    } else if used_pct >= 80 {
+        2_000
+    } else if used_pct >= 70 {
+        5_000
+    } else {
+        10_000
+    };
+    base.min(l0_ms)
+}
+
+/// Hysteresis state for proactively routing `upload_buffer` allocations to
+/// `D3D12_HEAP_TYPE_GPU_UPLOAD` (VRAM) when WDDM L0 shared memory is tight
+/// while local VRAM still has headroom.
+static L0_SPILL_TO_VRAM: AtomicBool = AtomicBool::new(false);
+
+fn next_l0_spill_state(currently_spilling: bool, video_memory: Option<[u64; 4]>) -> bool {
+    let Some([own_budget, own_used, shared_budget, shared_used]) = video_memory else {
+        return false;
+    };
+    if shared_budget == 0 {
+        return false;
+    }
+    let shared_pct = (u128::from(shared_used) * 100) / u128::from(shared_budget);
+    let own_pct = if own_budget > 0 {
+        (u128::from(own_used) * 100) / u128::from(own_budget)
+    } else {
+        0
+    };
+    if own_pct >= 85 {
+        return false;
+    }
+    if currently_spilling {
+        shared_pct >= 75
+    } else {
+        shared_pct >= 85 && own_pct < 80
+    }
+}
+
 /// How many references are held on a host object (its COM count): ours
 /// all, since the host's views and commands hold none. A buffer or texture
 /// with one is held by its owner alone: no descriptor slot keeps it
@@ -203,6 +261,19 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    let vm = host().and_then(|h| h.video_memory());
+    let prev = L0_SPILL_TO_VRAM.load(Ordering::Relaxed);
+    let next = next_l0_spill_state(prev, vm);
+    if next != prev {
+        L0_SPILL_TO_VRAM.store(next, Ordering::Relaxed);
+        if let Some(h) = host() {
+            if next {
+                h.log_video_memory("enabling proactive GPU_UPLOAD spill (L0 pressure)");
+            } else {
+                h.log_video_memory("disabling proactive GPU_UPLOAD spill");
+            }
+        }
+    }
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -655,6 +726,16 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let gpu_upload_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS16,
+                (&raw mut o16).cast(),
+                size_of_val(&o16) as u32,
+            )
+            .is_ok()
+            && o16.GPUUploadHeapSupported.as_bool();
+        tracing::info!(supported = gpu_upload_supported, "host GPU_UPLOAD heap (ReBAR)");
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
@@ -674,6 +755,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            gpu_upload_supported,
         })
     }
 }
@@ -6479,7 +6561,7 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         // SAFETY: plain creation of a read-back buffer.
-        let made = unsafe {
+        let mut made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
@@ -6489,20 +6571,38 @@ impl Host {
                 &mut buffer,
             )
         };
+        if made.is_err() {
+            bury(FINISHED.load(Ordering::Acquire));
+            buffer = None;
+            // SAFETY: retry after reclaiming finished retired resources.
+            made = unsafe {
+                self.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+            };
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {
+                self.log_video_memory("after read_back_buffer failure");
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
             }
         }
     }
 
-    pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        MADE[0].fetch_add(1, Ordering::Relaxed);
-        MADE[1].fetch_add(size, Ordering::Relaxed);
+    fn create_upload_buffer(
+        &self,
+        heap_type: D3D12_HEAP_TYPE,
+        size: u64,
+    ) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
+            Type: heap_type,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
@@ -6521,28 +6621,91 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
-                None
+        unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut buffer,
+            )?;
+            let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+            b.Map(0, None, Some(&mut data))?;
+        }
+        Ok((
+            buffer.ok_or_else(windows::core::Error::empty)?,
+            data.cast(),
+        ))
+    }
+
+    pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        MADE[0].fetch_add(1, Ordering::Relaxed);
+        MADE[1].fetch_add(size, Ordering::Relaxed);
+        // 0 = disabled, 1 = always prefer GPU_UPLOAD, 2 = auto (spill on L0 pressure/OOM)
+        static GPU_UPLOAD_MODE: OnceLock<u8> = OnceLock::new();
+        let mode = *GPU_UPLOAD_MODE.get_or_init(|| match std::env::var("VICTORY_GPU_UPLOAD").as_deref() {
+            Ok("0") => 0,
+            Ok("1") => 1,
+            _ => 2,
+        });
+        let can_gpu_upload = self.gpu_upload_supported && mode != 0;
+        let prefer_vram = can_gpu_upload && (mode == 1 || L0_SPILL_TO_VRAM.load(Ordering::Relaxed));
+
+        if prefer_vram {
+            match self.create_upload_buffer(D3D12_HEAP_TYPE_GPU_UPLOAD, size) {
+                Ok(ok) => return Some(ok),
+                Err(_) => {
+                    bury(FINISHED.load(Ordering::Acquire));
+                    if let Ok(ok) = self.create_upload_buffer(D3D12_HEAP_TYPE_UPLOAD, size) {
+                        return Some(ok);
+                    }
+                }
             }
         }
+
+        if let Ok(ok) = self.create_upload_buffer(D3D12_HEAP_TYPE_UPLOAD, size) {
+            return Some(ok);
+        }
+
+        bury(FINISHED.load(Ordering::Acquire));
+        let err = match self.create_upload_buffer(D3D12_HEAP_TYPE_UPLOAD, size) {
+            Ok(ok) => return Some(ok),
+            Err(e) => e,
+        };
+
+        if can_gpu_upload {
+            static SPILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            match self.create_upload_buffer(D3D12_HEAP_TYPE_GPU_UPLOAD, size) {
+                Ok(ok) => {
+                    let n = SPILLS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n % 256 == 0 {
+                        tracing::warn!(
+                            error = %err,
+                            size,
+                            spills = n,
+                            "upload buffer spilled to GPU_UPLOAD (VRAM) after L0 OOM"
+                        );
+                        self.log_video_memory("on upload_buffer OOM spill to GPU_UPLOAD");
+                    }
+                    return Some(ok);
+                }
+                Err(vram_err) => {
+                    self.log_video_memory("after upload_buffer failure (UPLOAD and GPU_UPLOAD)");
+                    tracing::warn!(
+                        error = %err,
+                        vram_error = %vram_err,
+                        size,
+                        "no upload buffer (L0 and GPU_UPLOAD exhausted)"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        self.log_video_memory("after upload_buffer failure");
+        tracing::warn!(error = %err, size, "no upload buffer");
+        None
     }
 }
 
@@ -7321,7 +7484,7 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
+        let mut made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
@@ -7336,9 +7499,31 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        if made.is_err() {
+            bury(FINISHED.load(Ordering::Acquire));
+            buffer = None;
+            data = std::ptr::null_mut();
+            // SAFETY: retry after reclaiming finished retired resources.
+            made = unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(&mut data))
+                    })
+            };
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                self.log_video_memory("after shared_buffer failure");
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
             }
@@ -7710,5 +7895,32 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn shared_ram_idle_ms_respects_l0_pressure() {
+        use super::shared_ram_idle_ms;
+        let gib = 1024 * 1024 * 1024;
+        // Plenty of free physical RAM (6 GiB), but L0 shared memory tight
+        assert_eq!(shared_ram_idle_ms(Some(6 * gib), Some([16 * gib, 4 * gib, 100, 69])), 10_000);
+        assert_eq!(shared_ram_idle_ms(Some(6 * gib), Some([16 * gib, 4 * gib, 100, 70])), 5_000);
+        assert_eq!(shared_ram_idle_ms(Some(6 * gib), Some([16 * gib, 4 * gib, 100, 80])), 2_000);
+        assert_eq!(shared_ram_idle_ms(Some(6 * gib), Some([16 * gib, 4 * gib, 100, 90])), 1_000);
+        // Physical RAM pressure still applies when L0 is low
+        assert_eq!(shared_ram_idle_ms(Some(gib), Some([16 * gib, 4 * gib, 100, 20])), 2_000);
+    }
+
+    #[test]
+    fn next_l0_spill_state_uses_hysteresis_and_vram_guard() {
+        use super::next_l0_spill_state;
+        // Activates at >= 85% L0 when VRAM < 80%
+        assert!(!next_l0_spill_state(false, Some([100, 50, 100, 84])));
+        assert!(next_l0_spill_state(false, Some([100, 50, 100, 85])));
+        // Stays active down to 75%, turns off below 75%
+        assert!(next_l0_spill_state(true, Some([100, 50, 100, 75])));
+        assert!(!next_l0_spill_state(true, Some([100, 50, 100, 74])));
+        // Does not spill into VRAM if VRAM is already tight
+        assert!(!next_l0_spill_state(false, Some([100, 80, 100, 95])));
+        assert!(!next_l0_spill_state(true, Some([100, 85, 100, 95])));
     }
 }
