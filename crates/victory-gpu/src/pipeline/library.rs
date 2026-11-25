@@ -507,6 +507,263 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Pipelines a driver's compiler crashed or hung on (names, one per line).
+const CRASHED_FILE: &str = "crashed.txt";
+
+fn crashed_set() -> &'static Mutex<HashSet<String>> {
+    static NAMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let initial = DIR
+            .get()
+            .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
+            .map(|t| t.lines().map(str::to_owned).collect())
+            .unwrap_or_default();
+        Mutex::new(initial)
+    })
+}
+
+/// The pipeline named `name` is left out from now on (and across runs).
+fn note_crashed(name: &str) {
+    use std::io::Write;
+    let newly_added = crashed_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(name.to_owned());
+    if !newly_added {
+        return;
+    }
+    let Some(dir) = DIR.get() else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(CRASHED_FILE));
+    if let Ok(mut f) = file {
+        let _ = writeln!(f, "{name}");
+    }
+}
+
+/// Whether the driver crashed or hung making the pipeline named `name` before.
+fn crashed(name: &str) -> bool {
+    crashed_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(name)
+}
+
+thread_local! {
+    /// The pipeline the driver makes on this thread.
+    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The driver makes a pipeline on this thread. If its compiler crashes there
+/// (AMD RDNA4 `amdxc64.dll` does on a few world compute shaders), the pipeline
+/// is noted and left out from then on, and the thread parked: a replacement
+/// worker is spawned so the title and shader warmup keep running.
+struct Making;
+
+impl Making {
+    fn new(name: &str) -> Making {
+        use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        // SAFETY: a handler that lives as long as the process.
+        HANDLER.call_once(|| unsafe {
+            AddVectoredExceptionHandler(1, Some(compiler_crashed));
+        });
+        MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
+        endless(name, true);
+        Making
+    }
+}
+
+/// The process's private bytes.
+fn committed() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: a structure of the size passed.
+    unsafe {
+        let mut info: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        let size = size_of_val(&info) as u32;
+        if GetProcessMemoryInfo(GetCurrentProcess(), &mut info, size) == 0 {
+            return 0;
+        }
+        info.PagefileUsage as u64
+    }
+}
+
+/// Workers (threads) lost to compiles that crashed, not replaced yet.
+static LOST: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Suspends thread `id`, at work in the driver's compiler (never in a heap
+/// function, whose lock it would keep); false if it was not caught there.
+fn suspend(id: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HMODULE};
+    use windows::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleHandleExW, GetModuleHandleW,
+    };
+    use windows::Win32::System::Threading::{
+        OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext};
+    const CONTEXT_CONTROL_AMD64: u32 = 0x10_0001;
+    #[repr(align(16))]
+    struct Aligned(CONTEXT);
+    // SAFETY: plain calls on a thread of ours; the context is whole and
+    // aligned; nothing that may need the suspended thread's locks is called
+    // while it is suspended (the modules are asked about after it runs on).
+    unsafe {
+        let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, false, id) else {
+            return false;
+        };
+        let module = |at: u64| {
+            let mut m = HMODULE::default();
+            let _ = GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                PCWSTR(at as *const u16),
+                &mut m,
+            );
+            m.0 as usize
+        };
+        let named = |s: &str| GetModuleHandleW(&HSTRING::from(s)).map_or(0, |m| m.0 as usize);
+        let (ntdll, ucrt) = (named("ntdll.dll"), named("ucrtbase.dll"));
+        let mut caught = false;
+        let mut last = Vec::new();
+        for _ in 0..500 {
+            if SuspendThread(thread) == u32::MAX {
+                break;
+            }
+            let mut context: Aligned = std::mem::zeroed();
+            context.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+            let known = GetThreadContext(thread.0, &mut context.0) != 0;
+            let at = context.0.Rip >> 12;
+            if known && last.contains(&at) {
+                caught = true;
+                break;
+            }
+            ResumeThread(thread);
+            // A page of the driver's own code: caught there next time.
+            let m = module(at << 12);
+            if known && m != 0 && m != ntdll && m != ucrt {
+                last.push(at);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let _ = CloseHandle(thread);
+        caught
+    }
+}
+
+/// Notes pipelines the driver's compiler has worked on for long
+/// ([`ENDLESS`]): they are left out from the next run on. AMD's never ends
+/// some of the world's ray tracing programs, and takes memory all the while
+/// (16 GB in two minutes), so their threads are stopped.
+fn endless(name: &str, begins: bool) {
+    use std::time::{Duration, Instant};
+    const ENDLESS: Duration = Duration::from_secs(20);
+    const EVEN_SO: Duration = Duration::from_secs(150);
+    const GROWTH: u64 = 3 << 30;
+    static AT_WORK: Mutex<Vec<(String, Instant, u32)>> = Mutex::new(Vec::new());
+    static WATCH: std::sync::Once = std::sync::Once::new();
+    {
+        let mut at_work = AT_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        if begins {
+            // SAFETY: a plain call.
+            let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+            at_work.push((name.to_owned(), Instant::now(), id));
+        } else if let Some(i) = at_work.iter().position(|w| w.0 == name) {
+            at_work.swap_remove(i);
+        }
+    }
+    WATCH.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("victory-compiles".into())
+            .spawn(|| {
+                let mut noted: Vec<String> = Vec::new();
+                let mut late: Option<u64> = None;
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let lost = std::mem::take(&mut *LOST.lock().unwrap_or_else(|e| e.into_inner()));
+                    for id in lost {
+                        super::make::worker_lost(id);
+                    }
+                    let long: Vec<(String, u32)> = AT_WORK
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .filter(|w| w.1.elapsed() > ENDLESS && !noted.contains(&w.0))
+                        .map(|w| (w.0.clone(), w.2))
+                        .collect();
+                    if long.is_empty() {
+                        late = None;
+                        continue;
+                    }
+                    let now = committed();
+                    let grown = now.saturating_sub(*late.get_or_insert(now)) > GROWTH;
+                    let long: Vec<(String, u32)> = if grown {
+                        late = None;
+                        long
+                    } else {
+                        AT_WORK
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .iter()
+                            .filter(|w| w.1.elapsed() > EVEN_SO && !noted.contains(&w.0))
+                            .map(|w| (w.0.clone(), w.2))
+                            .collect()
+                    };
+                    for (name, id) in long {
+                        let stopped = suspend(id);
+                        if stopped {
+                            super::make::worker_lost(id);
+                        }
+                        tracing::error!(
+                            name,
+                            stopped,
+                            "the driver's compiler does not end a pipeline: it is left out from the next run on"
+                        );
+                        note_crashed(&name);
+                        noted.push(name);
+                    }
+                }
+            });
+    });
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        let name = MAKING.with(|m| std::mem::take(&mut *m.borrow_mut()));
+        endless(&name, false);
+    }
+}
+
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
+    // SAFETY: the system passes a live record.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let name = MAKING.try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default());
+    let name = name.unwrap_or_default();
+    // Only reads or writes of the first pages: our own guards' faults are
+    // elsewhere.
+    if record.ExceptionCode != ACCESS_VIOLATION
+        || name.is_empty()
+        || record.ExceptionInformation[1] >= 0x10000
+    {
+        return 0; // not ours
+    }
+    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out");
+    note_crashed(&name);
+    endless(&name, false);
+    // SAFETY: a plain call.
+    let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    LOST.lock().unwrap_or_else(|e| e.into_inner()).push(id);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -514,9 +771,16 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    if crashed(name) {
+        // E_FAIL.
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x8000_4005_u32 as i32,
+        )));
+    }
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        let _making = Making::new(name);
         return create();
     };
     let began = std::time::Instant::now();
@@ -543,6 +807,7 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
+        let _making = Making::new(name);
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);

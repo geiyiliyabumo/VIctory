@@ -37,6 +37,8 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
+    /// Its worker was lost to a driver compiler crash or hang: it will not be made.
+    lost: AtomicBool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -118,6 +120,7 @@ impl Pending {
             begun: OnceLock::new(),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
+            lost: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
@@ -136,8 +139,12 @@ impl Pending {
 
     fn make(&self) {
         let _ = self.begun.set(Instant::now());
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        // Not `get_or_init`: a worker lost in the driver's compiler would leave
+        // the `OnceLock` blocked forever.
+        if self.made.get().is_none() && !self.lost.load(Ordering::Relaxed) {
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let _ = self.made.set(made);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -275,6 +282,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        if p.lost.load(Ordering::Relaxed) {
+            return None;
+        }
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
@@ -284,7 +294,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
-    if p.left_out.is_some() {
+    if p.left_out.is_some() || p.lost.load(Ordering::Relaxed) {
         return false;
     }
     p.make();
@@ -294,11 +304,21 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// Translates the containers of compute programs and makes their host
 /// pipelines, for the caches on disk; whether it has one (`None`: left out).
 pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
-    let p = Pending::new(shaders, None);
+    let p = Arc::new(Pending::new(shaders, None));
     if p.left_out.is_some() {
         return None;
     }
-    Some(HostPipeline::new(&p.shaders, None).is_some())
+    start(&p, REQUESTED);
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
+        held = done
+            .wait_timeout(held, Duration::from_millis(250))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+    drop(held);
+    Some(p.made.get().is_some_and(|made| made.is_some()))
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -440,7 +460,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() && !p.slow() {
+    while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) && !p.slow() {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
@@ -545,6 +565,75 @@ fn next() -> Arc<Pending> {
     }
 }
 
+/// What the workers (by thread) are currently compiling.
+static AT_WORK: Mutex<Vec<(u32, Arc<Pending>)>> = Mutex::new(Vec::new());
+
+fn spawn_worker(i: usize) -> bool {
+    let spawned = std::thread::Builder::new()
+        .name(format!("victory-pipelines-{i}"))
+        .spawn(|| {
+            // Below the title's own threads (loading, recording).
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            loop {
+                let p = next();
+                // SAFETY: a plain call.
+                let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+                AT_WORK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((id, p.clone()));
+                p.make();
+                AT_WORK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|w| w.0 != id);
+                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    drained();
+                } else {
+                    super::library::save(false);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+        false
+    } else {
+        true
+    }
+}
+
+/// A worker is lost to a driver compiler crash or endless compile: mark its
+/// pipeline lost, wake any waiter immediately, and spawn a replacement worker.
+pub(super) fn worker_lost(id: u32) {
+    static NEXT_REPLACEMENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+    let mut found = false;
+    AT_WORK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|w| {
+            if w.0 == id {
+                w.1.lost.store(true, Ordering::Relaxed);
+                let _ = w.1.made.set(None);
+                found = true;
+            }
+            w.0 != id
+        });
+    if found {
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+        drop(_held);
+        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+            drained();
+        }
+        spawn_worker(NEXT_REPLACEMENT.fetch_add(1, Ordering::Relaxed));
+    }
+}
+
 /// Starts the workers (half the logical processors, 2 to 8) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -552,27 +641,7 @@ fn workers() -> bool {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
-                    loop {
-                        next().make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
+            if spawn_worker(i) {
                 running = true;
             }
         }
