@@ -1380,25 +1380,55 @@ fn texture_floor_bytes(video_memory: Option<[u64; 4]>) -> u64 {
 }
 
 #[cfg(any(windows, test))]
+fn adaptive_texture_cap(video_memory: Option<[u64; 4]>) -> Option<u64> {
+    match video_memory {
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => {
+            Some((budget * 38 / 100).clamp(1536 << 20, 2560 << 20))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn effective_room_percent(explicit: Option<u64>, video_memory: Option<[u64; 4]>) -> u64 {
+    if let Some(percent) = explicit {
+        return percent.clamp(50, 97);
+    }
+    match video_memory {
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 78,
+        _ => 90,
+    }
+}
+
+#[cfg(any(windows, test))]
 fn vram_reclaim_target(
     video_memory: Option<[u64; 4]>,
     filled: u64,
     explicit_limit: Option<u64>,
 ) -> u64 {
     let percent = |bytes: u64, share: u8| (u128::from(bytes) * u128::from(share) / 100) as u64;
-    if let Some(limit) = explicit_limit.filter(|&limit| limit > 0) {
-        return if filled >= percent(limit, 90) {
+    let texture_target = |limit| {
+        if filled >= percent(limit, 90) {
             filled.saturating_sub(percent(limit, 80)).max(128 << 20)
         } else {
             0
-        };
+        }
+    };
+    if let Some(limit) = explicit_limit.filter(|&limit| limit > 0) {
+        return texture_target(limit);
     }
-    match video_memory {
+    let budget_target = match video_memory {
         Some([budget, used, ..]) if budget > 0 && used >= percent(budget, 85) => {
             used.saturating_sub(percent(budget, 78)).max(256 << 20)
         }
         _ => 0,
-    }
+    };
+    let adaptive_target = if explicit_limit.is_none() {
+        adaptive_texture_cap(video_memory).map_or(0, texture_target)
+    } else {
+        0
+    };
+    budget_target.max(adaptive_target)
 }
 
 #[cfg(windows)]
@@ -1411,12 +1441,10 @@ fn explicit_texture_budget() -> Option<u64> {
 }
 
 /// Whether more host copies of textures the title fills may be made for
-/// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to the floor for the adapter's budget, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
-/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
-/// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// shaders that pick textures by index (`draw.rs` `heap_textures`).
+/// `VICTORY_TEXTURE_BUDGET_MB` sets a fixed limit on those copies' bytes.
+/// Otherwise, admission follows the adaptive cap and, beyond the texture
+/// floor, the effective share of the local budget.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1426,30 +1454,29 @@ pub(crate) fn room() -> bool {
         return filled < limit;
     }
     let vm = crate::host::host().and_then(|h| h.video_memory());
+    if adaptive_texture_cap(vm).is_some_and(|cap| filled >= cap) {
+        return false;
+    }
     if filled < texture_floor_bytes(vm) {
         return true;
     }
     match vm {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+        Some([budget, used, ..]) => {
+            used < budget / 100 * effective_room_percent(explicit_room_percent(), vm)
+        }
         None => filled < WITHOUT_BUDGET,
     }
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 90 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
-/// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
-/// textures wait (runs 170-174); the card copies of title buffers from
-/// 1 MiB up take 449 MB more of the card than before (941 against 492),
-/// and 94 gives the textures about that much back.
+/// textures picked by index are made, if set by `VICTORY_TEXTURE_ROOM_PERCENT`.
 #[cfg(windows)]
-fn room_percent() -> u64 {
-    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+fn explicit_room_percent() -> Option<u64> {
+    static PERCENT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
     })
 }
 
@@ -2799,6 +2826,48 @@ mod tests {
         assert_eq!(texture_floor_bytes(Some([8 * gib, 0, 0, 0])), 1536 << 20);
         assert_eq!(texture_floor_bytes(Some([10 * gib, 0, 0, 0])), 2 * gib);
         assert_eq!(texture_floor_bytes(Some([24 * gib, 0, 0, 0])), 2 * gib);
+    }
+
+    #[test]
+    fn adaptive_texture_cap_scales_with_budget() {
+        let gib = 1 << 30;
+        let measured_budget = 617 * gib / 100;
+        assert_eq!(adaptive_texture_cap(None), None);
+        assert_eq!(adaptive_texture_cap(Some([0; 4])), None);
+        assert_eq!(adaptive_texture_cap(Some([gib, 0, 0, 0])), Some(1536 << 20));
+        assert_eq!(
+            adaptive_texture_cap(Some([measured_budget, 0, 0, 0])),
+            Some(measured_budget * 38 / 100)
+        );
+        assert_eq!(adaptive_texture_cap(Some([73 * gib / 10, 0, 0, 0])), Some(2560 << 20));
+        assert_eq!(adaptive_texture_cap(Some([9 * gib, 0, 0, 0])), None);
+        assert_eq!(adaptive_texture_cap(Some([24 * gib, 0, 0, 0])), None);
+    }
+
+    #[test]
+    fn effective_room_percent_respects_override_and_budget() {
+        let low = Some([8 << 30, 0, 0, 0]);
+        assert_eq!(effective_room_percent(Some(83), low), 83);
+        assert_eq!(effective_room_percent(Some(49), low), 50);
+        assert_eq!(effective_room_percent(Some(98), None), 97);
+        assert_eq!(effective_room_percent(None, low), 78);
+        assert_eq!(effective_room_percent(None, Some([9 << 30, 0, 0, 0])), 90);
+        assert_eq!(effective_room_percent(None, Some([0; 4])), 90);
+        assert_eq!(effective_room_percent(None, None), 90);
+    }
+
+    #[test]
+    fn vram_reclaim_target_responds_to_adaptive_cap() {
+        let mib = 1 << 20;
+        let budget = 6000 * mib;
+        let vm = Some([budget, 4600 * mib, 0, 0]);
+        let cap = 2280 * mib;
+        let threshold = 2052 * mib;
+        assert_eq!(vram_reclaim_target(vm, threshold - 1, None), 0);
+        assert_eq!(vram_reclaim_target(vm, threshold, None), 228 * mib);
+        assert_eq!(vram_reclaim_target(vm, threshold, Some(0)), 0);
+        assert_eq!(vram_reclaim_target(vm, threshold, Some(3000 * mib)), 0);
+        assert_eq!(vram_reclaim_target(Some([budget, 5100 * mib, 0, 0]), cap, None), 456 * mib);
     }
 
     #[test]

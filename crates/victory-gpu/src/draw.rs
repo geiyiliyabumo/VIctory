@@ -191,8 +191,8 @@ struct Window {
 const WINDOW_MOST: u64 = 64;
 
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
-/// by default).
+/// buffer are clamped a window at a time (on by default, disabled by
+/// `VICTORY_INDIRECT_WINDOW=0`).
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -201,7 +201,7 @@ const WINDOW_MOST: u64 = 64;
 /// the timing run of the lit scene (run 79) a shadow draw of next to
 /// nothing cost 14-16 microseconds, 4,126 records a frame.
 ///
-/// With the switch, when a draw asks for a record a short step after the
+/// With windowing enabled, when a draw asks for a record a short step after the
 /// one drawn before, the clamp takes that record and the ones that step
 /// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
 /// most, never past the buffer) into
@@ -232,7 +232,7 @@ const WINDOW_MOST: u64 = 64;
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
 /// What one title list has set, and what its host list was last given.

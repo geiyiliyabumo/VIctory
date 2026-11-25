@@ -143,7 +143,7 @@ pub(crate) fn cards() -> bool {
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes.
 /// Below a known 9 GiB local budget (8 GB VRAM GPUs), `VICTORY_CARD_BUFFERS_MIN_MB`
-/// defaults to 8 MiB and `VICTORY_CARD_BUFFERS_MB` to 512 MiB so large hot
+/// defaults to 8 MiB and `VICTORY_CARD_BUFFERS_MB` to 640 MiB so large hot
 /// shader-written buffers stay on the GPU instead of being starved by dozens of
 /// small 1-4 MiB buffers; otherwise defaults remain 1 MiB and 1,024 MiB.
 fn card_limits() -> (u64, u64) {
@@ -178,7 +178,7 @@ fn default_card_buffers_limit(explicit_mb: Option<u64>, video_memory: Option<[u6
         return mb << 20;
     }
     match video_memory {
-        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 512 << 20,
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 640 << 20,
         _ => 1024 << 20,
     }
 }
@@ -195,8 +195,8 @@ fn default_card_buffers_limit_adapts_to_local_budget() {
     assert_eq!(default_card_buffers_min(None, None), 1 << 20);
     assert_eq!(default_card_buffers_limit(Some(768), low), 768 << 20);
     assert_eq!(default_card_buffers_limit(Some(0), low), 0);
-    assert_eq!(default_card_buffers_limit(None, low), 512 << 20);
-    assert_eq!(default_card_buffers_limit(None, Some([73 * gib / 10, 0, 0, 0])), 512 << 20);
+    assert_eq!(default_card_buffers_limit(None, low), 640 << 20);
+    assert_eq!(default_card_buffers_limit(None, Some([73 * gib / 10, 0, 0, 0])), 640 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([9 * gib, 0, 0, 0])), 1024 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([24 * gib, 0, 0, 0])), 1024 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([0; 4])), 1024 << 20);
@@ -233,6 +233,22 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 64 * 16
 }
 
+fn card_vram_limit_percent(video_memory: Option<[u64; 4]>) -> u64 {
+    match video_memory {
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 90,
+        _ => 80,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn card_vram_limit_percent_adapts_to_local_budget() {
+    assert_eq!(card_vram_limit_percent(Some([6170 << 20, 0, 0, 0])), 90);
+    assert_eq!(card_vram_limit_percent(Some([9 << 30, 0, 0, 0])), 80);
+    assert_eq!(card_vram_limit_percent(Some([0; 4])), 80);
+    assert_eq!(card_vram_limit_percent(None), 80);
+}
+
 /// A buffer of `size` bytes in the card's memory for a title buffer's
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
@@ -249,16 +265,14 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    // Only while the card has room: with this copy on it, a fifth of the
-    // budget the system gives us must still be free. Copies are made when
-    // the world loads, before the textures fill the card; the texture
-    // queue's own rule (`resource::room`: nine tenths of the budget) counts
-    // them, so the card's use stays where it was and the textures' share
-    // shrinks by the copies' bytes, at most `card_limits`' second number.
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
+    // On smaller adapters the card copy limit leaves room for buffers
+    // after textures reach their admission threshold in `resource::room`.
+    let vm = host.video_memory();
+    if let Some([budget, used, ..]) = vm {
+        let limit = (u128::from(budget) * u128::from(card_vram_limit_percent(vm)) / 100) as u64;
+        if used.saturating_add(size) > limit {
+            return None;
+        }
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
@@ -1718,7 +1732,9 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// - only the copy holds its host buffer: no descriptor slot views it (a
 ///   slot keeps the buffer it views, `HostHeap::kept`), so no draw can read
 ///   it through a slot made earlier;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+/// - nothing asked for it within the idle time and frame thresholds.
+///
+/// Aligned copies use shorter thresholds above 1,024 entries or 64 MiB.
 ///
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
@@ -1726,23 +1742,30 @@ pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
     let mut gone = Vec::new();
     let mut idle_ms = None;
-    for copies in [&LOOSE, &ALIGNED] {
+    for (copies, aligned) in [(&LOOSE, false), (&ALIGNED, true)] {
         // Hold the lock from the reference check through removal.
         let mut map = copies.lock().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
             continue;
         }
-        let idle_ms = *idle_ms.get_or_insert_with(|| {
-            crate::host::shared_ram_idle_ms(
-                crate::host::available_physical_ram(),
-                crate::host::host().and_then(|h| h.video_memory()),
-            )
-        });
+        let (idle_ms, idle_frames) = if aligned
+            && (map.len() > 1024 || map.values().map(|s| s.len.next_multiple_of(256)).sum::<u64>() > (64 << 20))
+        {
+            (200, 1)
+        } else {
+            let idle_ms = *idle_ms.get_or_insert_with(|| {
+                crate::host::shared_ram_idle_ms(
+                    crate::host::available_physical_ram(),
+                    crate::host::host().and_then(|h| h.video_memory()),
+                )
+            });
+            (idle_ms, IDLE_FRAMES)
+        };
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
