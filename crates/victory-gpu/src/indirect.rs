@@ -114,13 +114,21 @@ void main(uint3 id : SV_DispatchThreadID) {
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
         while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+            if (!REST && BUDGET - before < cost) break;
+            uint next = before + min(cost, BUDGET - before);
             uint prev;
             budget.InterlockedCompareExchange(0, before, next, prev);
             if (prev == before) break;
             before = prev;
         }
         over = before >= BUDGET || BUDGET - before < cost;
+        uint was;
+        if (over) {
+            budget.InterlockedAdd(12, 1, was);
+        }
+        if (cost >= (1u << 22)) {
+            budget.InterlockedMax(16, cost, was);
+        }
     }
     if (kind <= 1) {
         if (over) {
@@ -175,17 +183,19 @@ fn clamp() -> Option<&'static Clamp> {
 
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    make_for(device)
+    let rest = std::env::var_os("VICTORY_INDIRECT_REST").is_none_or(|v| v != "0");
+    make_for(device, rest)
 }
 
-fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+fn make_for(device: &ID3D12Device, rest: bool) -> windows::core::Result<Clamp> {
+    let source = format!("#define REST {}\n{SOURCE}", u32::from(rest));
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -522,7 +532,7 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
-                let clamp = make_for(&device).expect("clamp shader must compile on WARP");
+                let clamp = make_for(&device, true).expect("clamp shader must compile on WARP");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,
@@ -1134,6 +1144,48 @@ void main() {
         };
         assert_eq!(spent, 1 << 27);
         assert_eq!(draws, [[1 << 24, 4, 7, 9], [1 << 24, 4, 7, 9], [0, 0, 7, 9]]);
+    }
+
+    #[test]
+    fn warp_oversized_indirect_draw_can_spare_the_remaining_budget() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const CAP: u32 = 1 << 27;
+        const LARGE: u32 = 1 << 22;
+        const STRIDE: u32 = 16;
+        let (src, src_ptr, _) = warp.shared_buffer(2 * u64::from(STRIDE));
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback, readback_ptr, _) = warp.shared_buffer(2 * u64::from(STRIDE));
+        let scratch = [warp.default_uav(u64::from(STRIDE)), warp.default_uav(u64::from(STRIDE))];
+        // SAFETY: the mapped source covers two draw records.
+        unsafe { src_ptr.cast::<[[u32; 4]; 2]>().write([[LARGE, 1, 7, 9], [50, 1, 7, 9]]) };
+
+        for rest in [true, false] {
+            let clamp = make_for(&warp.device, rest).expect("clamp shader must compile on WARP");
+            // SAFETY: a completed submission, if any, has released these five words.
+            unsafe { budget_ptr.cast::<[u32; 5]>().write([CAP - 100, 0, 0, 0, 0]) };
+            for (i, dst) in scratch.iter().enumerate() {
+                let offset = i as u64 * u64::from(STRIDE);
+                assert!(record_clamp_as(
+                    &clamp, &warp.list, dst, budget_gpu, (&src, offset), None, (0, STRIDE, 1), 0,
+                ));
+                done_on(&warp.list, dst);
+                // SAFETY: the list is open and the copy fits both buffers.
+                unsafe { warp.list.CopyBufferRegion(&readback, offset, dst, 0, u64::from(STRIDE)) };
+            }
+            warp.submit_and_wait();
+            // SAFETY: the GPU has finished writing both mapped buffers.
+            let (notes, draws) = unsafe {
+                (
+                    budget_ptr.cast::<[u32; 5]>().read_volatile(),
+                    readback_ptr.cast::<[[u32; 4]; 2]>().read_volatile(),
+                )
+            };
+            let (spent, refused, second) = if rest { (CAP, 2, [0, 0, 7, 9]) } else { (CAP - 50, 1, [50, 1, 7, 9]) };
+            assert_eq!(notes, [spent, 0, 0, refused, LARGE]);
+            assert_eq!(draws, [[0, 0, 7, 9], second]);
+        }
     }
 
     /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned

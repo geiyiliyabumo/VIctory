@@ -449,17 +449,13 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    {
+    crate::watch::views_mapped(section, offset, len, || {
         let mut v = views();
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
             v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
         }
-    }
-    // This view is writable from now on: a guard over the same bytes at
-    // another view must look at them again, and the pages are noted written
-    // there (`crate::watch`).
-    crate::watch::views_mapped(section, offset, len);
+    });
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
