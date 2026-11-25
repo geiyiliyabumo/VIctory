@@ -93,8 +93,8 @@ const MAX_WORDS: usize = 5;
 fn decode_aligned(code: &[u8]) -> Option<Result<Vec<Instruction>, ShaderError>> {
     // Per dword: the index in `found` of the instruction starting there.
     // It grows to the furthest dword reached, so bytes past the code (data,
-    // padding) cost nothing.
-    let mut at: Vec<u32> = Vec::new();
+    // padding) cost nothing; room for short programs is made at once.
+    let mut at: Vec<u32> = Vec::with_capacity((code.len() / 4).min(4096));
     let mut found: Vec<Instruction> = Vec::new();
     let mut pending = vec![0usize];
     while let Some(mut offset) = pending.pop() {
