@@ -92,7 +92,9 @@ const MAX_WORDS: usize = 5;
 /// per instruction.
 fn decode_aligned(code: &[u8]) -> Option<Result<Vec<Instruction>, ShaderError>> {
     // Per dword: the index in `found` of the instruction starting there.
-    let mut at = vec![u32::MAX; code.len() / 4];
+    // It grows to the furthest dword reached, so bytes past the code (data,
+    // padding) cost nothing.
+    let mut at: Vec<u32> = Vec::new();
     let mut found: Vec<Instruction> = Vec::new();
     let mut pending = vec![0usize];
     while let Some(mut offset) = pending.pop() {
@@ -113,7 +115,7 @@ fn decode_aligned(code: &[u8]) -> Option<Result<Vec<Instruction>, ShaderError>> 
             // the longest instruction's reach.
             let before = |end: usize| {
                 (1..=MAX_WORDS.min(end / 4))
-                    .map(|k| at[end / 4 - k])
+                    .map(|k| at.get(end / 4 - k).copied().unwrap_or(u32::MAX))
                     .find(|&i| i != u32::MAX)
                     .map(|i| &found[i as usize])
             };
@@ -121,6 +123,9 @@ fn decode_aligned(code: &[u8]) -> Option<Result<Vec<Instruction>, ShaderError>> 
                 Ok(flow) => flow,
                 Err(e) => return Some(Err(e)),
             };
+            if at.len() <= offset / 4 {
+                at.resize(offset / 4 + 1, u32::MAX);
+            }
             at[offset / 4] = found.len() as u32;
             found.push(inst);
             match flow {
