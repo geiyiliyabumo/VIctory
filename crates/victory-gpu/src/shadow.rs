@@ -1634,11 +1634,10 @@ mod piece_tests {
     }
 }
 
-/// Copies of windows outside buffers let go since the start, and their
-/// bytes.
+/// Window and aligned copies let go since the start, and their bytes.
 static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// For the memory line: the windows let go since the start and their
+/// For the memory line: the window and aligned copies let go since the start and their
 /// bytes, and of the bytes of the windows alive, how many lie between the
 /// lowest and the highest address ever asked for in each.
 #[cfg(feature = "diagnostics")]
@@ -1690,8 +1689,8 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
-/// Lets go of the copies of windows outside buffers that nothing names any
-/// more. They were never freed, and the world's streaming keeps asking for
+/// Lets go of loose windows and aligned views that nothing names any more.
+/// The windows were never freed, and streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
 /// eight minutes later (run 24). A window goes when
 /// - only the table of windows holds its copy: no list not yet reset reads
@@ -1706,17 +1705,20 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
-    let gone: Vec<Arc<Shadow>> = {
-        // Held from the look to the removal: `loose` hands a copy out
-        // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gone = Vec::new();
+    let mut idle_ms = None;
+    for copies in [&LOOSE, &ALIGNED] {
+        // Hold the lock from the reference check through removal.
+        let mut map = copies.lock().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
-            return;
+            continue;
         }
-        let idle_ms = crate::host::shared_ram_idle_ms(
-            crate::host::available_physical_ram(),
-            crate::host::host().and_then(|h| h.video_memory()),
-        );
+        let idle_ms = *idle_ms.get_or_insert_with(|| {
+            crate::host::shared_ram_idle_ms(
+                crate::host::available_physical_ram(),
+                crate::host::host().and_then(|h| h.video_memory()),
+            )
+        });
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
@@ -1726,12 +1728,12 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
-    };
+        gone.extend(idle.into_iter().filter_map(|key| map.remove(&key)));
+    }
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
         crate::host::trail(|| {
-            format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
+            format!("sweep: {went} host copies of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
         });
     }
     for shadow in gone {
@@ -3237,6 +3239,33 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+pub(crate) const MAX_ALIGNED_COPY: u64 = 16 << 20;
+static ALIGNED: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// A copy starting at the first byte of a buffer view that needs alignment.
+pub(crate) fn aligned_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if len == 0 || len > MAX_ALIGNED_COPY {
+        return None;
+    }
+    address.checked_add(len)?;
+    let key = (address, len);
+    if let Some(shadow) = ALIGNED.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(shadow.clone());
+    }
+
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    shadow.window = true;
+
+    let mut map = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
+    let shadow = map.entry(key).or_insert_with(|| Arc::new(shadow));
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    Some(shadow.clone())
+}
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());

@@ -2245,22 +2245,24 @@ impl HostHeap {
             return true;
         }
         let Some((address, width)) = buffer_extent(view) else { return true };
-        let Some(shadow) = crate::shadow::find(address, width) else { return false };
+        let Some(mut shadow) = crate::shadow::find(address, width) else { return false };
+        let mut offset = shadow.offset(address);
+        let mut desc = buffer_srv_words(view).map(srv_desc);
+        if let Some(desc) = &mut desc
+            && let Some(aligned) = aligned_srv_copy(address, width, offset, desc)
+        {
+            shadow = aligned;
+            offset = 0;
+        }
         if let Some(current) = self.shows(index, &shadow.buffer) {
             return current;
         }
-        // The previous owner may have forced a null SRV because its offset
-        // could not represent the first element. Retry if the new backing
-        // can describe the view. Permanently invalid views stay cached.
-        let words = match view {
-            View::Shader(_, Some(desc)) => desc,
-            View::Placed(false, _, desc) => desc[..10].try_into().unwrap(),
-            _ => return true,
-        };
-        let mut desc = srv_desc(words);
+        // A null SRV can become valid when its backing changes or an
+        // aligned copy becomes available. Permanently invalid views stay cached.
+        let Some(mut desc) = desc else { return true };
         // SAFETY: a live buffer.
         let host_width = unsafe { shadow.buffer.GetDesc() }.Width;
-        rebase_srv(&mut desc, shadow.offset(address), host_width).is_err()
+        rebase_srv(&mut desc, offset, host_width).is_err()
     }
 
     fn shows_placed_owner(&self, index: u32, view: &View) -> bool {
@@ -2383,6 +2385,14 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
+fn buffer_srv_words(view: &View) -> Option<&[u32; 10]> {
+    match view {
+        View::Shader(_, Some(desc)) if desc[1] == D3D12_SRV_DIMENSION_BUFFER.0 as u32 => Some(desc),
+        View::Placed(false, resource, desc) if resource[0] == 1 => desc[..10].try_into().ok(),
+        _ => None,
+    }
+}
+
 /// The title's count for a structured SRV. Read it before widening or
 /// clamping the Windows view to fit the host copy. A null resource has no records.
 pub(crate) fn structured_srv_records(view: &View) -> Option<u32> {
@@ -2483,7 +2493,8 @@ fn view_extent() -> bool {
 /// bytes) it reads there; `None` for other views and empty ranges.
 ///
 /// The copy is the one the view's slot shows: [`make`] finds it by the
-/// whole buffer the view is of ([`buffer_extent`]). Looked up by the range
+/// whole buffer the view is of ([`buffer_extent`]), with a dedicated copy
+/// of the view's range if the offset needs alignment. Looked up by the range
 /// the view reads, as it was, the copy is another one wherever the two
 /// lookups differ: for memory outside buffer objects, a view of a part of a
 /// buffer that crosses a window line (the buffer's window is two cells, the
@@ -2495,14 +2506,23 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if len == 0 {
         return None;
     }
-    if view_extent()
+    let mut srv = buffer_srv_words(view).map(srv_desc);
+    let by_extent = view_extent();
+    if (by_extent || srv.is_some())
         && let Some((base, width)) = buffer_extent(view)
         // (The console is lax: a view may begin past its buffer's end.)
         && address >= base
         && address - base < width.max(1)
         && let Some(shadow) = crate::shadow::find(base, width)
     {
-        return Some((shadow, address, len));
+        if let Some(desc) = &mut srv
+            && let Some(aligned) = aligned_srv_copy(base, width, shadow.offset(base), desc)
+        {
+            return Some((aligned, address, len));
+        }
+        if by_extent {
+            return Some((shadow, address, len));
+        }
     }
     crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
 }
@@ -2636,6 +2656,36 @@ enum SrvError {
     Layout,
 }
 
+fn srv_needs_aligned_copy(offset: u64, element: u64, len: u64) -> bool {
+    element > 0 && !offset.is_multiple_of(element) && len > 0 && len <= crate::shadow::MAX_ALIGNED_COPY
+}
+
+/// Copy just the bytes the view reads and move its first element to byte zero.
+fn aligned_srv_copy(
+    address: u64,
+    len: u64,
+    offset: u64,
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+) -> Option<Arc<crate::shadow::Shadow>> {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
+    let element = element_size(desc);
+    // SAFETY: the buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let bytes = u64::from(buffer.NumElements) * element;
+    if !srv_needs_aligned_copy(offset, element, bytes) {
+        return None;
+    }
+    let first = buffer.FirstElement.checked_mul(element)?;
+    if first.checked_add(bytes)? > len {
+        return None;
+    }
+    let shadow = crate::shadow::aligned_copy(address.checked_add(first)?, bytes)?;
+    buffer.FirstElement = 0;
+    Some(shadow)
+}
+
 /// Expresses the title's SRV in the coordinates of its host backing.
 fn rebase_srv(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, offset: u64, width: u64) -> Result<(), SrvError> {
     // A structured view as a raw view of the same bytes (see `raw_window`).
@@ -2678,8 +2728,12 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
-    let offset = shadow.offset(address);
+    let mut shadow = crate::shadow::find(address, len)?;
+    let mut offset = shadow.offset(address);
+    if let Some(aligned) = aligned_srv_copy(address, len, offset, &mut desc) {
+        shadow = aligned;
+        offset = 0;
+    }
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if let Err(reason) = rebase_srv(&mut desc, offset, width) {
@@ -3513,8 +3567,11 @@ mod tests {
     }
 
     #[test]
-    fn null_typed_srv_rebinds_when_a_new_owner_places_it_on_an_element() {
-        host().expect("D3D12 test device");
+    fn misaligned_typed_srv_shares_its_copy_with_refresh_and_rebinds() {
+        if host().is_none() {
+            assert!(!crate::host::on_warp(), "D3D12 WARP test device");
+            return;
+        }
         #[repr(align(256))]
         struct Aligned([u8; 1024]);
         static DATA: Aligned = Aligned([0; 1024]);
@@ -3529,7 +3586,8 @@ mod tests {
         let mut desc = [0; 16];
         desc[0] = DXGI_FORMAT_R32G32B32_FLOAT.0 as u32;
         desc[1] = 1;
-        desc[6] = 60;
+        desc[4] = 3;
+        desc[6] = 42;
         desc[10] = address as u32;
         desc[11] = (address >> 32) as u32;
         super::super::create_placed_srv(std::ptr::null(), &resource, &desc, handle);
@@ -3537,7 +3595,11 @@ mod tests {
         crate::shadow::register(3, start, 1024);
         let outer = crate::shadow::find(address, 720).unwrap();
         heap.mirror(0, handle, true).unwrap();
-        assert_eq!(heap.shows(0, &outer.buffer), None);
+        let (aligned, from, len) = buffer_copy(&view).unwrap();
+        assert_eq!((from, len), (address + 36, 504));
+        assert_eq!(aligned.span(), (from, len));
+        assert_ne!(aligned.id(), outer.id());
+        assert_eq!(heap.shows(0, &aligned.buffer), Some(true));
         assert!(heap.buffer_owner_current(0, &view));
         crate::shadow::register(4, address, 720);
         let inner = crate::shadow::find(address, 720).unwrap();
@@ -3546,9 +3608,40 @@ mod tests {
         assert_eq!(heap.shows(0, &inner.buffer), Some(true));
         crate::shadow::unregister(4, address);
         heap.mirror(0, handle, true).unwrap();
-        assert_eq!(heap.shows(0, &outer.buffer), None);
+        assert_eq!(heap.shows(0, &aligned.buffer), Some(true));
         assert!(heap.buffer_owner_current(0, &view));
         crate::shadow::unregister(3, start);
+    }
+
+    #[test]
+    fn srv_needs_aligned_copy_checks_alignment_and_copy_size() {
+        for offset in [0, 12, 24] {
+            assert!(!srv_needs_aligned_copy(offset, 12, 504));
+        }
+        for offset in [4, 8, 21_432_688] {
+            assert!(srv_needs_aligned_copy(offset, 12, 504));
+        }
+        assert!(!srv_needs_aligned_copy(4, 0, 504));
+        assert!(!srv_needs_aligned_copy(4, 12, 0));
+        assert!(srv_needs_aligned_copy(4, 12, 16 << 20));
+        assert!(!srv_needs_aligned_copy(4, 12, (16 << 20) + 1));
+    }
+
+    #[test]
+    fn rgb32_srv_rebases_at_zero_but_rejects_a_misaligned_offset() {
+        let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32G32B32_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV { NumElements: 42, ..Default::default() },
+            },
+            ..Default::default()
+        };
+        assert!(matches!(rebase_srv(&mut desc, 21_432_688, 32 << 20), Err(SrvError::Alignment)));
+        assert!(rebase_srv(&mut desc, 0, 512).is_ok());
+        // SAFETY: the buffer view's union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        assert_eq!((buffer.FirstElement, buffer.NumElements), (0, 42));
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
