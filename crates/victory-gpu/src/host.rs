@@ -133,12 +133,11 @@ pub(crate) fn available_system_memory() -> Option<(u64, u64)> {
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
-/// scaled down under VRAM pressure. Never returns less than 1,000 ms so
-/// handles not yet recorded into a list or slot remain protected.
+/// scaled down under VRAM pressure.
 fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
-    const NORMAL_MS: u64 = 5_000;
+    const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 2_500;
-    const HIGH_MS: u64 = 1_000;
+    const HIGH_MS: u64 = 500;
     let Some([budget, used, ..]) = video_memory else {
         return NORMAL_MS;
     };
@@ -146,9 +145,9 @@ fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
         return NORMAL_MS;
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
-    if used_pct >= 85 {
+    if used_pct >= 92 {
         HIGH_MS
-    } else if used_pct >= 75 {
+    } else if used_pct >= 88 {
         MODERATE_MS
     } else {
         NORMAL_MS
@@ -279,11 +278,11 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
-const PRESSURE_SWEEP_MS: u64 = 500;
+const PRESSURE_SWEEP_MS: u64 = 1_000;
 
 fn sweep_interval(video_memory: Option<[u64; 4]>, normal_ms: u64) -> u64 {
     if video_memory.is_some_and(|[budget, used, ..]| {
-        budget > 0 && u128::from(used) >= u128::from(budget) * 85 / 100
+        budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 92
     }) {
         PRESSURE_SWEEP_MS
     } else {
@@ -309,7 +308,7 @@ fn sweep() {
         return;
     }
     let vm = host().and_then(|h| h.video_memory());
-    if now < last + sweep_interval(vm, 1000)
+    if now < last + sweep_interval(vm, 2_000)
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -319,17 +318,16 @@ fn sweep() {
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
-    let needed = crate::resource::vram_reclaim_needed();
-    let targets = crate::resource::evictable_filled_resources(needed);
-    let unpinned = if needed != 0 && targets.is_empty() {
-        crate::descriptor::host::unpin_stand_ins()
-    } else {
-        crate::descriptor::unpin_textures(&targets)
-    };
+    let needed = crate::resource::vram_reclaim_needed(vm);
+    let targets = crate::resource::evictable_filled_resources(needed, vm);
+    let mut unpinned = crate::descriptor::unpin_textures(&targets);
+    if needed != 0 && crate::resource::critical_vram_pressure(vm) {
+        unpinned += crate::descriptor::host::unpin_stand_ins();
+    }
     if unpinned > 0 {
         trail(|| format!("sweep: unpinned {unpinned} idle texture descriptor slots under VRAM pressure"));
     }
-    crate::resource::let_go_idle(&targets);
+    crate::resource::let_go_idle(&targets, vm);
     let vm = host().and_then(|h| h.video_memory());
     let prev = L0_SPILL_TO_VRAM.load(Ordering::Relaxed);
     let next = next_l0_spill_state(prev, vm);
@@ -4760,7 +4758,7 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() {
             let elapsed = now_ms().saturating_sub(SWEPT.load(Ordering::Relaxed));
-            if elapsed > PRESSURE_SWEEP_MS && elapsed > sweep_interval(self.video_memory(), 1500) {
+            if elapsed >= PRESSURE_SWEEP_MS && elapsed >= sweep_interval(self.video_memory(), 2_500) {
                 // With the present sent ahead nothing else brings a moment
                 // with nothing in the air: one is made for the sweep.
                 self.settle(&mut submitted, WHY_SYNC);
@@ -8310,19 +8308,25 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn vram_idle_ms_scales_with_pressure() {
         use super::vram_idle_ms;
         let gib = 1024 * 1024 * 1024;
-        // Normal (< 75%)
-        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
-        // Moderate (75%..85%)
-        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
-        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
-        // High (>= 85%, including over-budget)
-        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
-        // Missing or zero budget falls back to normal
-        assert_eq!(vram_idle_ms(None), 5_000);
-        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 10_000);
+        assert_eq!(vram_idle_ms(Some([100, 87, 0, 0])), 10_000);
+        assert_eq!(vram_idle_ms(Some([100, 88, 0, 0])), 2_500);
+        assert_eq!(vram_idle_ms(Some([100, 91, 0, 0])), 2_500);
+        assert_eq!(vram_idle_ms(Some([100, 92, 0, 0])), 500);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 500);
+        assert_eq!(vram_idle_ms(None), 10_000);
+        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 10_000);
+    }
+
+    #[test]
+    fn host_sweep_interval_switches_at_92_percent() {
+        use super::sweep_interval;
+        for normal_ms in [2_000, 2_500] {
+            assert_eq!(sweep_interval(None, normal_ms), normal_ms);
+            assert_eq!(sweep_interval(Some([0, 100, 0, 0]), normal_ms), normal_ms);
+            assert_eq!(sweep_interval(Some([100, 91, 0, 0]), normal_ms), normal_ms);
+            assert_eq!(sweep_interval(Some([100, 92, 0, 0]), normal_ms), 1_000);
+        }
     }
 
     #[test]
@@ -8382,10 +8386,10 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let room_on_card = Some([15 * gib, 8 * gib, 100, 20]);
         assert_eq!(system_ram_idle_ms(enough_memory), 10_000);
         assert_eq!(system_ram_idle_ms(low_commit), 500);
-        assert_eq!(texture_idle_ms(room_on_card, enough_memory), 5_000);
+        assert_eq!(texture_idle_ms(room_on_card, enough_memory), 10_000);
         assert_eq!(texture_idle_ms(room_on_card, low_commit), 500);
         assert_eq!(texture_idle_ms(room_on_card, Some((gib, 8 * gib))), 2_000);
-        assert_eq!(texture_idle_ms(Some([100, 75, 100, 20]), enough_memory), 2_500);
+        assert_eq!(texture_idle_ms(Some([100, 88, 100, 20]), enough_memory), 2_500);
         assert_eq!(texture_idle_ms(Some([100, 10, 100, 90]), enough_memory), 1_000);
     }
 

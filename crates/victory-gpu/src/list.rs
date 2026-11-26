@@ -936,6 +936,9 @@ extern "system" fn copy_texture_region(
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let made = read_back(list, dst, x, y, z, src, source_box);
+            if made.is_ok() {
+                with_state(this, |_, state| state.invalidate_window());
+            }
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if made.is_err() && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {
@@ -1297,18 +1300,18 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && dst != 0
-        && src != 0
-    {
+    if dst != 0 && src != 0 {
         let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
+        with_state(this, |list, state| {
+            state.invalidate_window();
+            list.defer(move || {
+                if crate::texture::committed(src as *const u8, len)
+                    && crate::texture::committed(dst as *const u8, len)
+                {
+                    // SAFETY: both ranges are committed title memory.
+                    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                }
+            });
         });
     }
     #[cfg(not(windows))]
@@ -2043,6 +2046,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     }
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
+        with_state(this, |_, state| state.invalidate_window());
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }

@@ -73,17 +73,15 @@ impl Flip {
     }
 }
 
-/// Sweep stand-ins when the memory budget is under pressure but no title
-/// resource is still registered for eviction.
+/// Sweep stand-ins when the memory budget is at critical pressure. The
+/// previous views can outlive the title objects that owned them.
 pub(crate) fn unpin_stand_ins() -> usize {
     let heaps = super::SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     heaps.iter().filter_map(|&(_, _, at)| {
         // SAFETY: the registry lock excludes heap destruction.
         unsafe { &*(at as *const super::Heap) }.shared_host()
-    }).filter(|heap| !heap.sampler && heap.pending_textures.iter().any(|stripe| {
-        stripe.lock().unwrap_or_else(|e| e.into_inner()).values().any(|p| p.kept_previous)
-    }))
-        .map(|heap| heap.unpin_textures(|_, _| {})).sum()
+    }).filter(|heap| !heap.sampler)
+        .map(|heap| heap.unpin_stand_ins()).sum()
 }
 
 pub(crate) struct HostHeap {
@@ -105,8 +103,8 @@ pub(crate) struct HostHeap {
     made: Box<[AtomicU64]>,
     pending_textures: [Mutex<HashMap<u32, PendingTexture>>; SLOT_STRIPES],
     texture_serial: AtomicU64,
-    /// Ordinary writes share the gate and lock their slot's stripe. Writes
-    /// that displace other slots and the pressure sweep take it exclusively.
+    /// Ordinary writes and unpinning share the gate and lock their slot's
+    /// stripe. Writes that displace other slots take it exclusively.
     aliases: RwLock<()>,
     slot_locks: [Mutex<()>; SLOT_STRIPES],
     /// The host resource each slot views, held while the slot does: shaders
@@ -2035,60 +2033,119 @@ impl HostHeap {
     }
 
     /// Clears idle copies while the submission lock keeps the GPU settled.
+    /// The caller skips empty target sets; the first pass checks membership
+    /// only, with no resource or descriptor locks nested inside a stripe.
     pub(super) fn unpin_textures(
         &self,
-        mut with_idle_copy: impl FnMut(usize, &mut dyn FnMut()),
+        mut with_idle_copy: impl FnMut(usize, Option<&mut dyn FnMut()>) -> bool,
     ) -> usize {
-        // Exclude mirrored writes and preserve the reservation check for
-        // dynamic tables. Allocation and release take next before kept.
-        let _aliases = self.aliases.write().unwrap_or_else(|e| e.into_inner());
-        let next = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        let now = crate::host::moment();
-        let mut unpinned = 0;
-        for index in 0..self.count + next.1.len() as u32 {
-            // A reserved table can still be submitted even when the GPU is idle.
-            if index >= self.count && next.1[(index - self.count) as usize] {
-                continue;
-            }
-            let (mut kept, offset) = self.kept_slot(index);
-            let slot = &mut kept[offset];
-            let Some(resource) = slot.as_ref() else { continue };
-            let raw = resource.as_raw() as usize;
-            let mut clear = || {
-                let at = self.cpu(index);
-                let key = self.made_key(index);
-                let pending = self.pending(index).remove(&index);
-                let mut replacement = None;
-                if let Some(view) = pending.and_then(|p| view_at(p.key as u32, (p.key >> 32) as u32)) {
-                    replacement = neutral_for(&view, at);
-                } else {
-                    match view_at(key as u32, (key >> 32) as u32) {
-                        Some(View::Shader(_, Some(desc))) => null_like(&desc, at),
-                        Some(View::Placed(false, _, desc)) => null_like(desc.first_chunk().unwrap(), at),
-                        _ => null_view(at),
+        let mut candidates = Vec::new();
+        for (stripe, slots) in self.kept.iter().enumerate() {
+            let slots = slots.lock().unwrap_or_else(|e| e.into_inner());
+            for (offset, resource) in slots.iter().enumerate() {
+                if let Some(resource) = resource {
+                    let raw = resource.as_raw() as usize;
+                    if with_idle_copy(raw, None) {
+                        candidates.push(((offset * SLOT_STRIPES + stripe) as u32, raw));
                     }
                 }
-                *slot = replacement;
-                if index < self.count {
-                    self.made[index as usize].store(TRACKED_NULL, Ordering::Relaxed);
-                    textures.remove(index);
-                    textures.evicted.insert(index, now);
-                } else if let Some(dirty) = self.dynamic_dirty(index) {
-                    dirty.store(false, Ordering::Relaxed);
-                }
-                unpinned += 1;
-            };
-            // A stand-in may outlive the title object that owned it.
-            // Reclaim it during a pressure sweep even if that object is
-            // no longer in the eviction registry.
-            if self.pending(index).get(&index).is_some_and(|p| p.kept_previous) {
-                clear();
-            } else {
-                with_idle_copy(raw, &mut clear);
             }
         }
-        unpinned
+        candidates.into_iter().filter(|&(index, raw)| {
+            self.unpin_candidate(index, raw, None, |clear| {
+                with_idle_copy(raw, Some(clear));
+            })
+        }).count()
+    }
+
+    fn unpin_stand_ins(&self) -> usize {
+        let mut candidates = Vec::new();
+        let mut pending_slots = Vec::new();
+        for (stripe, pending) in self.pending_textures.iter().enumerate() {
+            {
+                let pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+                pending_slots.extend(pending.iter().filter_map(|(&index, p)| {
+                    p.kept_previous.then_some((index, p.serial))
+                }));
+            }
+            if pending_slots.is_empty() {
+                continue;
+            }
+            let slots = self.kept[stripe].lock().unwrap_or_else(|e| e.into_inner());
+            for (index, serial) in pending_slots.drain(..) {
+                if let Some(resource) = &slots[index as usize / SLOT_STRIPES] {
+                    candidates.push((index, resource.as_raw() as usize, serial));
+                }
+            }
+        }
+        candidates.into_iter().filter(|&(index, raw, serial)| {
+            self.unpin_candidate(index, raw, Some(serial), |clear| clear())
+        }).count()
+    }
+
+    fn unpin_candidate(
+        &self,
+        index: u32,
+        raw: usize,
+        stand_in: Option<u64>,
+        with_idle_copy: impl FnOnce(&mut dyn FnMut()),
+    ) -> bool {
+        let _aliases = self.aliases.read().unwrap_or_else(|e| e.into_inner());
+        let dynamic = index.checked_sub(self.count);
+        // A reserved table can still be submitted even when the GPU is idle.
+        // Dynamic writers own their reservation; release and allocation take next.
+        let next = dynamic.map(|_| self.next.lock().unwrap_or_else(|e| e.into_inner()));
+        if let (Some(next), Some(offset)) = (&next, dynamic)
+            && next.1.get(offset as usize) != Some(&false)
+        {
+            return false;
+        }
+        let _slot = dynamic.is_none().then(|| self.lock_slot(index));
+        let pending = if dynamic.is_none() { self.pending(index).get(&index).copied() } else { None };
+        match (stand_in, pending) {
+            (None, None) => {}
+            (Some(serial), Some(p)) if p.kept_previous && p.serial == serial => {}
+            _ => return false,
+        }
+        let mut old = None;
+        with_idle_copy(&mut || {
+            let (mut kept, offset) = self.kept_slot(index);
+            let slot = &mut kept[offset];
+            if slot.as_ref().is_none_or(|resource| resource.as_raw() as usize != raw) {
+                return;
+            }
+            let at = self.cpu(index);
+            let replacement = if let Some(view) = pending.and_then(|p| view_at(p.key as u32, (p.key >> 32) as u32)) {
+                neutral_for(&view, at)
+            } else {
+                let key = self.made_key(index);
+                match view_at(key as u32, (key >> 32) as u32) {
+                    Some(View::Shader(_, Some(desc))) => null_like(&desc, at),
+                    Some(View::Placed(false, _, desc)) => null_like(desc.first_chunk().unwrap(), at),
+                    _ => null_view(at),
+                }
+                None
+            };
+            old = std::mem::replace(slot, replacement);
+        });
+        let Some(old) = old else { return false };
+        if index < self.count {
+            self.made[index as usize].store(TRACKED_NULL, Ordering::Relaxed);
+            if let Some(p) = self.pending(index).get_mut(&index) {
+                // Keep the serial and queue entry so an upload still flips
+                // this slot and publishes its recheck when the copy lands.
+                p.kept_previous = false;
+            }
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if stand_in.is_none() {
+                textures.remove(index);
+            }
+            textures.evicted.insert(index, crate::host::moment());
+        } else if let Some(dirty) = self.dynamic_dirty(index) {
+            dirty.store(false, Ordering::Relaxed);
+        }
+        crate::host::retire(old);
+        true
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -2691,8 +2748,9 @@ impl HostHeap {
                 make_inner(&view, self.cpu(index), &mut retry, !show_after && ahead, &mut copying)
             };
             if wait || copying {
-                let mut pending = self.pending(index);
-                pending.entry(index).or_insert_with(|| {
+                // The alias gate and slot lock serialize writers here. Keep
+                // pending's stripe out of the descriptor and kept writes.
+                if !self.pending(index).contains_key(&index) {
                     let keep = keep_shown() && view_at(shown as u32, (shown >> 32) as u32)
                         .is_some_and(|old| kin(&old, &view)) && {
                             let (kept, offset) = self.kept_slot(index);
@@ -2703,13 +2761,13 @@ impl HostHeap {
                         self.keep(index, stand_in);
                         made.store(TRACKED_NULL, Ordering::Relaxed);
                     }
-                    PendingTexture {
+                    self.pending(index).insert(index, PendingTexture {
                         key,
                         serial: self.texture_serial.fetch_add(1, Ordering::Relaxed),
                         kept_previous: keep,
                         selected: for_draw,
-                    }
-                });
+                    });
+                }
                 return Ok(Some(view));
             }
             if kept.is_none() && !self.sampler {
@@ -4311,14 +4369,23 @@ mod tests {
         super::super::record(handle, view.clone());
         assert_eq!(host.shows(0, &old_copy.texture), Some(true));
         let flip = HostHeap::flip_request(heap, 0, handle, &view).unwrap();
-        assert_eq!(host.unpin_textures(|_, _| {}), 1);
+        let old_raw = old_copy.texture.as_raw() as usize;
+        assert_eq!(host.unpin_textures(|raw, clear| {
+            let matches = raw == old_raw;
+            if matches && let Some(clear) = clear {
+                clear();
+            }
+            matches
+        }), 0);
+        assert_eq!(host.shows(0, &old_copy.texture), Some(true));
+        assert_eq!(host.unpin_stand_ins(), 1);
         assert_eq!(host.shows(0, &old_copy.texture), Some(false));
         list.reset();
         crate::texture::upload(&list, new.resource, &new_copy.texture);
         list.defer_texture_ready(move || flip.flip_now());
         list.close();
         device.execute(&[&list]);
-        assert_eq!(host.shows(0, &new_copy.texture), Some(false));
+        assert_eq!(host.shows(0, &new_copy.texture), Some(true));
     }
 
     #[test]
@@ -5194,9 +5261,11 @@ mod tests {
         let targets = std::collections::HashSet::from([target.as_raw() as usize]);
         let unpin = || {
             heap.unpin_textures(|raw, clear| {
-                if targets.contains(&raw) {
+                let matches = targets.contains(&raw);
+                if matches && let Some(clear) = clear {
                     clear();
                 }
+                matches
             })
         };
 

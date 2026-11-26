@@ -1473,7 +1473,7 @@ fn texture_floor_bytes(video_memory: Option<[u64; 4]>) -> u64 {
 fn adaptive_texture_cap(video_memory: Option<[u64; 4]>) -> Option<u64> {
     match video_memory {
         Some([budget, ..]) if budget > 0 && budget < (9 << 30) => {
-            Some((budget * 34 / 100).clamp(1280 << 20, 2176 << 20))
+            Some((budget * 24 / 100).clamp(1024 << 20, 1536 << 20))
         }
         _ => None,
     }
@@ -1498,12 +1498,33 @@ fn effective_room_percent(explicit: Option<u64>, video_memory: Option<[u64; 4]>)
 }
 
 #[cfg(any(windows, test))]
+fn percent(bytes: u64, share: u8) -> u64 {
+    (u128::from(bytes) * u128::from(share) / 100) as u64
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn critical_vram_pressure(video_memory: Option<[u64; 4]>) -> bool {
+    video_memory.is_some_and(|[budget, used, ..]| budget > 0 && used >= percent(budget, 94))
+}
+
+#[cfg(any(windows, test))]
+fn filled_working_set_floor(video_memory: Option<[u64; 4]>, explicit_limit: Option<u64>) -> u64 {
+    if explicit_limit.is_none_or(|limit| limit == 0)
+        && video_memory.is_some_and(|[budget, ..]| budget > 0)
+        && !critical_vram_pressure(video_memory)
+    {
+        768 << 20
+    } else {
+        0
+    }
+}
+
+#[cfg(any(windows, test))]
 fn vram_reclaim_target(
     video_memory: Option<[u64; 4]>,
     filled: u64,
     explicit_limit: Option<u64>,
 ) -> u64 {
-    let percent = |bytes: u64, share: u8| (u128::from(bytes) * u128::from(share) / 100) as u64;
     let texture_target = |limit| {
         if filled >= percent(limit, 90) {
             filled.saturating_sub(percent(limit, 80)).max(128 << 20)
@@ -1515,8 +1536,8 @@ fn vram_reclaim_target(
         return texture_target(limit);
     }
     let budget_target = match video_memory {
-        Some([budget, used, ..]) if budget > 0 && used >= percent(budget, 80) => {
-            used.saturating_sub(percent(budget, 72)).max(256 << 20)
+        Some([budget, used, ..]) if budget > 0 && used >= percent(budget, 90) => {
+            used.saturating_sub(percent(budget, 84)).max(256 << 20)
         }
         _ => 0,
     };
@@ -1525,7 +1546,12 @@ fn vram_reclaim_target(
     } else {
         0
     };
-    budget_target.max(adaptive_target)
+    let floor = filled_working_set_floor(video_memory, explicit_limit);
+    if floor == 0 {
+        budget_target.max(adaptive_target)
+    } else {
+        budget_target.max(adaptive_target).min(filled.saturating_sub(floor))
+    }
 }
 
 #[cfg(windows)]
@@ -1545,57 +1571,70 @@ fn texture_sweep_enabled() -> bool {
 
 /// Bytes to reclaim from idle filled textures before admitting more copies.
 #[cfg(windows)]
-pub(crate) fn vram_reclaim_needed() -> u64 {
+pub(crate) fn vram_reclaim_needed(vm: Option<[u64; 4]>) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     if !texture_sweep_enabled() {
         return 0;
     }
-    let vm = crate::host::host().and_then(|h| h.video_memory());
     vram_reclaim_target(vm, KINDS[1].load(Relaxed), explicit_texture_budget())
 }
 
 /// Keeps the title resources alive between the resource and descriptor scans.
 /// The raw host identities are only used as keys, never dereferenced.
 #[cfg(windows)]
-#[derive(Default)]
-pub(crate) struct EvictableFilledResources(std::collections::HashMap<usize, ResourceRef>);
+pub(crate) struct EvictableFilledResources {
+    copies: std::collections::HashMap<usize, ResourceRef>,
+    idle_ms: u64,
+}
 
 #[cfg(windows)]
 impl EvictableFilledResources {
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.copies.is_empty()
     }
 
-    /// Recheck under the same lock as `hosted`: a recording thread may have
-    /// used the texture since the sweep selected it.
-    pub(crate) fn with_idle_copy(&self, raw: usize, unpin: &mut dyn FnMut()) {
+    /// With no action, check only membership so the descriptor scan can run
+    /// under a kept stripe alone. Recheck under the same lock as `hosted`
+    /// before running an action: a recording thread may have used the copy.
+    pub(crate) fn with_idle_copy(&self, raw: usize, unpin: Option<&mut dyn FnMut()>) -> bool {
         use windows::core::Interface;
-        let Some(title) = self.0.get(&raw) else { return };
+        let Some(title) = self.copies.get(&raw) else { return false };
+        let Some(unpin) = unpin else { return true };
         let r = resource(title.as_ptr());
         let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         if made.as_ref().is_some_and(|(host, _)| {
             host.texture.as_raw() as usize == raw
-                && idle_for_unpin(r, host)
+                && idle_for_unpin(r, host, self.idle_ms)
                 && !crate::texture::host_wrote(title.0)
         }) {
             unpin();
+            true
+        } else {
+            false
         }
     }
 }
 
 #[cfg(windows)]
-fn idle_for_unpin(r: &Resource, host: &std::sync::Arc<HostTexture>) -> bool {
+fn idle_for_unpin(r: &Resource, host: &std::sync::Arc<HostTexture>, idle_ms: u64) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    crate::host::long_ago(r.host.used.load(Relaxed), 500, 2)
+    crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, 2)
         && std::sync::Arc::strong_count(host) == 1
+        && !host.upload.copying()
 }
 
 /// Select the oldest descriptor-pinned filled textures first.
 #[cfg(windows)]
-pub(crate) fn evictable_filled_resources(target_bytes: u64) -> EvictableFilledResources {
+pub(crate) fn evictable_filled_resources(
+    target_bytes: u64,
+    vm: Option<[u64; 4]>,
+) -> EvictableFilledResources {
     use std::sync::atomic::Ordering::Relaxed;
     use windows::core::Interface;
-    let mut targets = EvictableFilledResources::default();
+    let mut targets = EvictableFilledResources {
+        copies: Default::default(),
+        idle_ms: if critical_vram_pressure(vm) { 500 } else { 2_000 },
+    };
     if target_bytes == 0 {
         return targets;
     }
@@ -1609,7 +1648,7 @@ pub(crate) fn evictable_filled_resources(target_bytes: u64) -> EvictableFilledRe
         }
         let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((host, _)) = made.as_ref()
-            && idle_for_unpin(r, host)
+            && idle_for_unpin(r, host, targets.idle_ms)
             && crate::host::references(&host.texture) > 1
         {
             candidates.push((
@@ -1621,10 +1660,12 @@ pub(crate) fn evictable_filled_resources(target_bytes: u64) -> EvictableFilledRe
         }
     }
     candidates.sort_unstable_by_key(|&(last_used, at, ..)| (last_used, at));
+    let floor = filled_working_set_floor(vm, explicit_texture_budget());
+    let reclaimable = KINDS[1].load(Relaxed).saturating_sub(floor);
     let mut bytes = 0u64;
     for (_, at, raw, size) in candidates {
-        if object::try_add_ref(at as This) {
-            targets.0.insert(raw, ResourceRef(at));
+        if size <= reclaimable.saturating_sub(bytes) && object::try_add_ref(at as This) {
+            targets.copies.insert(raw, ResourceRef(at));
             bytes = bytes.saturating_add(size);
             if bytes >= target_bytes {
                 break;
@@ -1648,7 +1689,7 @@ pub(crate) fn room() -> bool {
         return filled < limit;
     }
     let vm = crate::host::host().and_then(|h| h.video_memory());
-    if adaptive_texture_cap(vm).is_some_and(|cap| filled >= cap) {
+    if emergency_vram_redline(vm) || adaptive_texture_cap(vm).is_some_and(|cap| filled >= cap) {
         return false;
     }
     if filled < texture_floor_bytes(vm) {
@@ -1908,9 +1949,9 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
 ///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for the idle time and four frames, for 500 ms
-///   and two frames when selected for unpinning, or for 200 ms and one
-///   frame during pressure-driven eviction.
+/// - nothing asked for it for the idle time and four frames, for two seconds
+///   (500 ms at critical pressure) and two frames when selected for
+///   unpinning, or for 200 ms and one frame during pressure-driven eviction.
 ///
 /// The next use makes the host copy anew and uploads the title's memory
 /// again (its staging state goes with it). The title resource stays: its
@@ -1922,7 +1963,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
-pub(crate) fn let_go_idle(targets: &EvictableFilledResources) {
+pub(crate) fn let_go_idle(targets: &EvictableFilledResources, vm: Option<[u64; 4]>) {
     use std::sync::atomic::Ordering::Relaxed;
     use windows::core::Interface;
     const IDLE_FRAMES: u64 = 4;
@@ -1931,10 +1972,15 @@ pub(crate) fn let_go_idle(targets: &EvictableFilledResources) {
     if !texture_sweep_enabled() {
         return;
     }
-    let vm = crate::host::host().and_then(|h| h.video_memory());
     let idle_ms = crate::host::texture_idle_ms(vm, crate::host::available_system_memory());
     // Both pressure measurements precede the sweep so its bytes are credited once.
     let filled = KINDS[1].load(Relaxed);
+    let explicit_limit = explicit_texture_budget();
+    let floor = filled_working_set_floor(vm, explicit_limit);
+    let reclaimable = filled.saturating_sub(floor);
+    if reclaimable == 0 {
+        return;
+    }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1950,9 +1996,11 @@ pub(crate) fn let_go_idle(targets: &EvictableFilledResources) {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 (crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    || (targets.0.contains_key(&(host.texture.as_raw() as usize))
-                        && idle_for_unpin(r, host)))
+                    || (targets.copies.contains_key(&(host.texture.as_raw() as usize))
+                        && idle_for_unpin(r, host, targets.idle_ms)))
+                    && host.bytes <= reclaimable.saturating_sub(bytes)
                     && std::sync::Arc::strong_count(host) == 1
+                    && !host.upload.copying()
                     && crate::host::references(&host.texture) == 1
             });
             if idle {
@@ -1989,7 +2037,7 @@ pub(crate) fn let_go_idle(targets: &EvictableFilledResources) {
     if vm.is_some_and(|[budget, ..]| budget >= (10 << 30)) {
         return;
     }
-    let remaining_target = vram_reclaim_target(vm, filled, explicit_texture_budget()).saturating_sub(bytes);
+    let remaining_target = vram_reclaim_target(vm, filled, explicit_limit).saturating_sub(bytes);
     if remaining_target == 0 {
         return;
     }
@@ -2007,6 +2055,7 @@ pub(crate) fn let_go_idle(targets: &EvictableFilledResources) {
         if crate::host::long_ago(last_used, LRU_MS, LRU_FRAMES)
             && made.as_ref().is_some_and(|(host, _)| {
                 std::sync::Arc::strong_count(host) == 1
+                    && !host.upload.copying()
                     && crate::host::references(&host.texture) == 1
             })
         {
@@ -2022,6 +2071,8 @@ pub(crate) fn let_go_idle(targets: &EvictableFilledResources) {
         let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         if !made.as_ref().is_some_and(|(host, _)| {
             std::sync::Arc::strong_count(host) == 1
+                && !host.upload.copying()
+                && host.bytes <= reclaimable.saturating_sub(bytes + lru_bytes)
                 && crate::host::references(&host.texture) == 1
                 && crate::host::long_ago(r.host.used.load(Relaxed), LRU_MS, LRU_FRAMES)
                 && !crate::texture::host_wrote(at)
@@ -3096,15 +3147,15 @@ mod tests {
     #[test]
     fn adaptive_texture_cap_scales_with_budget() {
         let gib = 1 << 30;
-        let measured_budget = 6298 << 20;
+        let measured_budget = 6304 << 20;
         assert_eq!(adaptive_texture_cap(None), None);
         assert_eq!(adaptive_texture_cap(Some([0; 4])), None);
-        assert_eq!(adaptive_texture_cap(Some([gib, 0, 0, 0])), Some(1280 << 20));
+        assert_eq!(adaptive_texture_cap(Some([gib, 0, 0, 0])), Some(1024 << 20));
         assert_eq!(
             adaptive_texture_cap(Some([measured_budget, 0, 0, 0])),
-            Some(measured_budget * 34 / 100)
+            Some(measured_budget * 24 / 100)
         );
-        assert_eq!(adaptive_texture_cap(Some([73 * gib / 10, 0, 0, 0])), Some(2176 << 20));
+        assert_eq!(adaptive_texture_cap(Some([73 * gib / 10, 0, 0, 0])), Some(1536 << 20));
         assert_eq!(adaptive_texture_cap(Some([9 * gib, 0, 0, 0])), None);
         assert_eq!(adaptive_texture_cap(Some([24 * gib, 0, 0, 0])), None);
     }
@@ -3138,30 +3189,57 @@ mod tests {
         let mib = 1 << 20;
         let budget = 6000 * mib;
         let vm = Some([budget, 4600 * mib, 0, 0]);
-        let cap = 2040 * mib;
-        let threshold = 1836 * mib;
+        let cap = 1440 * mib;
+        let threshold = 1296 * mib;
         assert_eq!(vram_reclaim_target(vm, threshold - 1, None), 0);
-        assert_eq!(vram_reclaim_target(vm, threshold, None), 204 * mib);
+        assert_eq!(vram_reclaim_target(vm, threshold, None), 144 * mib);
         assert_eq!(vram_reclaim_target(vm, threshold, Some(0)), 0);
         assert_eq!(vram_reclaim_target(vm, threshold, Some(3000 * mib)), 0);
-        assert_eq!(vram_reclaim_target(Some([budget, 4800 * mib, 0, 0]), cap, None), 480 * mib);
+        assert_eq!(vram_reclaim_target(vm, cap, None), 288 * mib);
     }
 
     #[test]
     fn vram_reclaim_target_responds_to_pressure() {
         let mib = 1 << 20;
         let budget = 6000 * mib;
-        let at_pressure = Some([budget, 4800 * mib, 0, 0]);
-        assert_eq!(vram_reclaim_target(Some([budget, 4800 * mib - 1, 0, 0]), 0, None), 0);
-        assert_eq!(vram_reclaim_target(at_pressure, 0, None), 480 * mib);
-        assert_eq!(vram_reclaim_target(Some([budget, 6500 * mib, 0, 0]), 0, None), 2180 * mib);
-        assert_eq!(vram_reclaim_target(Some([1000 * mib, 800 * mib, 0, 0]), 0, None), 256 * mib);
+        let at_pressure = Some([budget, 5400 * mib, 0, 0]);
+        assert_eq!(vram_reclaim_target(Some([budget, 5400 * mib - 1, 0, 0]), 1200 * mib, None), 0);
+        assert_eq!(vram_reclaim_target(at_pressure, 1200 * mib, None), 360 * mib);
+        assert_eq!(vram_reclaim_target(Some([budget, 6500 * mib, 0, 0]), 0, None), 1460 * mib);
+        assert_eq!(vram_reclaim_target(Some([1000 * mib, 900 * mib, 0, 0]), 1090 * mib, Some(0)), 256 * mib);
         assert_eq!(vram_reclaim_target(at_pressure, 899 * mib, Some(1000 * mib)), 0);
         assert_eq!(vram_reclaim_target(None, 900 * mib, Some(1000 * mib)), 128 * mib);
         assert_eq!(vram_reclaim_target(None, 950 * mib, Some(1000 * mib)), 150 * mib);
-        assert_eq!(vram_reclaim_target(at_pressure, 0, Some(0)), 480 * mib);
+        assert_eq!(vram_reclaim_target(at_pressure, 1200 * mib, Some(0)), 360 * mib);
         assert_eq!(vram_reclaim_target(Some([0, budget, 0, 0]), budget, None), 0);
         assert_eq!(vram_reclaim_target(None, budget, None), 0);
+    }
+
+    #[test]
+    fn vram_reclaim_leaves_a_small_working_set_alone_at_84_percent() {
+        let mib = 1 << 20;
+        let vm = Some([6304 * mib, 5300 * mib, 0, 0]);
+        assert_eq!(vram_reclaim_target(vm, 500 * mib, None), 0);
+    }
+
+    #[test]
+    fn vram_reclaim_stops_at_the_working_set_floor_at_91_percent() {
+        let mib = 1 << 20;
+        let vm = Some([6304 * mib, 5737 * mib, 0, 0]);
+        assert_eq!(vram_reclaim_target(vm, 1200 * mib, None), (1200 - 768) * mib);
+    }
+
+    #[test]
+    fn vram_reclaim_bypasses_the_working_set_floor_at_critical_pressure() {
+        let mib = 1 << 20;
+        let budget = 6304 * mib;
+        let critical = percent(budget, 94);
+        assert_eq!(vram_reclaim_target(Some([budget, critical - 1, 0, 0]), 500 * mib, None), 0);
+        assert!(critical_vram_pressure(Some([budget, critical, 0, 0])));
+        assert_eq!(
+            vram_reclaim_target(Some([budget, 5989 * mib, 0, 0]), 500 * mib, None),
+            5989 * mib - percent(budget, 84),
+        );
     }
 
     type Release = extern "system" fn(This) -> u32;
