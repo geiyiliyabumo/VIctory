@@ -86,8 +86,15 @@ enum Stop {
     Fail(ShaderError),
 }
 
+pub(super) const ALBEDO_DWORD: u32 = 584;
+
+#[cfg(test)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_counted(parts, counted_in_threads(parts))
+    lower_with_ambient(parts, false)
+}
+
+pub(crate) fn lower_with_ambient(parts: &Parts, tiled_ambient: bool) -> Result<Lowered, ShaderError> {
+    lower_counted_ambient(parts, counted_in_threads(parts), tiled_ambient)
 }
 
 /// Whether the title dispatches the program by a count of threads whose last
@@ -110,10 +117,17 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// [`lower`]; `counted`: the lanes past a dispatch's count of threads leave
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
+#[cfg(test)]
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+    lower_counted_ambient(parts, counted, false)
+}
+
+fn lower_counted_ambient(parts: &Parts, counted: bool, tiled_ambient: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        let mut lower = Lower::new(parts, &bad);
+        lower.tiled_ambient = tiled_ambient;
+        match lower.run(counted) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -264,6 +278,7 @@ struct Lower<'a> {
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
+    tiled_ambient: bool,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
     /// DXIL block per IR block (unreachable: none).
@@ -2036,6 +2051,7 @@ impl<'a> Lower<'a> {
             x,
             bad,
             lane_fail: HashMap::new(),
+            tiled_ambient: false,
             vals: HashMap::new(),
             floats: HashMap::new(),
             block: vec![None; p.blocks.len()],
@@ -6775,6 +6791,10 @@ impl<'a> Lower<'a> {
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let is_constant = match self.slot_is_constant(src)? {
+                Some(marked) => marked,
+                None => self.s.m.cmp(self.cur, pred::EQ, stride, zero),
+            };
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -6802,8 +6822,7 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
-            let at = self.begin_guarded(Some(other));
+            let at = self.begin_guarded(Some(is_constant));
             // (Renderer port 5: the twin of a constant buffer's slot is a
             // raw view of its bytes, read as one.)
             let as_raw = super::shader::constants_raw() && super::shader::raw_views() != 0;
@@ -7163,7 +7182,18 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        // AMD's shader compiler can crash (`amdxc64.dll`) when `getDimensions`
+        // shares a uniform heap handle with buffer loads, or when `opt::REUSE`
+        // feeds the same SSA index to both a non-uniform `getDimensions` handle
+        // and a uniform load handle. Give buffer size queries a dedicated
+        // non-uniform handle with a distinct index while preserving `raw_twin`.
+        let h = if image.is_none() && !self.x.res.waterfall.loads.contains(&site) {
+            let index = self.heap_index(site, first, false)?;
+            let (index, bounded) = self.raw_twin(&src, index, false, props);
+            self.s.size_handle_at(self.cur, index, props, bounded)
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -8181,6 +8211,22 @@ impl<'a> Lower<'a> {
             let bits = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
             self.s.m.bin(self.cur, Bin::And, word, bits)
         }))
+    }
+
+    /// Whether the heap slot `src` names is marked as a constant buffer view
+    /// ([`super::shader::VIEW_CONSTANT`]) in the host's stride table.
+    fn slot_is_constant(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        if !super::shader::constant_marks() {
+            return Ok(None);
+        }
+        let Some(word) = self.slot_word(src)? else {
+            return Ok(None);
+        };
+        let c = self.cur;
+        let bit = self.s.m.i32(super::shader::VIEW_CONSTANT);
+        let zero = self.s.m.i32(0);
+        let x = self.s.m.bin(c, Bin::And, word, bit);
+        Ok(Some(self.s.m.cmp(c, pred::NE, x, zero)))
     }
 
     /// Whether the typed buffer view `src` names is one of an integer format,
@@ -12774,6 +12820,42 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Uses the linearized material base color as a diffuse floor in shadow
+    /// when ray tracing is off so unlit interiors never collapse to black.
+    fn ambient_albedo(&mut self) -> Option<V> {
+        let position = self
+            .s
+            .inputs
+            .iter()
+            .position(|el| el.kind == 3 && el.comp == 9 && el.cols >= 2)?;
+        let (Val::I32(x), Val::I32(y)) =
+            (self.load_input(position, 0), self.load_input(position, 1))
+        else {
+            return None;
+        };
+        let c = self.cur;
+        let x = self.as_float(x);
+        let y = self.as_float(y);
+        let x = self.s.m.cast(c, Cast::FpToUi, x, self.s.t.i32);
+        let y = self.s.m.cast(c, Cast::FpToUi, y, self.s.t.i32);
+        let table = self.host_word(RootType::Table, 0, 0);
+        let offset = self.s.m.i32(4 * ALBEDO_DWORD);
+        let address = self.s.m.bin(c, Bin::Add, table, offset);
+        let shift = self.s.m.i32(5);
+        let index = self.s.m.bin(c, Bin::LShr, address, shift);
+        let view = self.s.heap_handle(c, index, false, false, (2, 0x409));
+        let zero = self.s.m.i32(0);
+        let undef = self.s.m.undef(self.s.t.i32);
+        Some(self.s.op(
+            c,
+            "textureLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            66,
+            &[view, zero, x, y, undef, undef, undef, undef],
+        ))
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
@@ -12959,6 +13041,11 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        let ambient = if self.tiled_ambient && e.target == Target::Color(0) {
+            self.ambient_albedo()
+        } else {
+            None
+        };
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -12976,7 +13063,7 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            let (suffix, mut x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -12987,6 +13074,15 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            if let Some(rgb) = ambient.filter(|_| col < 3 && suffix == ".f32") {
+                let c = self.cur;
+                let base = self.s.m.extract(c, rgb, u32::from(col));
+                let level = self.s.m.f32(0.24f32.to_bits());
+                let fill = self.s.m.bin(c, Bin::Mul, base, level);
+                x = self
+                    .s
+                    .op(c, "binary.f32", Attr::ReadNone, self.s.t.f32, 35, &[x, fill]);
+            }
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),

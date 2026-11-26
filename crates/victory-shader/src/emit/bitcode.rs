@@ -23,6 +23,10 @@ pub(crate) enum Tag {
     Clamp,
     /// The iteration counter and limit test the translation adds to a loop.
     Counter,
+    /// A heap index kept distinct from uniform-handle indices so `opt::REUSE`
+    /// never feeds the same SSA index to both a non-uniform `getDimensions`
+    /// handle and a uniform load handle (which crashes `amdxc64.dll`).
+    SizeIndex,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -380,7 +384,7 @@ impl Module {
     /// are counted.
     pub fn tag(&mut self, v: V, tag: Tag) {
         if let V::Inst(i) = v
-            && census::enabled()
+            && (tag == Tag::SizeIndex || census::enabled())
         {
             self.tags.insert(i, tag);
         }

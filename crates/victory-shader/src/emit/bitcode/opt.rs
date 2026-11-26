@@ -903,6 +903,7 @@ impl Module {
                 let class = self.class(&effects, i);
                 if passes & REUSE != 0
                     && class == Effect::Pure
+                    && self.tags.get(&i) != Some(&super::Tag::SizeIndex)
                     && let Some(key) = self.key(i)
                 {
                     if let Some(&first) = known.get(&key) {

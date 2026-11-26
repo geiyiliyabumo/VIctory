@@ -87,6 +87,8 @@ mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod dims_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -122,9 +124,40 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_CONSTANT, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    constant_marks, constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
+
+/// Whether the RT-off diffuse base-color floor is emitted in tiled PBR
+/// material pixel shaders (`VICTORY_AMBIENT_FALLBACK=1` by default when ray
+/// tracing is off; `VICTORY_AMBIENT_FALLBACK=0` disables it). Part of the
+/// translation: the shader cache keys on it.
+pub fn ambient_fallback_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let rt_on = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+            || std::env::var_os("VICTORY_RAY_TRACING").is_some_and(|v| v == "1");
+        !rt_on && std::env::var_os("VICTORY_AMBIENT_FALLBACK").is_none_or(|v| v != "0")
+    })
+}
+
+fn tiled_ambient(c: &Container, native: &NativeProgram) -> bool {
+    native.stage == HwStage::Ps
+        && ambient_fallback_enabled()
+        && c.part(FourCC::PSV0).is_some_and(|psv| {
+            psv.data.split(|&b| b == 0).any(|entry| {
+                entry.starts_with(b"TL_PS_PBR_MATERIAL_")
+                    || entry.starts_with(b"TL_PS_NoDir_PBR_MATERIAL_")
+            })
+        })
+        && native.used.iter().any(|u| {
+            u.root == RootType::Table
+                && u.kind == crate::ResourceType::Srv
+                && u.slot == 0
+                && u.table_offset_dwords == lower::ALBEDO_DWORD
+                && u.dwords == 8
+        })
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -794,17 +827,20 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs,
-        outputs,
-        prims,
-        mesh_stride,
-    })?;
+    let l = lower::lower_with_ambient(
+        &lower::Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs,
+            outputs,
+            prims,
+            mesh_stride,
+        },
+        tiled_ambient(c, native),
+    )?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

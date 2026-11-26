@@ -25,13 +25,26 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
-pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+pub const VIEW_STRIDE_BITS: u32 = (1 << 29) - 1;
+/// In a [`SLOT_STRIDES`] dword: a constant buffer view (`View::Constant`),
+/// so picked-slot shaders only issue CBV loads on real CBV slots and never
+/// reinterpret a texture descriptor as a CBV (which faults on AMD RDNA4).
+pub const VIEW_CONSTANT: u32 = 1 << 29;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 /// (After VIctory 4243a96a.)
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
+
+/// Whether constant buffer slots are marked with [`VIEW_CONSTANT`] in the
+/// host's stride table (`VICTORY_CONSTANT_MARKS=0` restores the legacy read
+/// of any zero-stride slot as a constant buffer). Both host and translator
+/// use the same switch, and the shader cache keys on it.
+pub fn constant_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_none_or(|v| v != "0"))
+}
 /// Dwords of the [`SLOT_STRIDES`] buffer's strides: heap indices are
 /// clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
@@ -509,6 +522,35 @@ impl Shader {
         props: (u32, u32),
         bounded: bool,
     ) -> V {
+        self.nonuniform_handles += u32::from(nonuniform);
+        self.marked_heap_handle_at(block, index, sampler, nonuniform, props, bounded, false)
+    }
+
+    /// Dedicated non-uniform heap handle for buffer `getDimensions` queries:
+    /// AMD's shader compiler can crash (`amdxc64.dll`) when `getDimensions`
+    /// shares a uniform heap handle with the buffer's loads. Keeps the
+    /// uniform-handle statistic unchanged and preserves `raw_views` clamping.
+    pub fn size_handle_at(
+        &mut self,
+        block: usize,
+        index: V,
+        props: (u32, u32),
+        bounded: bool,
+    ) -> V {
+        self.m.tag(index, super::bitcode::Tag::SizeIndex);
+        self.marked_heap_handle_at(block, index, false, true, props, bounded, true)
+    }
+
+    fn marked_heap_handle_at(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+        bounded: bool,
+        keep_distinct: bool,
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         // (the raw twins of buffer views lie past it: such an index comes bounded)
         let limit = if bounded { 0 } else { VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
@@ -517,7 +559,14 @@ impl Shader {
             let null = self.m.i32(limit);
             let i32t = self.t.i32;
             let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
-            self.m.tag(v, super::bitcode::Tag::Clamp);
+            self.m.tag(
+                v,
+                if keep_distinct {
+                    super::bitcode::Tag::SizeIndex
+                } else {
+                    super::bitcode::Tag::Clamp
+                },
+            );
             v
         } else if sampler {
             // A sampler heap has at most 2,048 samplers on any host: an
@@ -538,7 +587,6 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
-        self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
