@@ -145,11 +145,12 @@ pub(crate) fn cards() -> bool {
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
-/// most bytes of such copies (their "before" twins not counted: a copy
-/// shaders write takes its size twice), both in bytes.
+/// most bytes of such copies (their "before" twins are hash buffers of ~1.6%
+/// size), both in bytes.
 /// Below a known 9 GiB local budget (8 GB VRAM GPUs), `VICTORY_CARD_BUFFERS_MIN_MB`
-/// defaults to 4 MiB and `VICTORY_CARD_BUFFERS_MB` to 896 MiB to admit more
-/// hot shader-written buffers. Otherwise the defaults are 1 MiB and 1,024 MiB.
+/// defaults to 8 MiB and `VICTORY_CARD_BUFFERS_MB` to 640 MiB so large
+/// shader-written buffers move off CPU snapshot/compare onto the GPU without
+/// starving textures. Otherwise the defaults are 1 MiB and 1,024 MiB.
 fn card_limits() -> (u64, u64) {
     static MIN_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     static LIMIT_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -172,7 +173,7 @@ fn default_card_buffers_min(explicit_mb: Option<u64>, video_memory: Option<[u64;
         return (mb << 20).max(1 << 20);
     }
     match video_memory {
-        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 4 << 20,
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 8 << 20,
         _ => 1 << 20,
     }
 }
@@ -182,7 +183,7 @@ fn default_card_buffers_limit(explicit_mb: Option<u64>, video_memory: Option<[u6
         return mb << 20;
     }
     match video_memory {
-        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 896 << 20,
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 640 << 20,
         _ => 1024 << 20,
     }
 }
@@ -194,13 +195,13 @@ fn default_card_buffers_limit_adapts_to_local_budget() {
     let low = Some([62 * gib / 10, 0, 0, 0]);
     assert_eq!(default_card_buffers_min(Some(2), low), 2 << 20);
     assert_eq!(default_card_buffers_min(Some(0), low), 1 << 20);
-    assert_eq!(default_card_buffers_min(None, low), 4 << 20);
+    assert_eq!(default_card_buffers_min(None, low), 8 << 20);
     assert_eq!(default_card_buffers_min(None, Some([9 * gib, 0, 0, 0])), 1 << 20);
     assert_eq!(default_card_buffers_min(None, None), 1 << 20);
     assert_eq!(default_card_buffers_limit(Some(768), low), 768 << 20);
     assert_eq!(default_card_buffers_limit(Some(0), low), 0);
-    assert_eq!(default_card_buffers_limit(None, low), 896 << 20);
-    assert_eq!(default_card_buffers_limit(None, Some([73 * gib / 10, 0, 0, 0])), 896 << 20);
+    assert_eq!(default_card_buffers_limit(None, low), 640 << 20);
+    assert_eq!(default_card_buffers_limit(None, Some([73 * gib / 10, 0, 0, 0])), 640 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([9 * gib, 0, 0, 0])), 1024 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([24 * gib, 0, 0, 0])), 1024 << 20);
     assert_eq!(default_card_buffers_limit(None, Some([0; 4])), 1024 << 20);
@@ -241,7 +242,10 @@ fn card_vram_has_room(video_memory: Option<[u64; 4]>, size: u64) -> bool {
     let Some([budget, used, ..]) = video_memory else {
         return true;
     };
-    let percent = if budget > 0 && budget < (9 << 30) { 85 } else { 80 };
+    // On < 9 GiB GPUs, placed textures admit up to 88% of local budget. Allow
+    // large shader-written card buffers up to 91% so hot buffers aren't locked
+    // out to CPU snapshot/compare once textures warm up.
+    let percent = if budget > 0 && budget < (9 << 30) { 91 } else { 80 };
     let limit = (u128::from(budget) * percent / 100) as u64;
     used.saturating_add(size) <= limit
 }
@@ -250,7 +254,7 @@ fn card_vram_has_room(video_memory: Option<[u64; 4]>, size: u64) -> bool {
 #[test]
 fn card_vram_admission_counts_the_new_buffer_against_the_budget() {
     let size = 4 << 20;
-    for (budget, percent) in [(6170 << 20, 85), (9 << 30, 80)] {
+    for (budget, percent) in [(6170 << 20, 91), (9 << 30, 80)] {
         let used = budget * percent / 100 - size;
         assert!(card_vram_has_room(Some([budget, used, 0, 0]), size));
         assert!(!card_vram_has_room(Some([budget, used + 1, 0, 0]), size));
@@ -2016,44 +2020,50 @@ fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
     let Some([_, _, budget, used]) = vm else {
         return L0ReclaimPlan {
             target_bytes: if emergency { 512 * MIB } else { 0 },
-            idle_ms: if emergency { 2_000 } else { 15_000 },
-            unmapped_cap_bytes: 256 * MIB,
+            idle_ms: if emergency { 2_000 } else { 12_000 },
+            unmapped_cap_bytes: if emergency { u64::MAX } else { 256 * MIB },
         };
     };
     if budget == 0 {
         return L0ReclaimPlan {
             target_bytes: if emergency { 512 * MIB } else { 0 },
-            idle_ms: if emergency { 2_000 } else { 15_000 },
-            unmapped_cap_bytes: 256 * MIB,
+            idle_ms: if emergency { 2_000 } else { 12_000 },
+            unmapped_cap_bytes: if emergency { u64::MAX } else { 256 * MIB },
         };
     }
     let pct = (u128::from(used) * 100) / u128::from(budget);
-    if emergency || pct >= 92 {
-        let goal = (u128::from(budget) * 70 / 100) as u64;
+    if emergency || pct >= 90 {
+        let goal = (u128::from(budget) * 66 / 100) as u64;
         L0ReclaimPlan {
             target_bytes: used.saturating_sub(goal).max(512 * MIB),
             idle_ms: 2_000,
             unmapped_cap_bytes: u64::MAX,
         }
-    } else if pct >= 88 {
-        let goal = (u128::from(budget) * 74 / 100) as u64;
+    } else if pct >= 84 {
+        let goal = (u128::from(budget) * 70 / 100) as u64;
         L0ReclaimPlan {
             target_bytes: used.saturating_sub(goal),
             idle_ms: 5_000,
             unmapped_cap_bytes: u64::MAX,
         }
-    } else if pct >= 78 {
-        let goal = (u128::from(budget) * 72 / 100) as u64;
+    } else if pct >= 72 {
+        let goal = (u128::from(budget) * 66 / 100) as u64;
         L0ReclaimPlan {
             target_bytes: used.saturating_sub(goal).min(256 * MIB),
-            idle_ms: 15_000,
+            idle_ms: 12_000,
             unmapped_cap_bytes: u64::MAX,
+        }
+    } else if pct >= 50 {
+        L0ReclaimPlan {
+            target_bytes: 0,
+            idle_ms: 12_000,
+            unmapped_cap_bytes: 256 * MIB,
         }
     } else {
         L0ReclaimPlan {
             target_bytes: 0,
-            idle_ms: 15_000,
-            unmapped_cap_bytes: 256 * MIB,
+            idle_ms: 12_000,
+            unmapped_cap_bytes: 0,
         }
     }
 }
@@ -2124,6 +2134,9 @@ pub(crate) fn evictable_loose_windows(
     emergency: bool,
 ) -> EvictableLooseWindows {
     let plan = l0_reclaim_plan(vm, emergency);
+    if plan.target_bytes == 0 && plan.unmapped_cap_bytes == 0 {
+        return EvictableLooseWindows::default();
+    }
     let snapshot: Vec<((u64, u64), usize, u64, u64, (u64, u64))> = {
         let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
@@ -3925,35 +3938,27 @@ const WINDOW: u64 = 4 << 20;
 /// shortcut: the default stays 4 MiB until a run with the memory line's
 /// window counts has shown what the finer grids give; the same memory
 /// asked for with different ranges then lies in more than one window.
-const SMALL_HOST_RAM: u64 = 20 << 30;
-const SMALL_HOST_WINDOW: u64 = 1 << 20;
-
+/// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
+/// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
+/// Keeping sized and unsized asks on the same 4 MiB grid prevents overlapping
+/// duplicate windows in the same cell (1 MiB + tails caused ~2.18 GiB of
+/// overlapping copies in gameplay); L0 pressure is instead controlled by
+/// reclaiming idle 4 MiB windows (`evictable_loose_windows`).
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
         let kb = std::env::var("VICTORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        let total = crate::host::system_memory_status().map(|m| m.ullTotalPhys);
-        resolve_window_grid(kb, total)
+        grid(kb)
     })
-}
-
-/// The window grid in bytes: explicit power of two in 64 KiB..=4 MiB, else
-/// 1 MiB on hosts with <= 20 GiB physical RAM (where WDDM L0 is ~7.5-8 GiB),
-/// else 4 MiB.
-fn resolve_window_grid(kb: Option<u64>, total_physical: Option<u64>) -> u64 {
-    match kb {
-        Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
-        Some(_) => WINDOW,
-        None if total_physical.is_some_and(|total| total <= SMALL_HOST_RAM) => SMALL_HOST_WINDOW,
-        None => WINDOW,
-    }
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
 /// 64 KiB to 4 MiB, 4 MiB for anything else.
-#[cfg_attr(not(test), allow(dead_code))]
 fn grid(kb: Option<u64>) -> u64 {
-    resolve_window_grid(kb, None)
+    match kb {
+        Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
+        _ => WINDOW,
+    }
 }
 
 /// The window (start, bytes) of title memory for an ask of `[address,
@@ -3964,31 +3969,12 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 }
 
 /// Whether the window of an ask without a length begins at the ask instead
-/// of at the 4 MiB line below it. Such an ask (a root view) reads from its
-/// address to the end of its 4 MiB cell; what lies below the lowest
-/// address ever asked for in the cell is memory the host zeroed and nothing
-/// reads (513 of run 65's 782 windows were asked for that way, 2,052 MB;
-/// of all windows' 3,236 MB, 1,988 MB were ever copied). With this on, the
-/// window is the cell's tail from the ask's step on ([`TAIL_STEP`]); an ask
-/// lower in the cell later makes a longer tail, which every ask from then
-/// on takes, and the shorter one goes when nothing holds it any more.
-/// Defaults on for hosts with <= 20 GiB physical RAM (overridable via
-/// `VICTORY_WINDOW_TAILS=0|1`).
+/// of at the 4 MiB line below it. Off by default (`VICTORY_WINDOW_TAILS=1`
+/// opts in) so unsized root views share the single 4 MiB cell buffer with
+/// sized views instead of creating overlapping tail copies.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let setting = std::env::var_os("VICTORY_WINDOW_TAILS");
-        let setting = setting.as_deref().map(|v| v.to_str().unwrap_or_default());
-        let total = crate::host::system_memory_status().map(|m| m.ullTotalPhys);
-        resolve_window_tails(setting, total)
-    })
-}
-
-fn resolve_window_tails(setting: Option<&str>, total_physical: Option<u64>) -> bool {
-    match setting {
-        Some(value) => value.trim() == "1",
-        None => total_physical.is_some_and(|total| total <= SMALL_HOST_RAM),
-    }
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -4185,52 +4171,38 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 #[cfg(test)]
 mod window_tests {
     use super::{
-        IdleWindow, L0ReclaimPlan, SMALL_HOST_WINDOW, WINDOW, cover, grid, holder,
-        l0_reclaim_plan, longest_tail, resolve_window_budget, resolve_window_grid,
-        resolve_window_tails, tail_of, window_of, window_victims,
+        IdleWindow, L0ReclaimPlan, WINDOW, cover, grid, holder, l0_reclaim_plan, longest_tail,
+        resolve_window_budget, tail_of, window_of, window_victims,
     };
-
-    #[test]
-    fn small_hosts_default_to_1mb_window_grid_and_tails_with_overrides() {
-        const GIB: u64 = 1 << 30;
-        assert_eq!(resolve_window_grid(None, Some(16 * GIB)), SMALL_HOST_WINDOW);
-        assert_eq!(resolve_window_grid(None, Some(20 * GIB)), SMALL_HOST_WINDOW);
-        assert_eq!(resolve_window_grid(None, Some(20 * GIB + 1)), WINDOW);
-        assert_eq!(resolve_window_grid(None, None), WINDOW);
-        assert_eq!(resolve_window_grid(Some(4096), Some(16 * GIB)), WINDOW);
-        assert_eq!(resolve_window_grid(Some(512), Some(32 * GIB)), 512 << 10);
-
-        assert!(resolve_window_tails(None, Some(16 * GIB)));
-        assert!(resolve_window_tails(None, Some(20 * GIB)));
-        assert!(!resolve_window_tails(None, Some(20 * GIB + 1)));
-        assert!(!resolve_window_tails(None, None));
-        assert!(!resolve_window_tails(Some("0"), Some(16 * GIB)));
-        assert!(resolve_window_tails(Some("1"), Some(32 * GIB)));
-    }
 
     #[test]
     fn l0_reclaim_plan_scales_from_calm_to_emergency() {
         const MIB: u64 = 1 << 20;
         let budget = 8000 * MIB;
-        // Below 78%: only unmapped windows (Tier 0), no committed eviction.
+        // Below 50%: skip both unmapped probing and committed eviction.
+        assert_eq!(
+            l0_reclaim_plan(Some([budget, 0, budget, 3900 * MIB]), false),
+            L0ReclaimPlan { target_bytes: 0, idle_ms: 12_000, unmapped_cap_bytes: 0 }
+        );
+        // 50..72%: Tier 0 unmapped dead windows only, no committed eviction.
+        assert_eq!(
+            l0_reclaim_plan(Some([budget, 0, budget, 5600 * MIB]), false),
+            L0ReclaimPlan { target_bytes: 0, idle_ms: 12_000, unmapped_cap_bytes: 256 * MIB }
+        );
+        // 75% L0: smooth 256 MiB cap toward 66%, 12s idle threshold.
         assert_eq!(
             l0_reclaim_plan(Some([budget, 0, budget, 6000 * MIB]), false),
-            L0ReclaimPlan { target_bytes: 0, idle_ms: 15_000, unmapped_cap_bytes: 256 * MIB }
+            L0ReclaimPlan { target_bytes: 256 * MIB, idle_ms: 12_000, unmapped_cap_bytes: u64::MAX }
         );
-        // 80% L0: smooth 256 MiB cap, 15s idle threshold.
+        // 85% L0: uncapped reclaim toward 70%, 5s idle threshold.
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 6400 * MIB]), false),
-            L0ReclaimPlan { target_bytes: 256 * MIB, idle_ms: 15_000, unmapped_cap_bytes: u64::MAX }
-        );
-        // 89% L0: uncapped reclaim toward 74%, 5s idle threshold.
-        assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 7120 * MIB]), false),
+            l0_reclaim_plan(Some([budget, 0, budget, 6800 * MIB]), false),
             L0ReclaimPlan { target_bytes: 1200 * MIB, idle_ms: 5_000, unmapped_cap_bytes: u64::MAX }
         );
-        // Emergency or >= 92%: aggressive reclaim toward 70%, 2s idle threshold.
+        // Emergency or >= 90%: aggressive reclaim toward 66%, 2s idle threshold.
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 7500 * MIB]), true),
-            L0ReclaimPlan { target_bytes: 1900 * MIB, idle_ms: 2_000, unmapped_cap_bytes: u64::MAX }
+            l0_reclaim_plan(Some([budget, 0, budget, 7280 * MIB]), true),
+            L0ReclaimPlan { target_bytes: 2000 * MIB, idle_ms: 2_000, unmapped_cap_bytes: u64::MAX }
         );
     }
 
