@@ -10,6 +10,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
@@ -734,16 +735,22 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
-fn rescan_slice_bounds(total: usize, pass: u64, stride: usize) -> std::ops::Range<usize> {
-    if stride == 0 {
-        return 0..0;
-    }
-    let phase = (pass % stride as u64) as usize;
-    let base = total / stride;
-    let extra = total % stride;
-    let start = phase * base + phase.min(extra);
-    let end = start + base + usize::from(phase < extra);
-    start..end
+fn texture_pass_budget(
+    base: (u64, Duration),
+    room: bool,
+    catchup: bool,
+    small_vram: bool,
+    pass: Option<(u64, Duration)>,
+) -> (u64, Duration) {
+    let (bytes, span) = if let Some(pass) = pass {
+        pass
+    } else if room && catchup {
+        let (catchup_bytes, catchup_ms) = if small_vram { (192 << 20, 350) } else { (512 << 20, 1500) };
+        (base.0.max(catchup_bytes), base.1.max(Duration::from_millis(catchup_ms)))
+    } else {
+        base
+    };
+    (bytes, if room { span } else { span.min(Duration::from_millis(25)) })
 }
 
 fn clears_indirect_window(stage_stores: Option<impl IntoIterator<Item = bool>>) -> bool {
@@ -1835,19 +1842,17 @@ impl State {
         // reads, kept from pass to pass. Recheck changed slots and a slice
         // of live slots each pass. This catches views that went stale
         // without a write and views whose memory gained a host copy.
-        const RESCAN_STRIDE: usize = 16;
+        use crate::descriptor::host::BUFFER_SCAN_PARTS;
         let crate::descriptor::host::BufferPass { passes, ranges, .. } = &mut *pass;
         let mut slots = host.buffer_changes();
-        let all_slots = host.buffer_slots();
-        if (*passes).is_multiple_of(RESCAN_STRIDE as u64) {
-            let live: HashSet<u32> = all_slots.iter().copied().collect();
+        let part = (*passes % u64::from(BUFFER_SCAN_PARTS)) as u32;
+        if part == 0 {
+            let live: HashSet<u32> = host.buffer_slots().into_iter().collect();
             ranges.retain(|index, _| live.contains(index));
         }
-        let slice = &all_slots[rescan_slice_bounds(all_slots.len(), *passes, RESCAN_STRIDE)];
-        // Both snapshots come from sets, so only their overlap needs filtering.
-        let changed: HashSet<u32> = slots.iter().copied().collect();
-        slots.extend(slice.iter().copied().filter(|index| !changed.contains(index)));
+        slots.extend(host.buffer_slots_of(part));
         slots.sort_unstable();
+        slots.dedup();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -2221,33 +2226,22 @@ impl State {
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
         }));
-        // A long queue (the world's first minutes: over 20,000 slots, which
-        // at the usual pace took three and a half minutes with the materials
-        // black) gets 512 MB and 1.5 s a pass while the run's allowance for
-        // catching up lasts (`catching_up`, `VICTORY_TEXTURE_GATE_S`, 60 s):
-        // joshuu/victory-amd's pace, which brought more in than tripling the
-        // usual budget once 1,024 were due. `VICTORY_TEXTURE_CATCHUP=0`
-        // keeps the plain budget.
-        const PER_FRAME_CATCHING_UP: u64 = 512 << 20;
-        const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
+        // A long queue gets a larger budget while the card has room and
+        // the run's allowance for catching up lasts (`VICTORY_TEXTURE_GATE_S`).
         const LONG: u64 = 2_000;
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
         let plain = span;
-        let (per_frame, span) = if catchup && census[0] > LONG && catching_up(std::time::Duration::ZERO) {
-            (per_frame.max(PER_FRAME_CATCHING_UP), span.max(SPAN_CATCHING_UP))
-        } else {
-            (per_frame, span)
-        };
+        let catchup = room && catchup && census[0] > LONG && catching_up(Duration::ZERO);
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
-        let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes)) => {
-                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
-            }
-            None => (span, per_frame),
-        };
+        let pass = PASS_BUDGET.get().map(|(ms, bytes)| {
+            (SPENT.load(Ordering::Relaxed).saturating_add(bytes), Duration::from_millis(ms))
+        });
+        let (bytes_at_most, span) = texture_pass_budget(
+            (per_frame, span), room, catchup, catchup && crate::resource::small_vram_budget(), pass,
+        );
         let began = std::time::Instant::now();
         for (index, write, recovered) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
@@ -4326,21 +4320,25 @@ mod tests {
     }
 
     #[test]
-    fn rescan_slice_bounds_covers_each_slot_once_per_cycle() {
-        const STRIDE: usize = 16;
-        for total in [0, 7, 64, 83_000, usize::MAX] {
-            let mut end = 0;
-            for pass in 0..STRIDE as u64 {
-                let slice = rescan_slice_bounds(total, pass, STRIDE);
-                assert_eq!(slice.start, end, "total {total}, pass {pass}");
-                assert!(slice.start <= slice.end && slice.end <= total);
-                assert!(slice.len() <= total.div_ceil(STRIDE));
-                assert_eq!(slice, rescan_slice_bounds(total, pass + STRIDE as u64, STRIDE));
-                end = slice.end;
-            }
-            assert_eq!(end, total);
-        }
-        assert_eq!(rescan_slice_bounds(83_000, 17, 0), 0..0);
+    fn texture_pass_budget_caps_blocked_passes() {
+        let ms = Duration::from_millis;
+        let base = (192 << 20, ms(250));
+        assert_eq!(texture_pass_budget(base, false, true, false, None), (base.0, ms(25)));
+        assert_eq!(texture_pass_budget(base, false, true, true, Some((64 << 20, ms(12)))), (64 << 20, ms(12)));
+        assert_eq!(texture_pass_budget(base, false, true, true, Some((2 << 30, ms(1500)))), (2 << 30, ms(25)));
+        assert_eq!(texture_pass_budget(base, true, true, true, Some((2 << 30, ms(1500)))), (2 << 30, ms(1500)));
+    }
+
+    #[test]
+    fn texture_pass_budget_scales_catchup_with_vram_and_honors_overrides() {
+        let ms = Duration::from_millis;
+        let base = (192 << 20, ms(250));
+        assert_eq!(texture_pass_budget(base, true, false, true, None), base);
+        assert_eq!(texture_pass_budget(base, true, true, true, None), (192 << 20, ms(350)));
+        assert_eq!(texture_pass_budget(base, true, true, false, None), (512 << 20, ms(1500)));
+        let higher = (640 << 20, ms(2000));
+        assert_eq!(texture_pass_budget(higher, true, true, true, None), higher);
+        assert_eq!(texture_pass_budget(higher, true, true, false, None), higher);
     }
 
     #[test]

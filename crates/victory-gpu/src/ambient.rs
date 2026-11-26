@@ -266,13 +266,15 @@ void main(uint3 at : SV_DispatchThreadID) {
     if (held > 0.0) {
         // Reflections: no brighter than a part of the light around.
         const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
-        float3 seen_there = unpack(light[at.xy]);
+        float3 was = unpack(light[at.xy]);
+        // Magenta (green far below red and blue) is what the probes' memory held, not light.
+        if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
         float3 around = from_around();
         float most = dot(around, LUMA) * held;
-        float has = dot(seen_there, LUMA);
+        float has = dot(was, LUMA);
         float3 floor_light = around * floor_part;
-        if (has > most) light[at.xy] = pack(seen_there * (most / has));
-        else if (has < dot(floor_light, LUMA)) light[at.xy] = pack(floor_light);
+        if (has > most) light[at.xy] = pack(was * (most / has));
+        else if (has == 0.0 || has < dot(floor_light, LUMA)) light[at.xy] = pack(floor_light);
         return;
     }
     float open = strength > 0.0 ? open_to_light(int2(at.xy), float2(w, h)) : 1.0;

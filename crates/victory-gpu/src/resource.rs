@@ -1479,6 +1479,11 @@ fn adaptive_texture_cap(video_memory: Option<[u64; 4]>) -> Option<u64> {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn small_vram_budget() -> bool {
+    adaptive_texture_cap(crate::host::host().and_then(|h| h.video_memory())).is_some()
+}
+
 #[cfg(any(windows, test))]
 fn emergency_vram_redline(video_memory: Option<[u64; 4]>) -> bool {
     video_memory.is_some_and(|[budget, used, ..]| {
@@ -1492,7 +1497,7 @@ fn effective_room_percent(explicit: Option<u64>, video_memory: Option<[u64; 4]>)
         return percent.clamp(50, 97);
     }
     match video_memory {
-        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 78,
+        Some([budget, ..]) if budget > 0 && budget < (9 << 30) => 88,
         _ => 90,
     }
 }
@@ -1701,6 +1706,14 @@ pub(crate) fn evictable_filled_resources(
     targets
 }
 
+#[cfg(windows)]
+static ROOM_LATELY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[cfg(windows)]
+pub(crate) fn room_lately() -> bool {
+    ROOM_LATELY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`).
 /// `VICTORY_TEXTURE_BUDGET_MB` sets a fixed limit on those copies' bytes.
@@ -1711,22 +1724,25 @@ pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     let filled = KINDS[1].load(Relaxed);
-    if let Some(limit) = explicit_texture_budget() {
-        return filled < limit;
-    }
-    let vm = crate::host::host().and_then(|h| h.video_memory());
-    if emergency_vram_redline(vm) || adaptive_texture_cap(vm).is_some_and(|cap| filled >= cap) {
-        return false;
-    }
-    if filled < texture_floor_bytes(vm) {
-        return true;
-    }
-    match vm {
-        Some([budget, used, ..]) => {
-            used < budget / 100 * effective_room_percent(explicit_room_percent(), vm)
+    let has_room = if let Some(limit) = explicit_texture_budget() {
+        filled < limit
+    } else {
+        let vm = crate::host::host().and_then(|h| h.video_memory());
+        if emergency_vram_redline(vm) || adaptive_texture_cap(vm).is_some_and(|cap| filled >= cap) {
+            false
+        } else if filled < texture_floor_bytes(vm) {
+            true
+        } else {
+            match vm {
+                Some([budget, used, ..]) => {
+                    used < budget / 100 * effective_room_percent(explicit_room_percent(), vm)
+                }
+                None => filled < WITHOUT_BUDGET,
+            }
         }
-        None => filled < WITHOUT_BUDGET,
-    }
+    };
+    ROOM_LATELY.store(has_room, Relaxed);
+    has_room
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
@@ -3224,7 +3240,7 @@ mod tests {
         assert_eq!(effective_room_percent(Some(83), low), 83);
         assert_eq!(effective_room_percent(Some(49), low), 50);
         assert_eq!(effective_room_percent(Some(98), None), 97);
-        assert_eq!(effective_room_percent(None, low), 78);
+        assert_eq!(effective_room_percent(None, low), 88);
         assert_eq!(effective_room_percent(None, Some([9 << 30, 0, 0, 0])), 90);
         assert_eq!(effective_room_percent(None, Some([0; 4])), 90);
         assert_eq!(effective_room_percent(None, None), 90);

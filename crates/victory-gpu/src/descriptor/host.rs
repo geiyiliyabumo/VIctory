@@ -25,6 +25,7 @@ struct RawPageRun {
 }
 
 const SLOT_STRIPES: usize = 64;
+pub(crate) const BUFFER_SCAN_PARTS: u32 = 16;
 // A null descriptor whose guest slot still has tracking state to clean up.
 // Its generation is outside the view record's valid kinds.
 const TRACKED_NULL: u64 = u64::MAX;
@@ -184,9 +185,53 @@ pub(crate) struct HostHeap {
 /// Slots that can supply a title address for a scalar descriptor load.
 #[derive(Default)]
 struct BufferSlots {
-    indices: std::collections::BTreeSet<u32>,
+    indices: BufferIndices,
     acceleration: std::collections::BTreeMap<u32, u64>,
     acceleration_locations: Option<Arc<[u64]>>,
+}
+
+#[derive(Default)]
+struct BufferIndices(Vec<u64>);
+
+impl BufferIndices {
+    fn insert(&mut self, index: u32) {
+        let word = (index / u64::BITS) as usize;
+        if word >= self.0.len() {
+            self.0.resize(word + 1, 0);
+        }
+        self.0[word] |= 1 << (index % u64::BITS);
+    }
+
+    fn remove(&mut self, index: u32) -> bool {
+        let word = (index / u64::BITS) as usize;
+        let Some(bits) = self.0.get_mut(word) else { return false };
+        let bit = 1 << (index % u64::BITS);
+        let was_set = *bits & bit != 0;
+        *bits &= !bit;
+        was_set
+    }
+
+    fn iter(&self, mask: u64) -> impl Iterator<Item = u32> + '_ {
+        self.0.iter().enumerate().flat_map(move |(word, bits)| {
+            let mut selected = bits & mask;
+            std::iter::from_fn(move || {
+                if selected == 0 {
+                    return None;
+                }
+                let index = word as u32 * u64::BITS + selected.trailing_zeros();
+                selected &= selected - 1;
+                Some(index)
+            })
+        })
+    }
+
+    fn part(&self, part: u32) -> impl Iterator<Item = u32> + '_ {
+        const { assert!(u64::BITS.is_multiple_of(BUFFER_SCAN_PARTS)) };
+        let mask = (part..u64::BITS)
+            .step_by(BUFFER_SCAN_PARTS as usize)
+            .fold(0, |mask, bit| mask | (1 << bit));
+        self.iter(if part < BUFFER_SCAN_PARTS { mask } else { 0 })
+    }
 }
 
 /// Refresh ranges belong to the heap that owns the corresponding slots.
@@ -862,6 +907,7 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 const NULL_BLOCK: u32 = 1 << 16;
+const SAMPLER_SLOTS: u32 = 2048;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -891,11 +937,20 @@ impl HostHeap {
             probe_view_limit();
         }
         let null = if sampler {
-            0
+            // Shaders clamp dynamic sampler indices to the permanent null slot.
+            SAMPLER_SLOTS - 1
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let (heap, count, size) = if null == 0 {
+        let (heap, count, size) = if sampler {
+            match make(SAMPLER_SLOTS) {
+                Ok(heap) => (heap, count.min(null), SAMPLER_SLOTS),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            }
+        } else if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -931,7 +986,7 @@ impl HostHeap {
         tracing::debug!(count, sampler, "host descriptor heap");
         // The null slot every index past the heap reads is the heap's last,
         // past the dynamic slots (`probe_view_limit`): all of them are free.
-        let dynamic = if null == 0 { extra } else { null - count };
+        let dynamic = if sampler || null == 0 { extra } else { null - count };
         let taken = vec![false; extra as usize];
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
@@ -1015,12 +1070,13 @@ impl HostHeap {
         total: u32,
     ) -> windows::core::Result<()> {
         let Some(host) = host() else { return Ok(()) };
+        let block_size = if self.sampler { total } else { NULL_BLOCK };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
                 host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: NULL_BLOCK,
+                    NumDescriptors: block_size,
                     ..Default::default()
                 })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
@@ -1033,8 +1089,8 @@ impl HostHeap {
                 null_view(start);
             }
             let mut filled = 1;
-            while filled < NULL_BLOCK {
-                let n = filled.min(NULL_BLOCK - filled);
+            while filled < block_size {
+                let n = filled.min(block_size - filled);
                 host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
                 filled += n;
             }
@@ -1057,7 +1113,7 @@ impl HostHeap {
         let mut done = 0;
         while done < count {
             let n = NULL_BLOCK.min(count - done);
-            // SAFETY: the source holds NULL_BLOCK identical descriptors of
+            // SAFETY: the source holds at least n identical descriptors of
             // this kind; the caller owns the entire destination range.
             unsafe {
                 host.device
@@ -1318,7 +1374,7 @@ impl HostHeap {
                 data.cast::<u64>().write(u64::from(self.count));
             }
             let slots = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-            for &slot in slots.indices.iter().chain(slots.acceleration.keys()) {
+            for slot in slots.indices.iter(u64::MAX).chain(slots.acceleration.keys().copied()) {
                 let address = heap.handle(slot).and_then(super::view).as_ref().and_then(guest_srv_address).unwrap_or(0);
                 // SAFETY: the heap tracks only title slots below self.count.
                 unsafe { data.cast::<u64>().add(slot as usize + 2).write(address) };
@@ -1914,7 +1970,13 @@ impl HostHeap {
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.indices.iter().copied().collect()
+        buffers.indices.iter(u64::MAX).collect()
+    }
+
+    /// Live buffer slots in one round-robin part.
+    pub(crate) fn buffer_slots_of(&self, part: u32) -> Vec<u32> {
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        buffers.indices.part(part).collect()
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -2016,7 +2078,7 @@ impl HostHeap {
             buffers.indices.insert(index);
             true
         } else {
-            buffers.indices.remove(&index)
+            buffers.indices.remove(index)
         };
         if was {
             self.changed
@@ -2751,7 +2813,8 @@ impl HostHeap {
                 // The alias gate and slot lock serialize writers here. Keep
                 // pending's stripe out of the descriptor and kept writes.
                 if !self.pending(index).contains_key(&index) {
-                    let keep = keep_shown() && view_at(shown as u32, (shown >> 32) as u32)
+                    let keep = crate::resource::room_lately()
+                        && keep_shown() && view_at(shown as u32, (shown >> 32) as u32)
                         .is_some_and(|old| kin(&old, &view)) && {
                             let (kept, offset) = self.kept_slot(index);
                             kept[offset].is_some()
@@ -4283,6 +4346,37 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn spread_scan_visits_each_live_buffer_slot_in_its_part() {
+        let mut slots = BufferIndices::default();
+        let live: Vec<u32> = (0..201).filter(|slot| slot % 5 != 2).collect();
+        for &slot in &live {
+            slots.insert(slot);
+        }
+        assert!(slots.iter(u64::MAX).eq(live.iter().copied()));
+        for part in 0..BUFFER_SCAN_PARTS {
+            let expected = live.iter().copied().filter(|slot| slot % BUFFER_SCAN_PARTS == part);
+            assert!(slots.part(part).eq(expected));
+        }
+        assert!(slots.part(BUFFER_SCAN_PARTS).next().is_none());
+        assert!(slots.remove(64));
+        assert!(!slots.remove(64));
+        assert!(!slots.part(0).any(|slot| slot == 64));
+    }
+
+    #[test]
+    fn sampler_heaps_back_2048_slots_and_reserve_null_sentinel() {
+        let Some(_) = host() else { return };
+        for (requested, fitted) in [(16, 16), (2048, 2047)] {
+            let heap = HostHeap::new(true, requested).expect("host sampler heap");
+            // SAFETY: a live descriptor heap.
+            assert_eq!(unsafe { heap.heap.GetDesc().NumDescriptors }, 2048);
+            assert_eq!(heap.count, fitted);
+            assert_eq!(heap.dynamic, 0);
+            assert!(heap.mirror(2047, 0, false).is_none());
+        }
+    }
+
     fn texture_test_heap() -> crate::object::This {
         #[repr(C)]
         struct Extended(super::super::HeapDesc, super::super::Placement);
@@ -4347,7 +4441,7 @@ mod tests {
         assert!(!kin(&srv(30, 4), &srv(32, 4)));
         assert!(!kin(&srv(98, 4), &srv(98, 9)));
         let Some(device) = host() else { return };
-        if !crate::texture::show_after() || !keep_shown() {
+        if !crate::texture::show_after() || !(crate::resource::room_lately() && keep_shown()) {
             return;
         }
         let raw = texture_test_heap();

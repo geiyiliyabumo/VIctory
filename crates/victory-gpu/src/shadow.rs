@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
-use crate::host::{HostList, host};
+use crate::host::{HostList, RamBand, host};
 use crate::watch::PAGE;
 
 /// A title buffer's host copy.
@@ -1912,6 +1912,48 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
+fn resolve_window_budget(setting: Option<&str>, total_physical: Option<u64>) -> Option<u64> {
+    let mb = match setting {
+        Some(value) => value.trim().parse::<u64>().ok()?,
+        None if total_physical.is_some_and(|total| total <= 20 << 30) => 1536,
+        None => return None,
+    };
+    (mb > 0).then(|| mb.saturating_mul(1 << 20))
+}
+
+/// The cap for eligible idle loose windows in the Watch band, halved in High.
+fn window_budget(total_physical: Option<u64>) -> Option<u64> {
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let setting = std::env::var_os("VICTORY_WINDOW_BUDGET_MB");
+        let setting = setting.as_deref().map(|value| value.to_str().unwrap_or_default());
+        resolve_window_budget(setting, total_physical)
+    })
+}
+
+static WINDOW_BAND: Mutex<RamBand> = Mutex::new(RamBand::Calm);
+
+struct IdleWindow {
+    key: (u64, u64),
+    used: u64,
+    bytes: u64,
+}
+
+fn window_victims(windows: &mut [IdleWindow], keep: u64) -> &[IdleWindow] {
+    let mut left: u64 = windows.iter().map(|window| window.bytes).sum();
+    if left <= keep {
+        return &[];
+    }
+    windows.sort_unstable_by_key(|window| (window.used, window.key));
+    for (index, window) in windows.iter().enumerate() {
+        left -= window.bytes;
+        if left <= keep {
+            return &windows[..=index];
+        }
+    }
+    windows
+}
+
 /// Lets go of loose windows and aligned views that nothing names any more.
 /// The windows were never freed, and streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
@@ -1931,6 +1973,7 @@ pub(crate) fn window_use() -> [u64; 8] {
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
     let mut gone = Vec::new();
+    let mut system_memory = None;
     let mut idle_ms = None;
     for (copies, aligned) in [(&LOOSE, false), (&ALIGNED, true)] {
         // Hold the lock from the reference check through removal.
@@ -1938,29 +1981,64 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             continue;
         }
-        let (idle_ms, idle_frames) = if aligned
+        let (base_idle_ms, base_idle_frames) = if aligned
             && (map.len() > 1024 || map.values().map(|s| s.len.next_multiple_of(256)).sum::<u64>() > (64 << 20))
         {
             (200, 1)
         } else {
             let idle_ms = *idle_ms.get_or_insert_with(|| {
+                let memory = system_memory.get_or_insert_with(crate::host::system_memory_status);
                 crate::host::shared_ram_idle_ms(
-                    crate::host::available_system_memory(),
+                    memory.as_ref().map(|m| (m.ullAvailPhys, m.ullAvailPageFile)),
                     crate::host::host().and_then(|h| h.video_memory()),
                 )
             });
             (idle_ms, IDLE_FRAMES)
         };
-        let idle: Vec<(u64, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        gone.extend(idle.into_iter().filter_map(|key| map.remove(&key)));
+        let mut pressure_cap = None;
+        let memory = system_memory.as_ref().and_then(Option::as_ref);
+        if !aligned && let Some(bytes) = window_budget(memory.map(|m| m.ullTotalPhys)) {
+            let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(memory) = memory {
+                *band = crate::host::sample_ram_band(*band, memory);
+            }
+            match *band {
+                RamBand::Calm => {}
+                RamBand::Watch => {
+                    pressure_cap = Some((base_idle_ms.min(2_000), base_idle_frames.min(2), bytes));
+                }
+                RamBand::High => {
+                    pressure_cap = Some((base_idle_ms.min(500), 1, bytes / 2));
+                }
+            }
+        }
+        let mut expired = Vec::new();
+        let mut early = Vec::new();
+        let mut kept_bytes = 0u64;
+        for (&key, s) in map.iter() {
+            let used = s.used.load(Ordering::Relaxed);
+            // One strong reference also ensures each candidate counts once.
+            let unheld = Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1;
+            if unheld && crate::host::long_ago(used, base_idle_ms, base_idle_frames) {
+                expired.push(key);
+            } else if unheld
+                && let Some((cap_ms, cap_frames, _)) = pressure_cap
+                && crate::host::long_ago(used, cap_ms, cap_frames)
+            {
+                early.push(IdleWindow { key, used, bytes: s.len });
+            } else {
+                kept_bytes = kept_bytes.saturating_add(s.len);
+            }
+        }
+        gone.extend(expired.into_iter().filter_map(|key| map.remove(&key)));
+        if let Some((_, _, cap_bytes)) = pressure_cap {
+            let early_keep = cap_bytes.saturating_sub(kept_bytes);
+            for window in window_victims(&mut early, early_keep) {
+                if let Some(shadow) = map.remove(&window.key) {
+                    gone.push(shadow);
+                }
+            }
+        }
     }
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3747,7 +3825,33 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{IdleWindow, WINDOW, cover, grid, holder, longest_tail, resolve_window_budget, tail_of, window_of, window_victims};
+
+    #[test]
+    fn window_budget_defaults_on_small_hosts_and_honors_explicit_settings() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(resolve_window_budget(None, Some(16 * GIB)), Some(1536 * MIB));
+        assert_eq!(resolve_window_budget(None, Some(20 * GIB)), Some(1536 * MIB));
+        assert_eq!(resolve_window_budget(None, Some(20 * GIB + 1)), None);
+        assert_eq!(resolve_window_budget(None, None), None);
+        assert_eq!(resolve_window_budget(Some("0"), Some(16 * GIB)), None);
+        assert_eq!(resolve_window_budget(Some(" 1024 "), Some(32 * GIB)), Some(1024 * MIB));
+        assert_eq!(resolve_window_budget(Some("invalid"), Some(16 * GIB)), None);
+    }
+
+    #[test]
+    fn window_budget_evicts_oldest_only_until_it_fits() {
+        let mut windows = [
+            IdleWindow { key: (3, 30), used: 3, bytes: 30 },
+            IdleWindow { key: (1, 10), used: 1, bytes: 10 },
+            IdleWindow { key: (2, 20), used: 2, bytes: 20 },
+        ];
+        assert!(window_victims(&mut windows, 60).is_empty());
+        assert!(window_victims(&mut windows, 50).iter().map(|window| window.used).eq([1]));
+        assert!(window_victims(&mut windows, 30).iter().map(|window| window.used).eq([1, 2]));
+        assert!(window_victims(&mut windows, 20).iter().map(|window| window.used).eq([1, 2, 3]));
+    }
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.

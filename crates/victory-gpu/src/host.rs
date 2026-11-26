@@ -18,6 +18,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
+use windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX;
 
 use crate::present_compositor::PresentCompositor;
 
@@ -123,13 +124,82 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
 /// Available physical RAM and commit headroom in bytes, from
 /// `GlobalMemoryStatusEx`.
 pub(crate) fn available_system_memory() -> Option<(u64, u64)> {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    system_memory_status().map(|m| (m.ullAvailPhys, m.ullAvailPageFile))
+}
+
+pub(crate) fn system_memory_status() -> Option<MEMORYSTATUSEX> {
+    use windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx;
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
+    ok.then_some(m)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RamBand {
+    Calm,
+    Watch,
+    High,
+}
+
+struct RamSample {
+    working: u64,
+    private: u64,
+    free_physical: u64,
+    commit_headroom: u64,
+    total_physical: u64,
+    commit_limit: u64,
+}
+
+impl RamSample {
+    fn band(&self, previous: RamBand) -> RamBand {
+        const GIB: u64 = 1 << 30;
+        let Self { working, private, free_physical, commit_headroom, total_physical, commit_limit } = *self;
+        if private * 5 >= commit_limit * 4 || working * 2 >= total_physical
+            || free_physical < 2 * GIB || commit_headroom < GIB
+        {
+            return RamBand::High;
+        }
+        if private * 10 >= commit_limit * 7 || working * 4 >= total_physical
+            || free_physical < 4 * GIB || commit_headroom < 2 * GIB
+        {
+            return RamBand::Watch;
+        }
+        // Falling below an entry watermark alone does not return to Calm.
+        let safe = match previous {
+            RamBand::Calm => true,
+            RamBand::High => private * 20 <= commit_limit * 13 && working * 4 <= total_physical
+                && free_physical >= 4 * GIB && commit_headroom >= 3 * GIB,
+            RamBand::Watch => private * 5 <= commit_limit * 3 && working * 5 <= total_physical
+                && free_physical >= 6 * GIB && commit_headroom >= 3 * GIB,
+        };
+        if safe { RamBand::Calm } else { RamBand::Watch }
+    }
+}
+
+pub(crate) fn sample_ram_band(previous: RamBand, memory: &MEMORYSTATUSEX) -> RamBand {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) } == 0 {
+        return previous;
+    }
+    RamSample {
+        working: counters.WorkingSetSize as u64,
+        private: counters.PagefileUsage as u64,
+        free_physical: memory.ullAvailPhys,
+        commit_headroom: memory.ullAvailPageFile,
+        total_physical: memory.ullTotalPhys,
+        commit_limit: memory.ullTotalPageFile,
+    }.band(previous)
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
@@ -3858,6 +3928,8 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let mut copied = std::collections::HashSet::new();
+                    let mut hashes = Vec::new();
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3865,19 +3937,26 @@ impl Host {
                         for &(a, b) in ranges {
                             list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                         }
+                        if !ranges.is_empty() {
+                            copied.insert(shadow.buffer.as_raw());
+                        }
                         let bytes = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
                         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
-                        let Some(before) = before else {
-                            continue;
-                        };
+                        if let Some(before) = before {
+                            hashes.push((shadow, ranges, before, size));
+                        }
+                    }
+                    // All copies are recorded before transitioning a shared
+                    // card buffer. The first hash of each buffer transitions it.
+                    for (shadow, ranges, before, size) in hashes {
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
                         // of each 64 KiB piece. The pieces just sent up are
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if copied.remove(&shadow.buffer.as_raw()) {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -5127,10 +5206,11 @@ impl Host {
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
                         std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
-                    text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
-                    ));
+                    let Some(line) = stopped_command(history, done, p.BreadcrumbCount) else {
+                        plain = p.pNext;
+                        continue;
+                    };
+                    text.push_str(&line);
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
                     // The k-th marker command is the k-th note.
@@ -8068,6 +8148,24 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
     }
 }
 
+/// DRED reports the count of completed breadcrumbs. That count is the
+/// zero-based index of the first command still incomplete.
+fn stopped_command(history: &[D3D12_AUTO_BREADCRUMB_OP], done: u32, count: u32) -> Option<String> {
+    if done >= count || done as usize >= history.len() {
+        return None;
+    }
+    let op = history[done as usize].0;
+    Some(if done == 0 {
+        format!("; no command completed of {count}; the first uncompleted is command index 0 (op {op})")
+    } else {
+        let last = done - 1;
+        let last_op = history[last as usize].0;
+        format!(
+            "; {done} of {count} commands completed, last at index {last} (op {last_op}); the first uncompleted is command index {done} (op {op})"
+        )
+    })
+}
+
 /// The commands that may have been running where a list stopped at
 /// command `done`: those between the barriers around it (work between
 /// barriers overlaps on the GPU), by kind, and what the markers just
@@ -8249,6 +8347,54 @@ mod spare {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn ram_band_tracks_pressure_and_uses_lower_exit_watermarks() {
+        use super::{RamBand, RamSample};
+        const GIB: u64 = 1 << 30;
+        let mut sample = RamSample {
+            working: 3 * GIB,
+            private: 5 * GIB,
+            free_physical: 8 * GIB,
+            commit_headroom: 4 * GIB,
+            total_physical: 16 * GIB,
+            commit_limit: 10 * GIB,
+        };
+        assert_eq!(sample.band(RamBand::Calm), RamBand::Calm);
+        sample.private = 7 * GIB;
+        assert_eq!(sample.band(RamBand::Calm), RamBand::Watch);
+        sample.private = 6 * GIB + 1;
+        assert_eq!(sample.band(RamBand::Calm), RamBand::Calm);
+        assert_eq!(sample.band(RamBand::Watch), RamBand::Watch);
+        sample.private = 6 * GIB;
+        assert_eq!(sample.band(RamBand::Watch), RamBand::Calm);
+        sample.free_physical = GIB;
+        assert_eq!(sample.band(RamBand::Calm), RamBand::High);
+        sample.free_physical = 8 * GIB;
+        sample.commit_headroom = 2 * GIB;
+        assert_eq!(sample.band(RamBand::High), RamBand::Watch);
+    }
+
+    #[test]
+    fn dred_reports_the_first_uncompleted_command() {
+        use super::{D3D12_AUTO_BREADCRUMB_OP as Op, stopped_command};
+        let history = [Op(46), Op(3), Op(15), Op(6)];
+        assert_eq!(
+            stopped_command(&history, 0, 4).as_deref(),
+            Some("; no command completed of 4; the first uncompleted is command index 0 (op 46)")
+        );
+        assert_eq!(
+            stopped_command(&history, 1, 4).as_deref(),
+            Some("; 1 of 4 commands completed, last at index 0 (op 46); the first uncompleted is command index 1 (op 3)")
+        );
+        assert_eq!(
+            stopped_command(&history, 3, 4).as_deref(),
+            Some("; 3 of 4 commands completed, last at index 2 (op 15); the first uncompleted is command index 3 (op 6)")
+        );
+        assert_eq!(stopped_command(&history, 4, 4), None);
+        assert_eq!(stopped_command(&history, 4, 8), None);
+        assert_eq!(stopped_command(&history, u32::MAX, 4), None);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
