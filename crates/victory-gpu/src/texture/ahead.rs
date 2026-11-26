@@ -181,7 +181,9 @@ pub(crate) fn take(resource: This, first: u32) -> Option<(Arc<Job>, bool)> {
         Use::Graphics => return None,
         Use::Fresh => {}
     }
-    if copy.state.load(Ordering::Relaxed) != D3D12_RESOURCE_STATE_COMMON.0 as u32 {
+    if copy.state.load(Ordering::Relaxed) != D3D12_RESOURCE_STATE_COMMON.0 as u32
+        || crate::resource::ahead_throttled()
+    {
         return None;
     }
     let queue = worker()?;

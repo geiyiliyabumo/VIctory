@@ -278,11 +278,13 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
-const PRESSURE_SWEEP_MS: u64 = 1_000;
+const PRESSURE_SWEEP_MS: u64 = 800;
+const SWEEP_MS: u64 = 1_000;
+const SETTLE_SWEEP_MS: u64 = 1_500;
 
 fn sweep_interval(video_memory: Option<[u64; 4]>, normal_ms: u64) -> u64 {
     if video_memory.is_some_and(|[budget, used, ..]| {
-        budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 92
+        budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90
     }) {
         PRESSURE_SWEEP_MS
     } else {
@@ -308,7 +310,7 @@ fn sweep() {
         return;
     }
     let vm = host().and_then(|h| h.video_memory());
-    if now < last + sweep_interval(vm, 2_000)
+    if now < last + sweep_interval(vm, SWEEP_MS)
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -4758,7 +4760,9 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() {
             let elapsed = now_ms().saturating_sub(SWEPT.load(Ordering::Relaxed));
-            if elapsed >= PRESSURE_SWEEP_MS && elapsed >= sweep_interval(self.video_memory(), 2_500) {
+            if elapsed >= PRESSURE_SWEEP_MS
+                && elapsed >= sweep_interval(self.video_memory(), SETTLE_SWEEP_MS)
+            {
                 // With the present sent ahead nothing else brings a moment
                 // with nothing in the air: one is made for the sweep.
                 self.settle(&mut submitted, WHY_SYNC);
@@ -7271,6 +7275,14 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        let [wait_ms, mirror_ms, refresh_ms, textures_ms] = [
+            &crate::draw::HEAP_BUFFER_WAIT_MICROS,
+            &crate::draw::HEAP_BUFFER_MIRROR_MICROS,
+            &crate::draw::HEAP_BUFFER_REFRESH_MICROS,
+            &crate::draw::HEAP_BUFFER_TEXTURES_MICROS,
+        ]
+        .map(|counter| counter.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+        let slots = crate::draw::HEAP_BUFFER_SLOTS.swap(0, Ordering::Relaxed);
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -7359,7 +7371,9 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms \
+                 (wait {wait_ms:.1}, mirror {mirror_ms:.1}, refresh {refresh_ms:.1}, textures {textures_ms:.1}, slots {slots}); \
+                 texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
                  cpu {cpu_pct:.1}% gpu {gpu_pct:.0}% busy ram {ram_mb:.0} MB",
@@ -8319,13 +8333,13 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 
     #[test]
-    fn host_sweep_interval_switches_at_92_percent() {
+    fn host_sweep_interval_switches_at_90_percent() {
         use super::sweep_interval;
-        for normal_ms in [2_000, 2_500] {
-            assert_eq!(sweep_interval(None, normal_ms), normal_ms);
-            assert_eq!(sweep_interval(Some([0, 100, 0, 0]), normal_ms), normal_ms);
-            assert_eq!(sweep_interval(Some([100, 91, 0, 0]), normal_ms), normal_ms);
-            assert_eq!(sweep_interval(Some([100, 92, 0, 0]), normal_ms), 1_000);
+        for (normal_ms, expected) in [(super::SWEEP_MS, 1_000), (super::SETTLE_SWEEP_MS, 1_500)] {
+            assert_eq!(sweep_interval(None, normal_ms), expected);
+            assert_eq!(sweep_interval(Some([0, 100, 0, 0]), normal_ms), expected);
+            assert_eq!(sweep_interval(Some([100, 89, 0, 0]), normal_ms), expected);
+            assert_eq!(sweep_interval(Some([100, 90, 0, 0]), normal_ms), 800);
         }
     }
 

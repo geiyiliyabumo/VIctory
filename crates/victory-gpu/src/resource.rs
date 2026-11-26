@@ -1473,7 +1473,7 @@ fn texture_floor_bytes(video_memory: Option<[u64; 4]>) -> u64 {
 fn adaptive_texture_cap(video_memory: Option<[u64; 4]>) -> Option<u64> {
     match video_memory {
         Some([budget, ..]) if budget > 0 && budget < (9 << 30) => {
-            Some((budget * 24 / 100).clamp(1024 << 20, 1536 << 20))
+            Some(percent(budget, 32).clamp(1280 << 20, 2048 << 20))
         }
         _ => None,
     }
@@ -1508,6 +1508,29 @@ pub(crate) fn critical_vram_pressure(video_memory: Option<[u64; 4]>) -> bool {
 }
 
 #[cfg(any(windows, test))]
+fn ahead_pressure(video_memory: Option<[u64; 4]>, filled: u64) -> bool {
+    video_memory.is_some_and(|[budget, used, ..]| budget > 0 && used >= percent(budget, 88))
+        || adaptive_texture_cap(video_memory).is_some_and(|cap| filled >= percent(cap, 90))
+}
+
+/// Existing copy jobs may finish, but new uploads use the graphics path under pressure.
+#[cfg(windows)]
+pub(crate) fn ahead_throttled() -> bool {
+    let vm = crate::host::host().and_then(|h| h.video_memory());
+    ahead_pressure(vm, KINDS[1].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The byte and texture count limits shared by the filled-texture sweep.
+#[cfg(any(windows, test))]
+fn filled_sweep_limits(video_memory: Option<[u64; 4]>) -> (u64, usize) {
+    if critical_vram_pressure(video_memory) {
+        (u64::MAX, usize::MAX)
+    } else {
+        (192 << 20, 400)
+    }
+}
+
+#[cfg(any(windows, test))]
 fn filled_working_set_floor(video_memory: Option<[u64; 4]>, explicit_limit: Option<u64>) -> u64 {
     if explicit_limit.is_none_or(|limit| limit == 0)
         && video_memory.is_some_and(|[budget, ..]| budget > 0)
@@ -1532,8 +1555,9 @@ fn vram_reclaim_target(
             0
         }
     };
+    let (byte_limit, _) = filled_sweep_limits(video_memory);
     if let Some(limit) = explicit_limit.filter(|&limit| limit > 0) {
-        return texture_target(limit);
+        return texture_target(limit).min(byte_limit);
     }
     let budget_target = match video_memory {
         Some([budget, used, ..]) if budget > 0 && used >= percent(budget, 90) => {
@@ -1547,11 +1571,12 @@ fn vram_reclaim_target(
         0
     };
     let floor = filled_working_set_floor(video_memory, explicit_limit);
-    if floor == 0 {
+    let target = if floor == 0 {
         budget_target.max(adaptive_target)
     } else {
         budget_target.max(adaptive_target).min(filled.saturating_sub(floor))
-    }
+    };
+    target.min(byte_limit)
 }
 
 #[cfg(windows)]
@@ -1661,13 +1686,14 @@ pub(crate) fn evictable_filled_resources(
     }
     candidates.sort_unstable_by_key(|&(last_used, at, ..)| (last_used, at));
     let floor = filled_working_set_floor(vm, explicit_texture_budget());
-    let reclaimable = KINDS[1].load(Relaxed).saturating_sub(floor);
+    let (byte_limit, count_limit) = filled_sweep_limits(vm);
+    let reclaimable = KINDS[1].load(Relaxed).saturating_sub(floor).min(byte_limit);
     let mut bytes = 0u64;
     for (_, at, raw, size) in candidates {
         if size <= reclaimable.saturating_sub(bytes) && object::try_add_ref(at as This) {
             targets.copies.insert(raw, ResourceRef(at));
             bytes = bytes.saturating_add(size);
-            if bytes >= target_bytes {
+            if bytes >= target_bytes || targets.copies.len() >= count_limit {
                 break;
             }
         }
@@ -1977,13 +2003,14 @@ pub(crate) fn let_go_idle(targets: &EvictableFilledResources, vm: Option<[u64; 4
     let filled = KINDS[1].load(Relaxed);
     let explicit_limit = explicit_texture_budget();
     let floor = filled_working_set_floor(vm, explicit_limit);
-    let reclaimable = filled.saturating_sub(floor);
+    let (byte_limit, count_limit) = filled_sweep_limits(vm);
+    let reclaimable = filled.saturating_sub(floor).min(byte_limit);
     if reclaimable == 0 {
         return;
     }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
-    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let (mut went, mut bytes, mut first) = (0usize, 0u64, None);
     let all = textures();
     for &at in all.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
@@ -2022,6 +2049,9 @@ pub(crate) fn let_go_idle(targets: &EvictableFilledResources, vm: Option<[u64; 4
                 first = Some(at);
             }
             crate::host::retire(host);
+            if went >= count_limit || bytes >= reclaimable {
+                break;
+            }
         }
     }
     if went > 0 {
@@ -2038,7 +2068,7 @@ pub(crate) fn let_go_idle(targets: &EvictableFilledResources, vm: Option<[u64; 4
         return;
     }
     let remaining_target = vram_reclaim_target(vm, filled, explicit_limit).saturating_sub(bytes);
-    if remaining_target == 0 {
+    if remaining_target == 0 || went >= count_limit || bytes >= reclaimable {
         return;
     }
 
@@ -2088,7 +2118,7 @@ pub(crate) fn let_go_idle(targets: &EvictableFilledResources, vm: Option<[u64; 4
             lru_went += 1;
             lru_bytes += host.bytes;
             crate::host::retire(host);
-            if lru_bytes >= remaining_target {
+            if lru_bytes >= remaining_target || went + lru_went >= count_limit {
                 break;
             }
         }
@@ -3150,14 +3180,30 @@ mod tests {
         let measured_budget = 6304 << 20;
         assert_eq!(adaptive_texture_cap(None), None);
         assert_eq!(adaptive_texture_cap(Some([0; 4])), None);
-        assert_eq!(adaptive_texture_cap(Some([gib, 0, 0, 0])), Some(1024 << 20));
+        assert_eq!(adaptive_texture_cap(Some([gib, 0, 0, 0])), Some(1280 << 20));
         assert_eq!(
             adaptive_texture_cap(Some([measured_budget, 0, 0, 0])),
-            Some(measured_budget * 24 / 100)
+            Some(measured_budget * 32 / 100)
         );
-        assert_eq!(adaptive_texture_cap(Some([73 * gib / 10, 0, 0, 0])), Some(1536 << 20));
+        assert_eq!(adaptive_texture_cap(Some([73 * gib / 10, 0, 0, 0])), Some(2048 << 20));
         assert_eq!(adaptive_texture_cap(Some([9 * gib, 0, 0, 0])), None);
         assert_eq!(adaptive_texture_cap(Some([24 * gib, 0, 0, 0])), None);
+    }
+
+    #[test]
+    fn ahead_pressure_responds_to_local_usage_or_filled_copies() {
+        let mib = 1 << 20;
+        let budget = 6000 * mib;
+        let local_threshold = 5280 * mib;
+        let filled_threshold = 1728 * mib;
+        let below = Some([budget, local_threshold - 1, budget, budget]);
+        assert!(!ahead_pressure(below, filled_threshold - 1));
+        assert!(ahead_pressure(below, filled_threshold));
+        assert!(ahead_pressure(Some([budget, local_threshold, 0, 0]), 0));
+        assert!(!ahead_pressure(None, u64::MAX));
+        assert!(!ahead_pressure(Some([0, local_threshold, 0, 0]), u64::MAX));
+        assert!(!ahead_pressure(Some([10 << 30, 0, 0, 0]), u64::MAX));
+        assert!(ahead_pressure(Some([10 << 30, 9 << 30, 0, 0]), 0));
     }
 
     #[test]
@@ -3189,13 +3235,13 @@ mod tests {
         let mib = 1 << 20;
         let budget = 6000 * mib;
         let vm = Some([budget, 4600 * mib, 0, 0]);
-        let cap = 1440 * mib;
-        let threshold = 1296 * mib;
+        let cap = 1920 * mib;
+        let threshold = 1728 * mib;
         assert_eq!(vram_reclaim_target(vm, threshold - 1, None), 0);
-        assert_eq!(vram_reclaim_target(vm, threshold, None), 144 * mib);
+        assert_eq!(vram_reclaim_target(vm, threshold, None), 192 * mib);
         assert_eq!(vram_reclaim_target(vm, threshold, Some(0)), 0);
         assert_eq!(vram_reclaim_target(vm, threshold, Some(3000 * mib)), 0);
-        assert_eq!(vram_reclaim_target(vm, cap, None), 288 * mib);
+        assert_eq!(vram_reclaim_target(vm, cap, None), 192 * mib);
     }
 
     #[test]
@@ -3204,13 +3250,13 @@ mod tests {
         let budget = 6000 * mib;
         let at_pressure = Some([budget, 5400 * mib, 0, 0]);
         assert_eq!(vram_reclaim_target(Some([budget, 5400 * mib - 1, 0, 0]), 1200 * mib, None), 0);
-        assert_eq!(vram_reclaim_target(at_pressure, 1200 * mib, None), 360 * mib);
+        assert_eq!(vram_reclaim_target(at_pressure, 1200 * mib, None), 192 * mib);
         assert_eq!(vram_reclaim_target(Some([budget, 6500 * mib, 0, 0]), 0, None), 1460 * mib);
-        assert_eq!(vram_reclaim_target(Some([1000 * mib, 900 * mib, 0, 0]), 1090 * mib, Some(0)), 256 * mib);
+        assert_eq!(vram_reclaim_target(Some([1000 * mib, 900 * mib, 0, 0]), 1090 * mib, Some(0)), 192 * mib);
         assert_eq!(vram_reclaim_target(at_pressure, 899 * mib, Some(1000 * mib)), 0);
         assert_eq!(vram_reclaim_target(None, 900 * mib, Some(1000 * mib)), 128 * mib);
         assert_eq!(vram_reclaim_target(None, 950 * mib, Some(1000 * mib)), 150 * mib);
-        assert_eq!(vram_reclaim_target(at_pressure, 1200 * mib, Some(0)), 360 * mib);
+        assert_eq!(vram_reclaim_target(at_pressure, 1200 * mib, Some(0)), 192 * mib);
         assert_eq!(vram_reclaim_target(Some([0, budget, 0, 0]), budget, None), 0);
         assert_eq!(vram_reclaim_target(None, budget, None), 0);
     }
@@ -3226,7 +3272,22 @@ mod tests {
     fn vram_reclaim_stops_at_the_working_set_floor_at_91_percent() {
         let mib = 1 << 20;
         let vm = Some([6304 * mib, 5737 * mib, 0, 0]);
-        assert_eq!(vram_reclaim_target(vm, 1200 * mib, None), (1200 - 768) * mib);
+        assert_eq!(vram_reclaim_target(vm, 900 * mib, None), (900 - 768) * mib);
+    }
+
+    #[test]
+    fn vram_sweep_limits_apply_below_critical_pressure() {
+        let mib = 1 << 20;
+        let budget = 6000 * mib;
+        let critical = 5640 * mib;
+        let below = Some([budget, critical - 1, 0, 0]);
+        let at = Some([budget, critical, 0, 0]);
+        assert_eq!(filled_sweep_limits(below), (192 * mib, 400));
+        assert_eq!(filled_sweep_limits(at), (u64::MAX, usize::MAX));
+        assert_eq!(vram_reclaim_target(below, 1800 * mib, None), 192 * mib);
+        assert_eq!(vram_reclaim_target(at, 1800 * mib, None), 600 * mib);
+        assert_eq!(vram_reclaim_target(below, 1800 * mib, Some(1000 * mib)), 192 * mib);
+        assert_eq!(vram_reclaim_target(at, 1800 * mib, Some(1000 * mib)), 1000 * mib);
     }
 
     #[test]

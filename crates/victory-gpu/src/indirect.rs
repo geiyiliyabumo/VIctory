@@ -11,9 +11,10 @@
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
 //! tail slots. Each list has a budget (2^27 vertex instances or threads,
-//! groups counted as 64 threads, mesh groups as 128): active records past it
-//! run empty, saturating without 32-bit wraparound so a list of thousands of
-//! garbage records cannot run for seconds either.
+//! groups counted as 64 threads, mesh groups as 128). A record whose cost
+//! exceeds the remaining budget runs empty and leaves that budget for later
+//! records. `VICTORY_INDIRECT_REST=1` makes a rejected record drain the
+//! remaining budget.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
@@ -183,8 +184,12 @@ fn clamp() -> Option<&'static Clamp> {
 
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let rest = std::env::var_os("VICTORY_INDIRECT_REST").is_none_or(|v| v != "0");
+    let rest = indirect_rest(std::env::var_os("VICTORY_INDIRECT_REST").as_deref());
     make_for(device, rest)
+}
+
+fn indirect_rest(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
 }
 
 fn make_for(device: &ID3D12Device, rest: bool) -> windows::core::Result<Clamp> {
@@ -532,7 +537,8 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
-                let clamp = make_for(&device, true).expect("clamp shader must compile on WARP");
+                let clamp = make_for(&device, indirect_rest(None))
+                    .expect("clamp shader must compile on WARP");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,
@@ -1147,7 +1153,17 @@ void main() {
     }
 
     #[test]
-    fn warp_oversized_indirect_draw_can_spare_the_remaining_budget() {
+    fn indirect_rest_requires_explicit_opt_in() {
+        use std::ffi::OsStr;
+        assert!(!indirect_rest(None));
+        for value in ["", "0", "true", "2", " 1"] {
+            assert!(!indirect_rest(Some(OsStr::new(value))));
+        }
+        assert!(indirect_rest(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn warp_oversized_indirect_draw_spares_the_remaining_budget_by_default() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1161,14 +1177,16 @@ void main() {
         // SAFETY: the mapped source covers two draw records.
         unsafe { src_ptr.cast::<[[u32; 4]; 2]>().write([[LARGE, 1, 7, 9], [50, 1, 7, 9]]) };
 
-        for rest in [true, false] {
-            let clamp = make_for(&warp.device, rest).expect("clamp shader must compile on WARP");
+        let drain = make_for(&warp.device, indirect_rest(Some(std::ffi::OsStr::new("1"))))
+            .expect("clamp shader must compile on WARP");
+        for rest in [false, true] {
+            let clamp = if rest { &drain } else { &warp.clamp };
             // SAFETY: a completed submission, if any, has released these five words.
             unsafe { budget_ptr.cast::<[u32; 5]>().write([CAP - 100, 0, 0, 0, 0]) };
             for (i, dst) in scratch.iter().enumerate() {
                 let offset = i as u64 * u64::from(STRIDE);
                 assert!(record_clamp_as(
-                    &clamp, &warp.list, dst, budget_gpu, (&src, offset), None, (0, STRIDE, 1), 0,
+                    clamp, &warp.list, dst, budget_gpu, (&src, offset), None, (0, STRIDE, 1), 0,
                 ));
                 done_on(&warp.list, dst);
                 // SAFETY: the list is open and the copy fits both buffers.

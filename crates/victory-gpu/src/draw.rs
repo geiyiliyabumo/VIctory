@@ -606,6 +606,11 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_BUFFER_WAIT_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_BUFFER_MIRROR_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_BUFFER_REFRESH_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_BUFFER_TEXTURES_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_BUFFER_SLOTS: AtomicU64 = AtomicU64::new(0);
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1813,12 +1818,19 @@ impl State {
         // shortcut: what the title writes into such buffers between lists
         // of one frame is seen a frame late.
         let frame = crate::frame::current();
+        let started = std::time::Instant::now();
         let mut pass = host.buffer_pass.lock().unwrap_or_else(|e| e.into_inner());
+        let locked = std::time::Instant::now();
+        let waited = (locked - started).as_micros() as u64;
         if pass.frame == Some(frame) {
+            // This list may have waited for another list's pass.
+            if waited > 0 {
+                HEAP_BUFFER_WAIT_MICROS.fetch_add(waited, Ordering::Relaxed);
+                HEAP_BUFFER_MICROS.fetch_add(waited, Ordering::Relaxed);
+            }
             return Some(gpu);
         }
         pass.frame = Some(frame);
-        let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Recheck changed slots and a slice
         // of live slots each pass. This catches views that went stale
@@ -1835,6 +1847,7 @@ impl State {
         // Both snapshots come from sets, so only their overlap needs filtering.
         let changed: HashSet<u32> = slots.iter().copied().collect();
         slots.extend(slice.iter().copied().filter(|index| !changed.contains(index)));
+        slots.sort_unstable();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -1895,6 +1908,7 @@ impl State {
         } else {
             ranges.extend(look(host, &slots));
         }
+        let mirrored = std::time::Instant::now();
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
@@ -1939,9 +1953,16 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        let refreshed = std::time::Instant::now();
         self.heap_textures(list, heap, host);
+        let done = std::time::Instant::now();
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
-        HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        HEAP_BUFFER_MICROS.fetch_add((done - started).as_micros() as u64, Ordering::Relaxed);
+        HEAP_BUFFER_WAIT_MICROS.fetch_add(waited, Ordering::Relaxed);
+        HEAP_BUFFER_MIRROR_MICROS.fetch_add((mirrored - locked).as_micros() as u64, Ordering::Relaxed);
+        HEAP_BUFFER_REFRESH_MICROS.fetch_add((refreshed - mirrored).as_micros() as u64, Ordering::Relaxed);
+        HEAP_BUFFER_TEXTURES_MICROS.fetch_add((done - refreshed).as_micros() as u64, Ordering::Relaxed);
+        HEAP_BUFFER_SLOTS.fetch_add(slots.len() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
         let seen = LOGGED.load(Ordering::Relaxed);
