@@ -1227,6 +1227,73 @@ const fn ds(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
     ]
 }
 
+#[test]
+fn full_width_unsigned_to_float_rounds_once() {
+    let shader = build_valu_cs(&[vop1(0x06, 0, vgpr(1))]);
+    let mut values = vec![0, 0xDE84_975E, 0xFFFF_FF7F, u32::MAX];
+    for exponent in 24..32 {
+        let base = 1u32 << exponent;
+        let ulp = base >> 23;
+        for middle in [base + ulp / 2, base + ulp + ulp / 2] {
+            values.extend([middle - 1, middle, middle + 1]);
+        }
+    }
+    let cases: Vec<_> = values.into_iter().map(|x| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |label, _, [x, ..], out| {
+        assert_eq!(out, (x as f32).to_bits(), "{label}: {x:#010x}");
+    });
+}
+
+#[test]
+fn lds_out_of_bounds_returns_zero_and_preserves_in_bounds_data() {
+    let ds_at = |op, dst, addr, data, offset| {
+        let [lo, hi] = ds(op, dst, addr, data);
+        [lo | offset, hi]
+    };
+    // Use 64 threads so the pipeline does not require an explicit wave
+    // size. Each thread uses a separate LDS dword.
+    let mut words = vec![vop1(1, 7, vgpr(0)), vop2(0x1A, 5, 130, 0)];
+    words.extend(ds_at(DS_WRITE_B32, 0, 5, 1, 0));
+    words.extend(ds_at(DS_WRITE_B32, 0, 5, 2, 512));
+    words.extend(ds_at(0x1E, 0, 5, 2, 513)); // ds_write_b8
+    words.extend(ds_at(0x20, 4, 5, 2, 512)); // ds_add_rtn_u32, old value must be zero
+    words.extend(ds_at(0x37, 1, 5, 0, 200 << 8)); // ds_read2_b32 [0] and [800]
+    words.extend(ds_at(0x39, 3, 5, 0, 600)); // ds_read_i8
+    words.push(vop2(0x25, 6, 208, 5)); // v6 = -16, wraps back to zero below
+    words.extend(ds_at(DS_READ_B32, 6, 6, 0, 16));
+    // Reduce the results to a single dword. With correctly dropped writes,
+    // the two in-bounds reads are the only nonzero results.
+    words.push(vop2(0x25, 0, vgpr(1), 6));
+    for v in [2, 3, 4] {
+        words.push(vop2(0x25, 0, vgpr(v), 0));
+    }
+    words.push(0x7DA4_0E80); // only thread zero stores the result
+    let shader = build_cs(&words, 64, 512);
+    run_cases(&shader, &[[0x1234, 0xFFFF, 0, 0]], |label, _, [x, ..], out| {
+        assert_eq!(out, x * 2, "{label}");
+    });
+}
+
+#[test]
+fn guarded_moves_keep_inactive_vgprs_and_overwrite_sgprs() {
+    let mut words = vec![
+        vop1(1, 5, vgpr(1)), // v5 = root constant
+        s_mov_b32(6, 193), // previous s6 = -1
+        0x7DA4_0280, // v_cmpx_eq_u32 exec, 0, v1
+        vop1(1, 5, 129), // v5 = 1 under EXEC
+        0x7E0C_0505, // v_readfirstlane_b32 s6, v5 (overwrites s6)
+        0xBEFE_03C1, // restore exec
+        0xD581_0007, 0x2000_00F2, // v_mov_b32_e64 v7, -(1.0)
+        vop2(0x25, 0, sgpr(6), 5),
+    ];
+    words.push(vop2(0x1D, 0, vgpr(7), 0)); // v_xor_b32
+    let shader = build_valu_cs(&words);
+    run_cases(&shader, &[[0, 0, 0, 0], [7, 0, 0, 0]], |label, _, [x, ..], out| {
+        let value = if x == 0 { 1 } else { x };
+        assert_eq!(out, (2 * value) ^ (-1.0f32).to_bits(), "{label}");
+    });
+}
+
 const DS_WRITE_B32: u8 = 0x0D;
 const DS_MIN_F32: u8 = 0x12;
 const DS_MAX_F32: u8 = 0x13;

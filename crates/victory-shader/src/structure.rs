@@ -1485,6 +1485,38 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_exit_restoring_exec_before_a_null_export_keeps_its_condition() {
+        let p = build(
+            &[
+                0xBE89_037E, // s_mov_b32 s9, exec_lo
+                0xBE88_037E, // s_mov_b32 s8, exec_lo
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xBF82_0001, // s_branch -> body
+                0xBEFE_0308, // header: s_mov_b32 exec_lo, s8
+                0x4A02_0281, // body: v_add_nc_u32 v1, 1, v1
+                0x7DA2_0283, // v_cmpx_lt_u32 exec, 3, v1
+                0x8A08_7E08, // s_andn2_b32 s8, s8, exec_lo
+                0xBF85_FFFB, // s_cbranch_scc1 -> header
+                0xBEFE_0309, // s_mov_b32 exec_lo, s9
+                0xF800_1890, 0, // exp null done vm
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let back = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_scc1"))
+            .unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[back] else {
+            panic!("{:?}", s.exits);
+        };
+        assert_ne!(when, Bool::TRUE);
+        assert_ne!(when, Bool::FALSE);
+    }
+
+    #[test]
     fn a_search_that_remembers_answers_as_one_made_anew() {
         // Functions of 12 variables put together at random, and conditions
         // of two to five of them (repeats and constants among them), under
