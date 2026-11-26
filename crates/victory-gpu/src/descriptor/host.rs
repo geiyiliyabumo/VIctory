@@ -130,8 +130,8 @@ pub(crate) struct HostHeap {
     /// 1.0 s of the recording threads in a frame that refused 3,143 (run
     /// 45), under the lock all of them need.
     too_long: std::sync::atomic::AtomicU32,
-    /// View heaps: the bytes per element of the buffer view at each title
-    /// slot, for shaders that pick a buffer by an index they compute
+    /// View heaps: the buffer stride or constant buffer mark at each
+    /// title slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
@@ -2060,9 +2060,16 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
+            let entry = match (stride, view) {
+                (Some(stride), _) => stride,
+                (None, Some(View::Constant(..))) if victory_shader::emit::constant_marks() => {
+                    victory_shader::emit::SLOT_STRIDE_CONSTANT
+                }
+                _ => 0,
+            };
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let location = view.and_then(acceleration_location);
@@ -5230,6 +5237,45 @@ mod tests {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [1]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    #[test]
+    fn constant_buffer_slots_are_marked_in_the_stride_table() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let (_, _, data) = heap.strides.as_ref().expect("view heap stride table");
+        let index = 3;
+        let entry = || {
+            // SAFETY: the slot is inside the mapping.
+            unsafe { (*data as *const u32).add(index as usize).read_volatile() }
+        };
+        let constant = View::Constant(0x1000, 256);
+        let expected = if victory_shader::emit::constant_marks() {
+            victory_shader::emit::SLOT_STRIDE_CONSTANT
+        } else {
+            0
+        };
+        let _ = heap.note_buffer(index, Some(&constant), false);
+        assert_eq!(entry(), expected);
+
+        let texture = View::Placed(
+            false,
+            [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0],
+            [0; 16],
+        );
+        let _ = heap.note_buffer(index, Some(&texture), false);
+        assert_eq!(entry(), 0);
+
+        let mut resource = [0; 14];
+        (resource[0], resource[4]) = (1, 64);
+        let mut desc = [0; 16];
+        (desc[1], desc[6], desc[7]) = (1, 4, 16);
+        let buffer = View::Placed(false, resource, desc);
+        let _ = heap.note_buffer(index, Some(&buffer), false);
+        assert_eq!(entry(), 16);
+        let _ = heap.note_buffer(index, None, false);
+        assert_eq!(entry(), 0);
     }
 
     /// A slot a draw read through a table leaves the queue; the title's

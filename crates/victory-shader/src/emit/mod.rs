@@ -87,6 +87,8 @@ mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod dims_tests;
+#[cfg(all(test, windows))]
 mod helper_lane_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
@@ -118,9 +120,10 @@ pub use lower::{host_max_wave, set_host_max_wave};
 
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    USER_VIEW_RECORDS, USER_DISPATCH_THREADS_X, set_view_heap_limit, view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
+    SLOT_STRIDE_CONSTANT, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE,
+    USER_DISPATCH_THREADS_X, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    USER_VIEW_RECORDS, constant_marks, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.

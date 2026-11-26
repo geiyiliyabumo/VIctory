@@ -67,6 +67,7 @@ fn build() -> &'static [u8; 32] {
             limit,
             victory_shader::emit::view_heap_limit(),
             victory_shader::emit::host_max_wave(),
+            u32::from(victory_shader::emit::constant_marks()),
             // Which group barriers wait is part of the translation too.
             u32::from(victory_shader::emit::group_sync()),
             // And which clean-up passes ran over the translated code.

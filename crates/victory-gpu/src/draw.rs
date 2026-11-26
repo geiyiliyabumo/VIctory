@@ -2524,7 +2524,8 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: Option<u32>) {
-        self.invalidate_window_for_pipeline();
+        // Compute can write indirect arguments through untracked addresses.
+        self.invalidate_window();
         let builder = crate::pipeline::is_builder(self.pipeline as This);
         #[cfg(feature = "diagnostics")]
         if builder {

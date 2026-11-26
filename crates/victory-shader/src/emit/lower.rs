@@ -238,6 +238,8 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// Whether the same stride-table entries mark constant buffer views.
+    constant_slots: HashMap<(usize, Site, u8), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1546,6 +1548,7 @@ impl<'a> Lower<'a> {
             },
             handles: HashMap::new(),
             strides: HashMap::new(),
+            constant_slots: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -5580,19 +5583,10 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // A buffer the program picks from the view heap by an index it
-        // computes (`ResourceHeap`) has no used-resource entry, and the
-        // heap holds a buffer view there, not a constant buffer: read as
-        // raw bytes, as a table's SRV is below. Read as a constant buffer
-        // (the host's validation: "Descriptor Type in Heap: SRV, Register
-        // Type: CBV", heap index 17) the loads gave nothing:
-        // the title's meshlet culling (BatchCullMeshlets,
-        // BatchCullPreSkinnedMeshlets, BatchCullBatchCSMeshlets) reads its
-        // batch records, mesh headers and instance transforms this way, so
-        // it passed no meshlet and every indirect mesh draw ran empty.
-        // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // A computed view heap index has no used-resource entry. A slot
+        // with a buffer stride is read as raw bytes, like a table's SRV.
+        // The stride table distinguishes buffer views and marked constant
+        // buffer views. With marks enabled, other slots read as zeros.
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
@@ -5600,6 +5594,10 @@ impl<'a> Lower<'a> {
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let is_constant = match self.slot_is_constant(src) {
+                Some(marked) => marked,
+                None => self.s.m.cmp(self.cur, pred::EQ, stride, zero),
+            };
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -5622,8 +5620,7 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
-            let at = self.begin_guarded(Some(other));
+            let at = self.begin_guarded(Some(is_constant));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
             for (k, &r) in raw.iter().enumerate() {
@@ -5751,13 +5748,8 @@ impl<'a> Lower<'a> {
             matches!(x.p.blocks[u.0.0].insts[u.0.1].fields, Fields::Smem { .. })
         };
         let use_of = |of: Site| uses(of).find(|u| !by_scalar_load(u)).or_else(|| uses(of).next());
-        // The console compiler loads a descriptor again wherever it needs it, and for a
-        // size it reads the dwords of a load that nothing uses as a descriptor (a texture
-        // picked from the heap by an index held per lane: one load for its width, one for
-        // its base level, one for each read of the image). Another load of as many dwords
-        // from the same address reads the same descriptor, so what uses that one tells
-        // this one's kind. The handle is still made from this load's own operands, which
-        // hold here.
+        // A repeated load from the same address can reveal the descriptor's
+        // kind. Build the handle with this load's operands.
         let address = self.scalar.get(&site).copied();
         let twin = || {
             let a = address?;
@@ -5783,9 +5775,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            // A sampler's descriptor: no program reads its dwords as numbers, so where one
-            // meets numbers at a join the register is dead on that path (`dead`), as a
-            // descriptor's address or format is.
+            // Sampler descriptor words are dead where they join numeric values.
             let sampler = x.res.descriptors.iter().any(|d| {
                 d.role == Role::Sampler
                     && d.source.leaves().into_iter().any(
@@ -5897,7 +5887,14 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        // AMD's compiler needs a dedicated non-uniform handle for buffer
+        // size queries. Descriptors loaded per lane already use one.
+        let h = if image.is_none() && !self.x.res.waterfall.loads.contains(&site) {
+            let index = self.heap_index(site, first, false)?;
+            self.s.size_handle(self.cur, index, props)
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let words: Vec<(u32, V)> = match image {
             Some(kind) => self.image_size_words(h, kind, uav),
             None => {
@@ -6464,9 +6461,24 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let v = self.as_int(f);
-        self.strides.insert(key, v);
-        Ok(Some(v))
+        let mut stride = self.as_int(f);
+        if super::shader::constant_marks() {
+            let mark = self.s.m.i32(super::shader::SLOT_STRIDE_CONSTANT);
+            let is_constant = self.s.m.cmp(c, pred::EQ, stride, mark);
+            self.constant_slots.insert(key, is_constant);
+            let zero = self.s.m.i32(0);
+            stride = self.s.m.select(c, is_constant, zero, stride);
+        }
+        self.strides.insert(key, stride);
+        Ok(Some(stride))
+    }
+
+    /// Whether the slot just read by `slot_stride` holds a constant buffer.
+    fn slot_is_constant(&self, src: &Source) -> Option<V> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        self.constant_slots.get(&(self.cur, *load, *first)).copied()
     }
 
     /// The heap index of a descriptor that may differ between lanes,

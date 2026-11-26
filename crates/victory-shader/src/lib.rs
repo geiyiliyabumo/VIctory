@@ -94,6 +94,7 @@ mod source_tests {
     const OUTSIDE_TRANSLATION: &[&str] = &[
         "emit/cube_lod_tests.rs",
         "emit/diff_tests.rs",
+        "emit/dims_tests.rs",
         "emit/helper_lane_tests.rs",
         "emit/host.rs",
         "emit/intersect_tests.rs",

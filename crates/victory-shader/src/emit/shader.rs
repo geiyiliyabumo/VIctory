@@ -17,7 +17,8 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
 /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// element of the buffer view at heap slot `i`, `SLOT_STRIDE_CONSTANT` for
+/// a constant buffer with marks enabled, or 0 otherwise.
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
@@ -26,6 +27,18 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The stride-table entry for a constant buffer view. A shader uses a
+/// constant buffer load only for a marked slot, since interpreting a texture
+/// descriptor as a constant buffer can fault on AMD GPUs.
+pub const SLOT_STRIDE_CONSTANT: u32 = u32::MAX;
+
+/// Whether constant buffer slots are marked. Both the host and translator
+/// use the same setting. `VICTORY_CONSTANT_MARKS=0` restores the legacy read
+/// of any zero-stride slot as a constant buffer.
+pub fn constant_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_none_or(|v| v != "0"))
+}
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -481,6 +494,25 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        self.nonuniform_handles += u32::from(nonuniform);
+        self.marked_heap_handle(block, index, sampler, nonuniform, props)
+    }
+
+    /// AMD's compiler can crash when `getDimensions` uses the uniform heap
+    /// handle shared by a buffer's loads. Use a dedicated non-uniform handle
+    /// for the query and count it as uniform in the statistics.
+    pub fn size_handle(&mut self, block: usize, index: V, props: (u32, u32)) -> V {
+        self.marked_heap_handle(block, index, false, true, props)
+    }
+
+    fn marked_heap_handle(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
@@ -509,7 +541,6 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
-        self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,

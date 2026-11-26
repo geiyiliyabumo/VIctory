@@ -1538,16 +1538,15 @@ pub(crate) fn critical_vram_pressure(video_memory: Option<[u64; 4]>) -> bool {
 }
 
 #[cfg(any(windows, test))]
-fn ahead_pressure(video_memory: Option<[u64; 4]>, filled: u64) -> bool {
+fn local_vram_pressure(video_memory: Option<[u64; 4]>) -> bool {
     video_memory.is_some_and(|[budget, used, ..]| budget > 0 && used >= percent(budget, 88))
-        || adaptive_texture_cap(video_memory).is_some_and(|cap| filled >= percent(cap, 90))
 }
 
 /// Existing copy jobs may finish, but new uploads use the graphics path under pressure.
 #[cfg(windows)]
 pub(crate) fn ahead_throttled() -> bool {
     let vm = crate::host::host().and_then(|h| h.video_memory());
-    ahead_pressure(vm, KINDS[1].load(std::sync::atomic::Ordering::Relaxed))
+    local_vram_pressure(vm)
 }
 
 /// The byte and texture count limits shared by the filled-texture sweep.
@@ -1595,7 +1594,7 @@ fn vram_reclaim_target(
         }
         _ => 0,
     };
-    let adaptive_target = if explicit_limit.is_none() {
+    let adaptive_target = if explicit_limit.is_none() && local_vram_pressure(video_memory) {
         adaptive_texture_cap(video_memory).map_or(0, texture_target)
     } else {
         0
@@ -1742,8 +1741,8 @@ pub(crate) fn room_lately() -> bool {
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`).
 /// `VICTORY_TEXTURE_BUDGET_MB` sets a fixed limit on those copies' bytes.
-/// Otherwise, admission follows the adaptive cap and, beyond the texture
-/// floor, the effective share of the local budget.
+/// Otherwise, admission follows the effective share of the local budget
+/// beyond the texture floor. The adaptive cap applies under local pressure.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1753,7 +1752,9 @@ pub(crate) fn room() -> bool {
         filled < limit
     } else {
         let vm = crate::host::host().and_then(|h| h.video_memory());
-        if emergency_vram_redline(vm) || adaptive_texture_cap(vm).is_some_and(|cap| filled >= cap) {
+        if emergency_vram_redline(vm)
+            || (local_vram_pressure(vm) && adaptive_texture_cap(vm).is_some_and(|cap| filled >= cap))
+        {
             false
         } else if filled < texture_floor_bytes(vm) {
             true
@@ -3232,19 +3233,16 @@ mod tests {
     }
 
     #[test]
-    fn ahead_pressure_responds_to_local_usage_or_filled_copies() {
+    fn local_vram_pressure_starts_at_88_percent() {
         let mib = 1 << 20;
         let budget = 6000 * mib;
         let local_threshold = 5280 * mib;
-        let filled_threshold = 1728 * mib;
-        let below = Some([budget, local_threshold - 1, budget, budget]);
-        assert!(!ahead_pressure(below, filled_threshold - 1));
-        assert!(ahead_pressure(below, filled_threshold));
-        assert!(ahead_pressure(Some([budget, local_threshold, 0, 0]), 0));
-        assert!(!ahead_pressure(None, u64::MAX));
-        assert!(!ahead_pressure(Some([0, local_threshold, 0, 0]), u64::MAX));
-        assert!(!ahead_pressure(Some([10 << 30, 0, 0, 0]), u64::MAX));
-        assert!(ahead_pressure(Some([10 << 30, 9 << 30, 0, 0]), 0));
+        assert!(!local_vram_pressure(Some([budget, local_threshold - 1, budget, budget])));
+        assert!(local_vram_pressure(Some([budget, local_threshold, 0, 0])));
+        assert!(!local_vram_pressure(None));
+        assert!(!local_vram_pressure(Some([0, local_threshold, 0, 0])));
+        assert!(!local_vram_pressure(Some([10 << 30, 0, 0, 0])));
+        assert!(local_vram_pressure(Some([10 << 30, 9 << 30, 0, 0])));
     }
 
     #[test]
@@ -3275,7 +3273,7 @@ mod tests {
     fn vram_reclaim_target_responds_to_adaptive_cap() {
         let mib = 1 << 20;
         let budget = 6000 * mib;
-        let vm = Some([budget, 4600 * mib, 0, 0]);
+        let vm = Some([budget, 5280 * mib, 0, 0]);
         let cap = 1920 * mib;
         let threshold = 1728 * mib;
         assert_eq!(vram_reclaim_target(vm, threshold - 1, None), 0);
@@ -3283,6 +3281,15 @@ mod tests {
         assert_eq!(vram_reclaim_target(vm, threshold, Some(0)), 0);
         assert_eq!(vram_reclaim_target(vm, threshold, Some(3000 * mib)), 0);
         assert_eq!(vram_reclaim_target(vm, cap, None), 192 * mib);
+    }
+
+    #[test]
+    fn adaptive_texture_reclaim_requires_local_vram_pressure() {
+        let mib = 1 << 20;
+        let budget = 7290 * mib;
+        let filled = 2200 * mib;
+        assert_eq!(vram_reclaim_target(Some([budget, 5000 * mib, 0, 0]), filled, None), 0);
+        assert_eq!(vram_reclaim_target(Some([budget, 6450 * mib, 0, 0]), filled, None), 192 * mib);
     }
 
     #[test]
