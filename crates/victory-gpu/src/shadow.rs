@@ -2157,6 +2157,21 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    /// Round a UAV refresh out to the touched guest pages, clipped to the
+    /// copy. The declaration of GPU writes still uses the original span.
+    pub(crate) fn page_range(&self, address: u64, len: u64) -> (u64, u64) {
+        let end = self.start + self.len;
+        let from = address.clamp(self.start, end);
+        let to = address.saturating_add(len).clamp(from, end);
+        if from == to {
+            return (from, 0);
+        }
+        let page = PAGE as u64;
+        let from = (from & !(page - 1)).max(self.start);
+        let to = to.checked_next_multiple_of(page).unwrap_or(end).min(end);
+        (from, to - from)
+    }
+
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
@@ -3826,6 +3841,18 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 #[cfg(test)]
 mod window_tests {
     use super::{IdleWindow, WINDOW, cover, grid, holder, longest_tail, resolve_window_budget, tail_of, window_of, window_victims};
+
+    #[test]
+    fn uav_refresh_covers_touched_pages_within_the_shadow() {
+        let Some(host) = crate::host::host() else { return };
+        let (buffer, data) = host.shared_buffer(0x400).unwrap();
+        let shadow = super::Shadow::new(buffer, data, 0, 0x1_ff00, 0x400);
+        assert_eq!(shadow.page_range(0x1_ff80, 0x20), (0x1_ff00, 0x100));
+        assert_eq!(shadow.page_range(0x2_0010, 0x20), (0x2_0000, 0x300));
+        assert_eq!(shadow.page_range(0x1_ff80, 0x100), (0x1_ff00, 0x400));
+        assert_eq!(shadow.page_range(0x2_0010, 0), (0x2_0010, 0));
+        assert_eq!(shadow.page_range(u64::MAX, 1), (0x2_0300, 0));
+    }
 
     #[test]
     fn window_budget_defaults_on_small_hosts_and_honors_explicit_settings() {

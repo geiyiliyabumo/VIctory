@@ -519,7 +519,7 @@ fn twin_texture(
                 Some(&mut bytes),
             );
         }
-        let Some(buffer) = host.uav_buffer(bytes) else {
+        let Some(buffer) = twin_scratch(host, bytes) else {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };
@@ -570,6 +570,31 @@ fn twin_texture(
         through,
         plane,
     }))
+}
+
+/// Stencil twin copies share one buffer per power-of-two size. Each copy
+/// returns it to COMMON, and every list using it runs on the same queue.
+#[cfg(windows)]
+fn twin_scratch(
+    host: &crate::host::Host,
+    bytes: u64,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+    // D3D12 resources are free-threaded.
+    struct Scratch(Vec<(u64, ID3D12Resource)>);
+    // SAFETY: the resource interfaces may be shared across recording threads.
+    unsafe impl Send for Scratch {}
+    static SCRATCH: std::sync::Mutex<Scratch> = std::sync::Mutex::new(Scratch(Vec::new()));
+
+    let size = bytes.max(1 << 16).checked_next_power_of_two()?;
+    let mut scratch = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, buffer)) = scratch.0.iter().find(|(class, _)| *class == size) {
+        return Some(buffer.clone());
+    }
+    let buffer = host.uav_buffer(size)?;
+    crate::host::name(&buffer, || format!("depth twin scratch {size:#x}"));
+    scratch.0.push((size, buffer.clone()));
+    Some(buffer)
 }
 
 /// The typeless format of a format's family (itself if it has none).

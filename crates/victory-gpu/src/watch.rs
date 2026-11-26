@@ -696,11 +696,19 @@ fn cover_aliases(g: &mut Guards, from: usize, to: usize, rest: Duration) {
             }
             #[cfg(feature = "diagnostics")]
             ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
+            let mut fully_guarded = true;
+            for &alias in &shown {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
                 if alias != block && !protect_alias(g, alias, rest) {
-                    g.clean.remove(block);
+                    fully_guarded = false;
+                }
+            }
+            if !fully_guarded {
+                // An open alias can change every view, including views
+                // previously reported as clean.
+                for alias in shown {
+                    g.clean.remove(alias / BLOCK);
                 }
             }
         }

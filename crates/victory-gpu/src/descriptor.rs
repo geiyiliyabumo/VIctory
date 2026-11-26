@@ -901,10 +901,9 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let [lo, hi, size, _] = words(desc).unwrap_or_default();
+    let address = u64::from(lo) | u64::from(hi) << 32;
+    record(handle, View::Constant(address, size));
 }
 
 /// Device method.
@@ -1149,6 +1148,17 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let mut storage = [0u64; 4];
+        let handle = storage.as_mut_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], handle);
+        assert_eq!(view(handle), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
     }
 
     #[test]

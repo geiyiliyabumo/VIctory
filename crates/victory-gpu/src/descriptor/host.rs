@@ -3464,6 +3464,9 @@ fn buffer_uav(
         );
         return None;
     }
+    if !raw && stride == 0 && !typed_store(desc.Format) {
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -3514,27 +3517,47 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    if view == 0 {
-        return !typeless;
-    }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
-    if view != own && crate::resource::target_format(view) == own {
-        if let Some(format) = format {
-            *format = d.Format;
-        }
-        return true;
+    let stand_in = view != 0 && view != own && crate::resource::target_format(view) == own;
+    if view == 0 && typeless {
+        return false;
     }
-    if family(view) != family(own) {
+    if view != 0 && !stand_in && family(view) != family(own) {
         once!(view, own, "view format of another family");
         return false;
     }
+    let actual = if stand_in || !typeless { d.Format } else { DXGI_FORMAT(view as i32) };
+    if unordered && !typed_store(actual) {
+        return false;
+    }
     if let Some(format) = format
-        && !typeless
+        && view != 0
     {
-        *format = d.Format;
+        *format = actual;
     }
     true
+}
+
+/// Typed UAV stores depend on both the final view format and the adapter.
+fn typed_store(format: DXGI_FORMAT) -> bool {
+    let Some(host) = host() else { return false };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+    // SAFETY: a format-support query into our own structure.
+    let queried = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    };
+    let allowed = queried.is_ok()
+        && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+        && support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0;
+    if !allowed {
+        once!(format = format.0, "an unordered view in a format the host cannot store");
+    }
+    allowed
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -3654,6 +3677,11 @@ fn make_inner(
     let host = host()?;
     let device = &host.device;
     match view {
+        View::Constant(0, 0) => {
+            // SAFETY: a slot of our heap and a null CBV description.
+            unsafe { device.CreateConstantBufferView(None, at) };
+            Some(None)
+        }
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);

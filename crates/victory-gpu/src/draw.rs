@@ -1629,9 +1629,12 @@ impl State {
         };
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
-            s.refresh(list, a, len);
             if writes {
+                let (from, bytes) = s.page_range(a, len);
+                s.refresh(list, from, bytes);
                 s.gpu_writes(list, a, len);
+            } else {
+                s.refresh(list, a, len);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -1870,6 +1873,11 @@ impl State {
                     if host.shows(index, &shadow.buffer) == Some(false) {
                         HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
                     }
+                    let (from, len) = if matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
+                        shadow.page_range(from, len)
+                    } else {
+                        (from, len)
+                    };
                     found.push((index, (shadow, from, from + len)));
                 }
                 // Check device health while this chunk's slots are still
@@ -3986,11 +3994,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
-        shadow.refresh(list, address, len);
+        let writes = kind == ResourceType::Uav && (STORES.get() || !write_skip());
+        let (from, bytes) = if writes { shadow.page_range(address, len) } else { (address, len) };
+        shadow.refresh(list, from, bytes);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            if writes {
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]
