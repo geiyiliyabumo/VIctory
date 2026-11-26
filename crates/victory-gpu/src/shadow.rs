@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::core::Interface;
 
 use crate::host::{HostList, RamBand, host};
 use crate::watch::PAGE;
@@ -58,6 +59,10 @@ pub(crate) struct Shadow {
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
     used: AtomicU64,
+    /// When the copy was last actively bound by a draw/dispatch, rewritten via
+    /// a descriptor slot, or updated with mapped CPU writes (not bumped by
+    /// passive zero-byte heap-buffer rescans).
+    active: AtomicU64,
     /// The lowest and highest title address asked for in the copy (a
     /// window is 4 MiB whatever was asked: measured for the memory line).
     asked: [AtomicU64; 2],
@@ -952,10 +957,43 @@ impl SnapshotPool {
         self.bytes += capacity;
         self.count += 1;
     }
+
+    fn trim_to(&mut self, max_bytes: usize) {
+        while self.bytes > max_bytes {
+            let Some(mut smallest) = self.by_capacity.first_entry() else {
+                break;
+            };
+            let size = *smallest.key();
+            smallest.get_mut().pop();
+            if smallest.get().is_empty() {
+                smallest.remove();
+            }
+            self.count -= 1;
+            self.bytes -= size;
+        }
+    }
 }
 
 static POOL: std::sync::LazyLock<Mutex<SnapshotPool>> =
     std::sync::LazyLock::new(|| Mutex::new(SnapshotPool::default()));
+
+/// Trims retained CPU snapshot buffers under WDDM L0 or physical RAM pressure.
+pub(crate) fn trim_snapshot_pool(vm: Option<[u64; 4]>, avail_phys: Option<u64>) {
+    const MIB: u64 = 1 << 20;
+    let l0_pct = vm.map_or(0, |[_, _, budget, used]| {
+        if budget > 0 { ((u128::from(used) * 100) / u128::from(budget)) as u64 } else { 0 }
+    });
+    let cap = if l0_pct >= 90 || avail_phys.is_some_and(|avail| avail < 512 * MIB) {
+        Some(0)
+    } else if l0_pct >= 80 || avail_phys.is_some_and(|avail| avail < 1024 * MIB) {
+        Some(64 << 20)
+    } else {
+        None
+    };
+    if let Some(cap) = cap {
+        POOL.lock().unwrap_or_else(|e| e.into_inner()).trim_to(cap);
+    }
+}
 
 fn pooled(n: usize) -> Vec<u8> {
     let reused = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n);
@@ -1004,6 +1042,18 @@ mod snapshot_pool_tests {
         pool.put(Vec::with_capacity(16));
         assert_eq!((pool.count, pool.bytes), (512, 4104));
         assert_eq!(pool.take(16).unwrap().capacity(), 16);
+    }
+
+    #[test]
+    fn trim_to_drops_smallest_buffers_until_under_cap() {
+        let mut pool = SnapshotPool::default();
+        pool.put(Vec::with_capacity(1024));
+        pool.put(Vec::with_capacity(2048));
+        pool.put(Vec::with_capacity(4096));
+        pool.trim_to(4096);
+        assert_eq!((pool.count, pool.bytes), (1, 4096));
+        pool.trim_to(0);
+        assert_eq!((pool.count, pool.bytes), (0, 0));
     }
 }
 
@@ -1954,6 +2004,236 @@ fn window_victims(windows: &mut [IdleWindow], keep: u64) -> &[IdleWindow] {
     windows
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct L0ReclaimPlan {
+    target_bytes: u64,
+    idle_ms: u64,
+    unmapped_cap_bytes: u64,
+}
+
+fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
+    const MIB: u64 = 1 << 20;
+    let Some([_, _, budget, used]) = vm else {
+        return L0ReclaimPlan {
+            target_bytes: if emergency { 512 * MIB } else { 0 },
+            idle_ms: if emergency { 2_000 } else { 15_000 },
+            unmapped_cap_bytes: 256 * MIB,
+        };
+    };
+    if budget == 0 {
+        return L0ReclaimPlan {
+            target_bytes: if emergency { 512 * MIB } else { 0 },
+            idle_ms: if emergency { 2_000 } else { 15_000 },
+            unmapped_cap_bytes: 256 * MIB,
+        };
+    }
+    let pct = (u128::from(used) * 100) / u128::from(budget);
+    if emergency || pct >= 92 {
+        let goal = (u128::from(budget) * 70 / 100) as u64;
+        L0ReclaimPlan {
+            target_bytes: used.saturating_sub(goal).max(512 * MIB),
+            idle_ms: 2_000,
+            unmapped_cap_bytes: u64::MAX,
+        }
+    } else if pct >= 88 {
+        let goal = (u128::from(budget) * 74 / 100) as u64;
+        L0ReclaimPlan {
+            target_bytes: used.saturating_sub(goal),
+            idle_ms: 5_000,
+            unmapped_cap_bytes: u64::MAX,
+        }
+    } else if pct >= 78 {
+        let goal = (u128::from(budget) * 72 / 100) as u64;
+        L0ReclaimPlan {
+            target_bytes: used.saturating_sub(goal).min(256 * MIB),
+            idle_ms: 15_000,
+            unmapped_cap_bytes: u64::MAX,
+        }
+    } else {
+        L0ReclaimPlan {
+            target_bytes: 0,
+            idle_ms: 15_000,
+            unmapped_cap_bytes: 256 * MIB,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EvictableWindow {
+    key: (u64, u64),
+    span: (u64, u64),
+    idle_ms: u64,
+    unmapped: bool,
+}
+
+/// Loose windows selected for descriptor unpinning and immediate L0 reclaim.
+/// Holds only keys and raw host buffer identities (never `Arc<Shadow>`), so it
+/// never inflates `Arc::strong_count` during descriptor/buffer-pass unpinning.
+#[derive(Default)]
+pub(crate) struct EvictableLooseWindows {
+    by_raw: std::collections::HashMap<usize, EvictableWindow>,
+    by_key: std::collections::HashMap<(u64, u64), EvictableWindow>,
+}
+
+impl EvictableLooseWindows {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_raw.is_empty()
+    }
+
+    pub(crate) fn contains(&self, raw: usize) -> bool {
+        self.by_raw.contains_key(&raw)
+    }
+
+    /// With no action, checks membership without locking `LOOSE`.
+    /// With an action, rechecks under `LOOSE` that the window is still idle,
+    /// has no in-flight GPU writes, and is not held by any command list or
+    /// buffer pass (`Arc::strong_count == 1`), then invokes `unpin`.
+    pub(crate) fn with_idle_window(
+        &self,
+        raw: usize,
+        unpin: Option<&mut dyn FnMut()>,
+    ) -> Option<(u64, u64)> {
+        let entry = *self.by_raw.get(&raw)?;
+        let Some(unpin) = unpin else {
+            return Some(entry.span);
+        };
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let shadow = map.get(&entry.key)?;
+        if shadow.buffer.as_raw() as usize != raw
+            || Arc::strong_count(shadow) != 1
+            || !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || (!entry.unmapped
+                && !crate::host::long_ago(
+                    shadow.active.load(Ordering::Relaxed),
+                    entry.idle_ms,
+                    2,
+                ))
+        {
+            return None;
+        }
+        unpin();
+        Some(entry.span)
+    }
+}
+
+/// Selects loose windows eligible for unpinning and L0 reclaim on this sweep:
+/// first windows whose asked guest memory is no longer committed (unmapped),
+/// then coldest idle windows when WDDM L0 shared usage crosses 78%.
+pub(crate) fn evictable_loose_windows(
+    vm: Option<[u64; 4]>,
+    emergency: bool,
+) -> EvictableLooseWindows {
+    let plan = l0_reclaim_plan(vm, emergency);
+    let snapshot: Vec<((u64, u64), usize, u64, u64, (u64, u64))> = {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return EvictableLooseWindows::default();
+        }
+        map.iter()
+            .filter_map(|(&key, s)| {
+                if !s.window || s.place.is_some() {
+                    return None;
+                }
+                if !s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    return None;
+                }
+                let active = s.active.load(Ordering::Relaxed);
+                // Skip very fresh windows (< 2 s) so newly created views are
+                // never probed or evicted before their first frames settle.
+                if !crate::host::long_ago(active, 2_000, 2) {
+                    return None;
+                }
+                let low = s.asked[0].load(Ordering::Relaxed);
+                let high = s.asked[1].load(Ordering::Relaxed);
+                let probe = if low < high {
+                    if s.unsized_asks.load(Ordering::Relaxed) > 0 {
+                        (low, (s.start + s.len).saturating_sub(low))
+                    } else {
+                        (low, high - low)
+                    }
+                } else {
+                    (s.start, s.len)
+                };
+                Some((key, s.buffer.as_raw() as usize, s.len, active, probe))
+            })
+            .collect()
+    };
+    if snapshot.is_empty() {
+        return EvictableLooseWindows::default();
+    }
+    let mut unmapped = Vec::new();
+    let mut cold = Vec::new();
+    for (key, raw, bytes, active, (probe_start, probe_len)) in snapshot {
+        if !crate::host::range_has_committed(probe_start, probe_len) {
+            unmapped.push((active, key, raw, bytes));
+        } else if plan.target_bytes > 0 && crate::host::long_ago(active, plan.idle_ms, 2) {
+            cold.push((active, key, raw, bytes));
+        }
+    }
+    unmapped.sort_unstable_by_key(|&(active, key, _, _)| (active, key));
+    cold.sort_unstable_by_key(|&(active, key, _, _)| (active, key));
+
+    let mut targets = EvictableLooseWindows::default();
+    let mut reclaimed = 0u64;
+    let mut unmapped_bytes = 0u64;
+    for (_, key, raw, bytes) in unmapped {
+        if unmapped_bytes >= plan.unmapped_cap_bytes {
+            break;
+        }
+        let entry = EvictableWindow {
+            key,
+            span: (key.0, key.0.saturating_add(key.1)),
+            idle_ms: 0,
+            unmapped: true,
+        };
+        targets.by_raw.insert(raw, entry);
+        targets.by_key.insert(key, entry);
+        unmapped_bytes = unmapped_bytes.saturating_add(bytes);
+        reclaimed = reclaimed.saturating_add(bytes);
+    }
+    for (_, key, raw, bytes) in cold {
+        if reclaimed >= plan.target_bytes {
+            break;
+        }
+        let entry = EvictableWindow {
+            key,
+            span: (key.0, key.0.saturating_add(key.1)),
+            idle_ms: plan.idle_ms,
+            unmapped: false,
+        };
+        targets.by_raw.insert(raw, entry);
+        targets.by_key.insert(key, entry);
+        reclaimed = reclaimed.saturating_add(bytes);
+    }
+    targets
+}
+
+/// Immediately drops already-unheld loose and aligned copies with no pending
+/// GPU writes during an emergency `shared_buffer` allocation retry.
+pub(crate) fn let_go_unheld_emergency() -> usize {
+    let mut gone = Vec::new();
+    for copies in [&LOOSE, &ALIGNED] {
+        let mut map = copies.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map
+            .iter()
+            .filter_map(|(&key, s)| {
+                let unheld = Arc::strong_count(s) == 1
+                    && crate::host::references(&s.buffer) == 1
+                    && s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+                unheld.then_some(key)
+            })
+            .collect();
+        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+    }
+    let count = gone.len();
+    for shadow in gone {
+        LET_GO[0].fetch_add(1, Ordering::Relaxed);
+        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+        crate::host::retire(shadow);
+    }
+    count
+}
+
 /// Lets go of loose windows and aligned views that nothing names any more.
 /// The windows were never freed, and streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
@@ -1964,15 +2244,18 @@ fn window_victims(windows: &mut [IdleWindow], keep: u64) -> &[IdleWindow] {
 /// - only the copy holds its host buffer: no descriptor slot views it (a
 ///   slot keeps the buffer it views, `HostHeap::kept`), so no draw can read
 ///   it through a slot made earlier;
-/// - nothing asked for it within the idle time and frame thresholds.
+/// - nothing asked for it within the idle time and frame thresholds, or it was
+///   targeted for immediate L0 reclaim (`let_go_idle`).
 ///
 /// Aligned copies use shorter thresholds above 1,024 entries or 64 MiB.
 ///
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
-pub(crate) fn let_go_idle() {
+pub(crate) fn let_go_idle(targets: &EvictableLooseWindows, vm: Option<[u64; 4]>) {
     const IDLE_FRAMES: u64 = 4;
     let mut gone = Vec::new();
+    let mut targeted_count = 0usize;
+    let mut targeted_bytes = 0u64;
     let mut system_memory = None;
     let mut idle_ms = None;
     for (copies, aligned) in [(&LOOSE, false), (&ALIGNED, true)] {
@@ -1990,7 +2273,7 @@ pub(crate) fn let_go_idle() {
                 let memory = system_memory.get_or_insert_with(crate::host::system_memory_status);
                 crate::host::shared_ram_idle_ms(
                     memory.as_ref().map(|m| (m.ullAvailPhys, m.ullAvailPageFile)),
-                    crate::host::host().and_then(|h| h.video_memory()),
+                    vm,
                 )
             });
             (idle_ms, IDLE_FRAMES)
@@ -2012,6 +2295,7 @@ pub(crate) fn let_go_idle() {
                 }
             }
         }
+        let mut targeted = Vec::new();
         let mut expired = Vec::new();
         let mut early = Vec::new();
         let mut kept_bytes = 0u64;
@@ -2019,7 +2303,15 @@ pub(crate) fn let_go_idle() {
             let used = s.used.load(Ordering::Relaxed);
             // One strong reference also ensures each candidate counts once.
             let unheld = Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1;
-            if unheld && crate::host::long_ago(used, base_idle_ms, base_idle_frames) {
+            if !aligned
+                && unheld
+                && let Some(entry) = targets.by_key.get(&key)
+                && s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                && (entry.unmapped
+                    || crate::host::long_ago(s.active.load(Ordering::Relaxed), entry.idle_ms, 2))
+            {
+                targeted.push(key);
+            } else if unheld && crate::host::long_ago(used, base_idle_ms, base_idle_frames) {
                 expired.push(key);
             } else if unheld
                 && let Some((cap_ms, cap_frames, _)) = pressure_cap
@@ -2028,6 +2320,13 @@ pub(crate) fn let_go_idle() {
                 early.push(IdleWindow { key, used, bytes: s.len });
             } else {
                 kept_bytes = kept_bytes.saturating_add(s.len);
+            }
+        }
+        for key in targeted {
+            if let Some(shadow) = map.remove(&key) {
+                targeted_count += 1;
+                targeted_bytes = targeted_bytes.saturating_add(shadow.len);
+                gone.push(shadow);
             }
         }
         gone.extend(expired.into_iter().filter_map(|key| map.remove(&key)));
@@ -2039,6 +2338,13 @@ pub(crate) fn let_go_idle() {
                 }
             }
         }
+    }
+    if targeted_count > 0 {
+        tracing::info!(
+            windows = targeted_count,
+            mb = targeted_bytes >> 20,
+            "reclaimed idle loose windows under L0 pressure"
+        );
     }
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2118,6 +2424,14 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Marks the copy as actively used (direct draw/dispatch bind, descriptor
+    /// slot write, or mapped CPU dirty update). Passive heap-buffer rescans do
+    /// not call this, allowing cold old-scene loose windows to age out under L0
+    /// pressure.
+    pub(crate) fn touch_active(&self) {
+        self.active.store(crate::host::moment(), Ordering::Relaxed);
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -2189,6 +2503,7 @@ impl Shadow {
             before: Mutex::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
+            active: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             id: {
@@ -2905,7 +3220,10 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let (copied, mapped) = self.copy_stale(from, to, now, &written);
+                if mapped > 0 {
+                    self.touch_active();
+                }
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -2921,7 +3239,7 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        let _ = self.copy(from, to);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
@@ -2987,11 +3305,11 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> (usize, usize) {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let (mut bytes, mut mapped, mut run) = (0, 0, None);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -3011,27 +3329,32 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                let (total, valid) = self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += total;
+                mapped += valid;
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            let (total, valid) = self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += total;
+            mapped += valid;
         }
-        bytes
+        (bytes, mapped)
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
-    fn copy(&self, from: usize, to: usize) -> usize {
+    /// Returns `(total_span_bytes, mapped_bytes_copied)`.
+    fn copy(&self, from: usize, to: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        let mapped = crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
-        to - from
+        (to - from, mapped)
     }
 
     /// Whether shaders read and write this copy in the card's own memory
@@ -3602,21 +3925,35 @@ const WINDOW: u64 = 4 << 20;
 /// shortcut: the default stays 4 MiB until a run with the memory line's
 /// window counts has shown what the finer grids give; the same memory
 /// asked for with different ranges then lies in more than one window.
+const SMALL_HOST_RAM: u64 = 20 << 30;
+const SMALL_HOST_WINDOW: u64 = 1 << 20;
+
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
         let kb = std::env::var("VICTORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        grid(kb)
+        let total = crate::host::system_memory_status().map(|m| m.ullTotalPhys);
+        resolve_window_grid(kb, total)
     })
+}
+
+/// The window grid in bytes: explicit power of two in 64 KiB..=4 MiB, else
+/// 1 MiB on hosts with <= 20 GiB physical RAM (where WDDM L0 is ~7.5-8 GiB),
+/// else 4 MiB.
+fn resolve_window_grid(kb: Option<u64>, total_physical: Option<u64>) -> u64 {
+    match kb {
+        Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
+        Some(_) => WINDOW,
+        None if total_physical.is_some_and(|total| total <= SMALL_HOST_RAM) => SMALL_HOST_WINDOW,
+        None => WINDOW,
+    }
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
 /// 64 KiB to 4 MiB, 4 MiB for anything else.
+#[cfg_attr(not(test), allow(dead_code))]
 fn grid(kb: Option<u64>) -> u64 {
-    match kb {
-        Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
-        _ => WINDOW,
-    }
+    resolve_window_grid(kb, None)
 }
 
 /// The window (start, bytes) of title memory for an ask of `[address,
@@ -3635,16 +3972,23 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// window is the cell's tail from the ask's step on ([`TAIL_STEP`]); an ask
 /// lower in the cell later makes a longer tail, which every ask from then
 /// on takes, and the shorter one goes when nothing holds it any more.
-/// shortcut: off unless `VICTORY_WINDOW_TAILS=1`. A longer tail is another
-/// host buffer than the shorter one: what was bound to the shorter stays
-/// right only because every list brings up to date the copy it bound
-/// (`draw.rs` keeps a root view's copy with its slot). It pays only
-/// together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB grid an ask
-/// with a length in the same cell makes the whole cell's window, and the
-/// tail is that.
+/// Defaults on for hosts with <= 20 GiB physical RAM (overridable via
+/// `VICTORY_WINDOW_TAILS=0|1`).
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let setting = std::env::var_os("VICTORY_WINDOW_TAILS");
+        let setting = setting.as_deref().map(|v| v.to_str().unwrap_or_default());
+        let total = crate::host::system_memory_status().map(|m| m.ullTotalPhys);
+        resolve_window_tails(setting, total)
+    })
+}
+
+fn resolve_window_tails(setting: Option<&str>, total_physical: Option<u64>) -> bool {
+    match setting {
+        Some(value) => value.trim() == "1",
+        None => total_physical.is_some_and(|total| total <= SMALL_HOST_RAM),
+    }
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -3840,7 +4184,55 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 #[cfg(test)]
 mod window_tests {
-    use super::{IdleWindow, WINDOW, cover, grid, holder, longest_tail, resolve_window_budget, tail_of, window_of, window_victims};
+    use super::{
+        IdleWindow, L0ReclaimPlan, SMALL_HOST_WINDOW, WINDOW, cover, grid, holder,
+        l0_reclaim_plan, longest_tail, resolve_window_budget, resolve_window_grid,
+        resolve_window_tails, tail_of, window_of, window_victims,
+    };
+
+    #[test]
+    fn small_hosts_default_to_1mb_window_grid_and_tails_with_overrides() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(resolve_window_grid(None, Some(16 * GIB)), SMALL_HOST_WINDOW);
+        assert_eq!(resolve_window_grid(None, Some(20 * GIB)), SMALL_HOST_WINDOW);
+        assert_eq!(resolve_window_grid(None, Some(20 * GIB + 1)), WINDOW);
+        assert_eq!(resolve_window_grid(None, None), WINDOW);
+        assert_eq!(resolve_window_grid(Some(4096), Some(16 * GIB)), WINDOW);
+        assert_eq!(resolve_window_grid(Some(512), Some(32 * GIB)), 512 << 10);
+
+        assert!(resolve_window_tails(None, Some(16 * GIB)));
+        assert!(resolve_window_tails(None, Some(20 * GIB)));
+        assert!(!resolve_window_tails(None, Some(20 * GIB + 1)));
+        assert!(!resolve_window_tails(None, None));
+        assert!(!resolve_window_tails(Some("0"), Some(16 * GIB)));
+        assert!(resolve_window_tails(Some("1"), Some(32 * GIB)));
+    }
+
+    #[test]
+    fn l0_reclaim_plan_scales_from_calm_to_emergency() {
+        const MIB: u64 = 1 << 20;
+        let budget = 8000 * MIB;
+        // Below 78%: only unmapped windows (Tier 0), no committed eviction.
+        assert_eq!(
+            l0_reclaim_plan(Some([budget, 0, budget, 6000 * MIB]), false),
+            L0ReclaimPlan { target_bytes: 0, idle_ms: 15_000, unmapped_cap_bytes: 256 * MIB }
+        );
+        // 80% L0: smooth 256 MiB cap, 15s idle threshold.
+        assert_eq!(
+            l0_reclaim_plan(Some([budget, 0, budget, 6400 * MIB]), false),
+            L0ReclaimPlan { target_bytes: 256 * MIB, idle_ms: 15_000, unmapped_cap_bytes: u64::MAX }
+        );
+        // 89% L0: uncapped reclaim toward 74%, 5s idle threshold.
+        assert_eq!(
+            l0_reclaim_plan(Some([budget, 0, budget, 7120 * MIB]), false),
+            L0ReclaimPlan { target_bytes: 1200 * MIB, idle_ms: 5_000, unmapped_cap_bytes: u64::MAX }
+        );
+        // Emergency or >= 92%: aggressive reclaim toward 70%, 2s idle threshold.
+        assert_eq!(
+            l0_reclaim_plan(Some([budget, 0, budget, 7500 * MIB]), true),
+            L0ReclaimPlan { target_bytes: 1900 * MIB, idle_ms: 2_000, unmapped_cap_bytes: u64::MAX }
+        );
+    }
 
     #[test]
     fn uav_refresh_covers_touched_pages_within_the_shadow() {

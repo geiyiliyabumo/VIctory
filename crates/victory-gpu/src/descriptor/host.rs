@@ -186,9 +186,31 @@ pub(crate) struct HostHeap {
 #[derive(Default)]
 struct BufferSlots {
     indices: BufferIndices,
+    /// Title buffer slots unpinned under WDDM L0 pressure (slot -> evicted
+    /// window `[start, end)`), skipped by passive round-robin heap scans until
+    /// rewritten, explicitly bound by a draw table, or remapped.
+    suppressed: std::collections::HashMap<u32, (u64, u64)>,
     acceleration: std::collections::BTreeMap<u32, u64>,
     acceleration_locations: Option<Arc<[u64]>>,
 }
+
+impl Drop for BufferSlots {
+    fn drop(&mut self) {
+        if !self.suppressed.is_empty() {
+            SUPPRESSED_BUFFERS_COUNT.fetch_sub(
+                self.suppressed.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+/// Number of buffer slots currently suppressed across all view heaps: lets
+/// [`remapped`] skip recording buffer remap ranges with one relaxed load when 0.
+static SUPPRESSED_BUFFERS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Guest memory ranges remapped while at least one buffer slot is suppressed.
+static BUFFER_REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 #[derive(Default)]
 struct BufferIndices(Vec<u64>);
@@ -489,6 +511,11 @@ pub(crate) fn remapped(at: usize, len: usize) {
     /// 131,072 were dropped in one run at the 32,768 there were.)
     const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
+    if SUPPRESSED_BUFFERS_COUNT.load(Relaxed) > 0 {
+        const BUFFER_MOST: usize = 1 << 16;
+        let mut ranges = BUFFER_REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = record_remap(&mut ranges, start, end, BUFFER_MOST);
+    }
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
@@ -1967,16 +1994,54 @@ impl HostHeap {
         }
     }
 
-    /// The title slots that hold buffer views.
+    /// The title slots that hold active (non-suppressed) buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.indices.iter(u64::MAX).collect()
+        buffers
+            .indices
+            .iter(u64::MAX)
+            .filter(|slot| !buffers.suppressed.contains_key(slot))
+            .collect()
     }
 
-    /// Live buffer slots in one round-robin part.
+    /// Live (non-suppressed) buffer slots in one round-robin part.
     pub(crate) fn buffer_slots_of(&self, part: u32) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.indices.part(part).collect()
+        buffers
+            .indices
+            .part(part)
+            .filter(|slot| !buffers.suppressed.contains_key(slot))
+            .collect()
+    }
+
+    /// Wakes suppressed buffer slots whose previously evicted loose-window
+    /// span overlaps guest memory mapped, unmapped, or written via [`remapped`].
+    pub(crate) fn wake_remapped_buffers(&self) -> Vec<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if SUPPRESSED_BUFFERS_COUNT.load(Relaxed) == 0 {
+            return Vec::new();
+        }
+        let mut ranges = std::mem::take(&mut *BUFFER_REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        if ranges.is_empty() {
+            return Vec::new();
+        }
+        merge_remaps(&mut ranges);
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if buffers.suppressed.is_empty() {
+            return Vec::new();
+        }
+        let mut woken = Vec::new();
+        buffers.suppressed.retain(|&slot, &mut (start, end)| {
+            let hit = ranges.iter().any(|&(a, b)| a < end && start < b);
+            if hit {
+                woken.push(slot);
+            }
+            !hit
+        });
+        if !woken.is_empty() {
+            SUPPRESSED_BUFFERS_COUNT.fetch_sub(woken.len() as u64, Relaxed);
+        }
+        woken
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -2083,8 +2148,14 @@ impl HostHeap {
         }
         let was = if stride.is_some() {
             buffers.indices.insert(index);
+            if buffers.suppressed.remove(&index).is_some() {
+                SUPPRESSED_BUFFERS_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             true
         } else {
+            if buffers.suppressed.remove(&index).is_some() {
+                SUPPRESSED_BUFFERS_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             buffers.indices.remove(index)
         };
         if was {
@@ -2210,6 +2281,124 @@ impl HostHeap {
                 textures.remove(index);
             }
             textures.evicted.insert(index, crate::host::moment());
+        } else if let Some(dirty) = self.dynamic_dirty(index) {
+            dirty.store(false, Ordering::Relaxed);
+        }
+        crate::host::retire(old);
+        true
+    }
+
+    /// Drops `BufferPass::ranges` entries referencing targeted loose windows so
+    /// `Arc::strong_count` reflects only active command lists. Returns the
+    /// removed title slot indices so any slot not subsequently unpinned can be
+    /// re-queued via `self.changed`.
+    pub(super) fn release_buffer_pass_targets(
+        &self,
+        mut matches: impl FnMut(usize) -> bool,
+    ) -> Vec<u32> {
+        let mut pass = self.buffer_pass.lock().unwrap_or_else(|e| e.into_inner());
+        let mut removed = Vec::new();
+        pass.ranges.retain(|&index, (shadow, _, _)| {
+            if matches(shadow.buffer.as_raw() as usize) {
+                removed.push(index);
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
+    /// Clears descriptor slots (title and released dynamic) holding targeted
+    /// idle loose windows while submission is settled, suppressing passive
+    /// round-robin re-mirroring of unpinned title slots until rewritten, bound
+    /// via a table, or remapped.
+    pub(super) fn unpin_loose_windows(
+        &self,
+        released_slots: &[u32],
+        mut with_idle_window: impl FnMut(usize, Option<&mut dyn FnMut()>) -> Option<(u64, u64)>,
+    ) -> usize {
+        let mut candidates = Vec::new();
+        for (stripe, slots) in self.kept.iter().enumerate() {
+            let slots = slots.lock().unwrap_or_else(|e| e.into_inner());
+            for (offset, resource) in slots.iter().enumerate() {
+                if let Some(resource) = resource {
+                    let raw = resource.as_raw() as usize;
+                    if with_idle_window(raw, None).is_some() {
+                        candidates.push(((offset * SLOT_STRIPES + stripe) as u32, raw));
+                    }
+                }
+            }
+        }
+        let mut unpinned_title = std::collections::HashSet::new();
+        let mut count = 0;
+        for (index, raw) in candidates {
+            if self.unpin_buffer_candidate(index, raw, |clear| with_idle_window(raw, Some(clear))) {
+                if index < self.count {
+                    unpinned_title.insert(index);
+                }
+                count += 1;
+            }
+        }
+        // Any BufferPass slot whose window could not be unpinned (e.g. a
+        // recording thread concurrently grabbed it) is queued for next pass.
+        if !released_slots.is_empty() {
+            let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
+            for &slot in released_slots {
+                if !unpinned_title.contains(&slot) {
+                    changed.insert(slot);
+                }
+            }
+        }
+        count
+    }
+
+    fn unpin_buffer_candidate(
+        &self,
+        index: u32,
+        raw: usize,
+        with_idle_window: impl FnOnce(&mut dyn FnMut()) -> Option<(u64, u64)>,
+    ) -> bool {
+        let _aliases = self.aliases.read().unwrap_or_else(|e| e.into_inner());
+        let dynamic = index.checked_sub(self.count);
+        let next = dynamic.map(|_| self.next.lock().unwrap_or_else(|e| e.into_inner()));
+        if let (Some(next), Some(offset)) = (&next, dynamic)
+            && next.1.get(offset as usize) != Some(&false)
+        {
+            return false;
+        }
+        let _slot = dynamic.is_none().then(|| self.lock_slot(index));
+        if dynamic.is_none() && self.pending(index).contains_key(&index) {
+            return false;
+        }
+        let mut old = None;
+        let span = with_idle_window(&mut || {
+            let (mut kept, offset) = self.kept_slot(index);
+            let slot = &mut kept[offset];
+            if slot.as_ref().is_none_or(|resource| resource.as_raw() as usize != raw) {
+                return;
+            }
+            let at = self.cpu(index);
+            if index < self.count {
+                let key = self.made_key(index);
+                match view_at(key as u32, (key >> 32) as u32) {
+                    Some(view) => null_for(&view, at),
+                    None => null_buffer_view(at),
+                }
+            } else {
+                null_buffer_view(at);
+            }
+            old = slot.take();
+        });
+        let (Some(span), Some(old)) = (span, old) else {
+            return false;
+        };
+        if index < self.count {
+            self.made[index as usize].store(TRACKED_NULL, Ordering::Relaxed);
+            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            if buffers.suppressed.insert(index, span).is_none() {
+                SUPPRESSED_BUFFERS_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
         } else if let Some(dirty) = self.dynamic_dirty(index) {
             dirty.store(false, Ordering::Relaxed);
         }
@@ -5472,6 +5661,75 @@ mod tests {
         assert_eq!(unpin(), 1);
         assert_eq!(crate::host::references(&target), 1);
         assert_eq!(unpin(), 0);
+    }
+
+    #[test]
+    fn unpin_loose_windows_suppresses_passive_scans_and_wakes_on_remap_or_rewrite() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let heap = HostHeap::new(false, 4).unwrap();
+        let (target, _) = host.shared_buffer(4096).unwrap();
+        let (other, _) = host.shared_buffer(4096).unwrap();
+        let dynamic = heap.dynamic(2).unwrap();
+        let span = (0x7fed_0000_0000u64, 0x7fed_0010_0000u64);
+        let raw_target = target.as_raw() as usize;
+
+        for slot in [0, 1, dynamic, dynamic + 1] {
+            heap.keep(slot, Some(target.clone()));
+        }
+        heap.keep(2, Some(other.clone()));
+        for (slot, key) in heap.made.iter().zip(1..=3) {
+            slot.store(key, Ordering::Relaxed);
+        }
+        {
+            let mut buffers = heap.buffers.lock().unwrap();
+            buffers.indices.insert(0);
+            buffers.indices.insert(1);
+            buffers.indices.insert(2);
+        }
+        heap.release(dynamic, 1, false);
+
+        assert_eq!(crate::host::references(&target), 5);
+        let unpinned = heap.unpin_loose_windows(&[0, 1], |raw, clear| {
+            if raw != raw_target {
+                return None;
+            }
+            if let Some(clear) = clear {
+                clear();
+            }
+            Some(span)
+        });
+        assert_eq!(unpinned, 3);
+        assert_eq!(crate::host::references(&target), 2);
+        assert_eq!(crate::host::references(&other), 2);
+        assert_eq!([0, 1, 2].map(|index| heap.made_key(index)), [0, 0, 3]);
+        assert_eq!(heap.shows(0, &target), None);
+        assert_eq!(heap.shows(1, &target), None);
+        assert_eq!(heap.shows(2, &other), Some(true));
+        assert_eq!(heap.shows(dynamic, &target), None);
+        assert_eq!(heap.shows(dynamic + 1, &target), Some(true));
+        // Passive round-robin buffer scans skip suppressed slots 0 and 1.
+        assert_eq!(heap.buffer_slots(), [2]);
+        // Remapping guest memory in the evicted span wakes slots 0 and 1.
+        remapped(span.0 as usize, 4096);
+        let mut woken = heap.wake_remapped_buffers();
+        woken.sort_unstable();
+        assert_eq!(woken, [0, 1]);
+        assert_eq!(heap.buffer_slots(), [0, 1, 2]);
+
+        heap.release(dynamic + 1, 1, false);
+        let rest = heap.unpin_loose_windows(&[], |raw, clear| {
+            if raw != raw_target {
+                return None;
+            }
+            if let Some(clear) = clear {
+                clear();
+            }
+            Some(span)
+        });
+        assert_eq!(rest, 1);
+        assert_eq!(crate::host::references(&target), 1);
     }
 
     #[test]

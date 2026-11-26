@@ -45,7 +45,7 @@ if ($game.PSIsContainer -or $game.Extension -ine '.exe') {
 Push-Location -LiteralPath $PSScriptRoot
 try {
     & (Join-Path $PSScriptRoot 'Initialize-FormatTables.ps1')
-    $targetDir = Join-Path $PSScriptRoot 'target'
+    $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $PSScriptRoot 'target' }
     $target = 'x86_64-pc-windows-msvc'
     & cargo build --locked --release -p victory --features diagnostics --bins --target $target --target-dir $targetDir
     if ($LASTEXITCODE -ne 0) {

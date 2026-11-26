@@ -709,6 +709,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .map_or(u64::MAX, |mb| mb << 20)
     });
     let shadow = crate::shadow::find(address, 1)?;
+    shadow.touch_active();
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
@@ -1260,6 +1261,7 @@ impl State {
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                 continue;
             };
+            shadow.touch_active();
             shadow.refresh(list, v.address, u64::from(v.size));
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -1278,6 +1280,7 @@ impl State {
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                 return false;
             };
+            shadow.touch_active();
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -1619,6 +1622,7 @@ impl State {
         });
         let find = |a: u64| {
             let s = crate::shadow::find(a, 1)?;
+            s.touch_active();
             // SAFETY: a live buffer.
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
@@ -1741,6 +1745,9 @@ impl State {
         let slot = self.root_srv_slots.entry(key).or_default();
         slot.resolve(|| address.and_then(|a| crate::shadow::find(a, 1)));
         let shadow = address.zip(slot.shadow.clone());
+        if let Some((_, s)) = &shadow {
+            s.touch_active();
+        }
         let index = match slot.index {
             Some(index) => index,
             None => {
@@ -1848,6 +1855,8 @@ impl State {
         use crate::descriptor::host::BUFFER_SCAN_PARTS;
         let crate::descriptor::host::BufferPass { passes, ranges, .. } = &mut *pass;
         let mut slots = host.buffer_changes();
+        slots.extend(host.wake_remapped_buffers());
+        let active_slots: HashSet<u32> = slots.iter().copied().collect();
         let part = (*passes % u64::from(BUFFER_SCAN_PARTS)) as u32;
         if part == 0 {
             let live: HashSet<u32> = host.buffer_slots().into_iter().collect();
@@ -1920,6 +1929,11 @@ impl State {
             ranges.extend(pool.run(jobs).into_iter().flatten());
         } else {
             ranges.extend(look(host, &slots));
+        }
+        for index in active_slots {
+            if let Some((shadow, _, _)) = ranges.get(&index) {
+                shadow.touch_active();
+            }
         }
         let mirrored = std::time::Instant::now();
         let views = ranges.len() as u32;
@@ -3699,9 +3713,13 @@ impl State {
             why("arguments outside title buffers");
             return false;
         };
+        args.touch_active();
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {
-                Some(s) => Some((s, at)),
+                Some(s) => {
+                    s.touch_active();
+                    Some((s, at))
+                }
                 None => {
                     why("count outside title buffers");
                     return false;
@@ -3995,6 +4013,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+        shadow.touch_active();
         let writes = kind == ResourceType::Uav && (STORES.get() || !write_skip());
         let (from, bytes) = if writes { shadow.page_range(address, len) } else { (address, len) };
         shadow.refresh(list, from, bytes);

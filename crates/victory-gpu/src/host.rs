@@ -348,13 +348,19 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+const EMERGENCY_SWEEP_MS: u64 = 250;
 const PRESSURE_SWEEP_MS: u64 = 800;
 const SWEEP_MS: u64 = 1_000;
 const SETTLE_SWEEP_MS: u64 = 1_500;
 
+/// Set when `shared_buffer` fails to allocate in WDDM L0 so the next
+/// submission settles and runs an emergency L0 loose-window sweep.
+static EMERGENCY_L0_SWEEP: AtomicBool = AtomicBool::new(false);
+
 fn sweep_interval(video_memory: Option<[u64; 4]>, normal_ms: u64) -> u64 {
-    if video_memory.is_some_and(|[budget, used, ..]| {
-        budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90
+    if video_memory.is_some_and(|[budget, used, shared_budget, shared_used]| {
+        (budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90)
+            || (shared_budget > 0 && u128::from(shared_used) * 100 >= u128::from(shared_budget) * 85)
     }) {
         PRESSURE_SWEEP_MS
     } else {
@@ -376,19 +382,31 @@ fn sweep() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + PRESSURE_SWEEP_MS {
+    let emergency = EMERGENCY_L0_SWEEP.load(Ordering::Acquire);
+    let min_gap = if emergency { EMERGENCY_SWEEP_MS } else { PRESSURE_SWEEP_MS };
+    if now < last + min_gap {
         return;
     }
     let vm = host().and_then(|h| h.video_memory());
-    if now < last + sweep_interval(vm, SWEEP_MS)
+    let interval = if emergency { EMERGENCY_SWEEP_MS } else { sweep_interval(vm, SWEEP_MS) };
+    if now < last + interval
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
     {
         return;
     }
+    if emergency {
+        EMERGENCY_L0_SWEEP.store(false, Ordering::Release);
+    }
     crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
+    let l0_targets = crate::shadow::evictable_loose_windows(vm, emergency);
+    let unpinned_windows = crate::descriptor::unpin_loose_windows(&l0_targets);
+    if unpinned_windows > 0 {
+        trail(|| format!("sweep: unpinned {unpinned_windows} idle buffer descriptor slots under L0 pressure"));
+    }
+    crate::shadow::let_go_idle(&l0_targets, vm);
+    crate::shadow::trim_snapshot_pool(vm, system_memory_status().map(|m| m.ullAvailPhys));
     crate::texture::let_go_idle();
     let needed = crate::resource::vram_reclaim_needed(vm);
     let targets = crate::resource::evictable_filled_resources(needed, vm);
@@ -4837,10 +4855,13 @@ impl Host {
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() {
+        } else if late_free_present() || EMERGENCY_L0_SWEEP.load(Ordering::Acquire) {
             let elapsed = now_ms().saturating_sub(SWEPT.load(Ordering::Relaxed));
-            if elapsed >= PRESSURE_SWEEP_MS
-                && elapsed >= sweep_interval(self.video_memory(), SETTLE_SWEEP_MS)
+            let emergency = EMERGENCY_L0_SWEEP.load(Ordering::Acquire);
+            if (emergency && elapsed >= EMERGENCY_SWEEP_MS)
+                || (late_free_present()
+                    && elapsed >= PRESSURE_SWEEP_MS
+                    && elapsed >= sweep_interval(self.video_memory(), SETTLE_SWEEP_MS))
             {
                 // With the present sent ahead nothing else brings a moment
                 // with nothing in the air: one is made for the sweep.
@@ -6651,19 +6672,19 @@ impl Batch {
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
-pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) -> usize {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
             // SAFETY: timing only: the caller vouches for the source.
             unsafe { std::ptr::copy(src, dst, len) };
-            return;
+            return len;
         }
-        2 => return,
+        2 => return 0,
         _ => {}
     }
     if len == 0 {
-        return;
+        return 0;
     }
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
@@ -6676,7 +6697,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let ask_first = title_dst
         && *ASK.get_or_init(|| std::env::var_os("VICTORY_COPY_ASK").is_some_and(|v| v == "1"));
     if ask_first && !crate::texture::committed(dst, len) {
-        return;
+        return 0;
     }
     if title_dst {
         // The kernel writes the destination: it must not be guarded.
@@ -6688,33 +6709,68 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
-        return;
+        return len;
     }
     // The copy failed: a source page is not there, or the destination is
     // not all mapped. Then the destination stays as it is (the kernel may
     // have written its first pages).
     if title_dst && !ask_first && !crate::texture::committed(dst, len) {
-        return;
+        return 0;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     #[cfg(feature = "diagnostics")]
     let sparse = std::time::Instant::now();
-    if !title_dst && len >= 64 << 10 {
-        read_sparse(src, dst, len);
+    let copied = if !title_dst && len >= 64 << 10 {
+        read_sparse(src, dst, len)
     } else {
-        read_pieces(src, dst, len);
-    }
+        read_pieces(src, dst, len)
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+    copied
+}
+
+/// Whether `[start, start + len)` contains at least one committed, readable
+/// page in the current process. Used off the hot path by L0 loose-window
+/// reclaim to identify windows whose guest memory has been unmapped.
+pub(crate) fn range_has_committed(start: u64, len: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    if len == 0 {
+        return false;
+    }
+    let Some(end) = start.checked_add(len) else {
+        return true;
+    };
+    let mut at = start;
+    while at < end {
+        // SAFETY: the query inspects an address and fills a local structure.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if size != size_of_val(&info) {
+            return true;
+        }
+        if info.State == MEM_COMMIT && info.Protect != PAGE_NOACCESS && info.Protect != 0 {
+            return true;
+        }
+        let region_end = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64);
+        if region_end <= at {
+            return true;
+        }
+        at = region_end;
+    }
+    false
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
-fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
+fn read_sparse(src: *const u8, dst: *mut u8, len: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
+    let mut copied = 0;
     let mut offset = 0;
     while offset < len {
         let at = src.wrapping_add(offset);
@@ -6726,7 +6782,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
-            read_pieces(at, to, remaining);
+            copied += read_pieces(at, to, remaining);
             break;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
@@ -6734,23 +6790,31 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
+        } else if read(at, to, n) {
+            copied += n;
+        } else {
             // A mapping may change between query and read.
-            read_pieces(at, to, n);
+            copied += read_pieces(at, to, n);
         }
         offset += n;
     }
+    copied
 }
 
-fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
+fn read_pieces(src: *const u8, dst: *mut u8, len: usize) -> usize {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
+    let mut copied = 0;
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if read(at as *const u8, to, n) {
+            copied += n;
+        } else {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if read(at as *const u8, to, n) {
+                    copied += n;
+                } else {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
@@ -6759,6 +6823,7 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
             });
         }
     });
+    copied
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -8037,10 +8102,12 @@ impl Host {
                 })
         };
         if made.is_err() {
+            EMERGENCY_L0_SWEEP.store(true, Ordering::Release);
+            let _ = crate::shadow::let_go_unheld_emergency();
             bury(FINISHED.load(Ordering::Acquire));
             buffer = None;
             data = std::ptr::null_mut();
-            // SAFETY: retry after reclaiming finished retired resources.
+            // SAFETY: retry after reclaiming unheld windows and finished retired resources.
             made = unsafe {
                 self.device
                     .CreateCommittedResource(
@@ -8060,8 +8127,22 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                self.log_video_memory("after shared_buffer failure");
-                tracing::warn!(error = %e, size, "no shared buffer");
+                static FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let count = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                let now = now_ms();
+                let prev = LAST_LOG_MS.load(Ordering::Relaxed);
+                let should_log = count <= 8
+                    || count.is_power_of_two()
+                    || (now >= prev + 2_000
+                        && LAST_LOG_MS
+                            .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok());
+                if should_log {
+                    LAST_LOG_MS.store(now, Ordering::Relaxed);
+                    self.log_video_memory("after shared_buffer failure");
+                    tracing::warn!(error = %e, size, failures = count, "no shared buffer");
+                }
                 None
             }
         }
@@ -8484,9 +8565,27 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         for (normal_ms, expected) in [(super::SWEEP_MS, 1_000), (super::SETTLE_SWEEP_MS, 1_500)] {
             assert_eq!(sweep_interval(None, normal_ms), expected);
             assert_eq!(sweep_interval(Some([0, 100, 0, 0]), normal_ms), expected);
-            assert_eq!(sweep_interval(Some([100, 89, 0, 0]), normal_ms), expected);
-            assert_eq!(sweep_interval(Some([100, 90, 0, 0]), normal_ms), 800);
+            assert_eq!(sweep_interval(Some([100, 89, 100, 84]), normal_ms), expected);
+            assert_eq!(sweep_interval(Some([100, 90, 100, 10]), normal_ms), 800);
+            assert_eq!(sweep_interval(Some([100, 50, 100, 85]), normal_ms), 800);
         }
+    }
+
+    #[test]
+    fn range_has_committed_distinguishes_committed_and_reserved_memory() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+        let buf = [1u8; 4096];
+        assert!(super::range_has_committed(buf.as_ptr() as u64, buf.len() as u64));
+        assert!(!super::range_has_committed(buf.as_ptr() as u64, 0));
+        // SAFETY: reserve an address range without committing any pages, then release it.
+        let reserved = unsafe { VirtualAlloc(std::ptr::null(), 64 << 10, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!reserved.is_null());
+        let has_committed = super::range_has_committed(reserved as u64, 64 << 10);
+        // SAFETY: matches VirtualAlloc above.
+        unsafe { VirtualFree(reserved, 0, MEM_RELEASE) };
+        assert!(!has_committed);
     }
 
     #[test]

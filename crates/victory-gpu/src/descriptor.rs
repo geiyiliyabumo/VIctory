@@ -287,6 +287,40 @@ pub(crate) fn unpin_textures(targets: &crate::resource::EvictableFilledResources
     unpinned
 }
 
+/// Clears buffer-pass ranges and descriptor slots holding idle loose windows
+/// while submission is settled so `shadow::let_go_idle` can reclaim L0.
+#[cfg(windows)]
+pub(crate) fn unpin_loose_windows(targets: &crate::shadow::EvictableLooseWindows) -> usize {
+    if targets.is_empty() {
+        return 0;
+    }
+    // Snapshot Arc<HostHeap> references and drop SHADER_HEAPS before acquiring
+    // buffer_pass, aliases, slot locks, or shadow::LOOSE.
+    let hosts: Vec<std::sync::Arc<host::HostHeap>> = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            .filter_map(|&(_, _, at)| {
+                // SAFETY: heaps remove themselves under this lock before destruction.
+                let heap = unsafe { &*(at as *const Heap) };
+                (!heap.samplers()).then(|| heap.shared_host().cloned()).flatten()
+            })
+            .collect()
+    };
+    // Pass 1: drop BufferPass::ranges entries for targeted windows across all
+    // heaps so Arc::strong_count drops to 1 unless a command list still holds them.
+    let released: Vec<Vec<u32>> = hosts
+        .iter()
+        .map(|host| host.release_buffer_pass_targets(|raw| targets.contains(raw)))
+        .collect();
+    // Pass 2: unpin matching kept descriptor slots (title and released dynamic).
+    let mut unpinned = 0;
+    for (host, slots) in hosts.iter().zip(&released) {
+        unpinned += host.unpin_loose_windows(slots, |raw, unpin| targets.with_idle_window(raw, unpin));
+    }
+    unpinned
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
