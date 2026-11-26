@@ -319,8 +319,13 @@ fn sweep() {
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
-    let targets = crate::resource::evictable_filled_resources(crate::resource::vram_reclaim_needed());
-    let unpinned = crate::descriptor::unpin_textures(&targets);
+    let needed = crate::resource::vram_reclaim_needed();
+    let targets = crate::resource::evictable_filled_resources(needed);
+    let unpinned = if needed != 0 && targets.is_empty() {
+        crate::descriptor::host::unpin_stand_ins()
+    } else {
+        crate::descriptor::unpin_textures(&targets)
+    };
     if unpinned > 0 {
         trail(|| format!("sweep: unpinned {unpinned} idle texture descriptor slots under VRAM pressure"));
     }
@@ -344,16 +349,15 @@ fn sweep() {
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
     if started <= FINISHED.load(Ordering::Acquire) {
+        drop(retired);
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    retired.push((started, Retired(Box::new(object))));
 }
 
 /// Drops what waited for submissions up to `finished`.
@@ -2036,6 +2040,7 @@ struct Deferred {
     budget_zeroed: bool,
     /// Work once the GPU has completed the list and its readbacks are visible.
     after: Vec<Box<dyn Fn() + Send>>,
+    texture_ready: Vec<Box<dyn Fn() + Send>>,
 }
 
 #[derive(Default)]
@@ -3268,7 +3273,7 @@ pub(crate) fn walls_trace() -> bool {
 /// ([`late`]) did not, at any stage: the flights' lists were settled
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
-fn read_backs(list: &HostList) {
+fn read_backs(list: &HostList, completed: bool) {
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
     for back in &list.deferred().texture_backs {
@@ -3276,6 +3281,11 @@ fn read_backs(list: &HostList) {
     }
     for work in &list.deferred().after {
         work();
+    }
+    if completed {
+        for work in &list.deferred().texture_ready {
+            work();
+        }
     }
     for (buffer, at, [row, rows, pitch], source, recorded) in &list.deferred().backs {
         let mut landed = false;
@@ -4225,7 +4235,8 @@ impl Host {
                 Late::Run(flight) => {
                     last = flight.number;
                     for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
+                        // SAFETY: plain device status query after the fence poll.
+                        read_backs(flight.lists[i].host(), unsafe { self.device.GetDeviceRemovedReason() }.is_ok());
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -4654,7 +4665,8 @@ impl Host {
                     Late::Run(flight) => {
                         last = flight.number;
                         for &i in &flight.order {
-                            read_backs(flight.lists[i].host());
+                            // SAFETY: plain device status query after the fence wait.
+                            read_backs(flight.lists[i].host(), unsafe { self.device.GetDeviceRemovedReason() }.is_ok());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
@@ -4899,6 +4911,7 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        let mut completed = true;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -4914,10 +4927,15 @@ impl Host {
                     Ok(()) => {
                         working(false);
                         WaitForSingleObject(self.event, INFINITE);
+                        let value = self.fence.GetCompletedValue();
+                        completed &= value >= *submitted && value != u64::MAX;
                         stood(started);
                         working(true);
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        completed = false;
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             // With timing on each group is one of `runs` (and the compare
@@ -5018,7 +5036,7 @@ impl Host {
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
-            read_backs(list);
+            read_backs(list, completed);
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -5370,6 +5388,7 @@ impl HostList {
         copy: &std::sync::Arc<crate::resource::HostTexture>,
         wanted: u32,
     ) -> Option<u32> {
+        copy.upload.listed();
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -5408,6 +5427,7 @@ impl HostList {
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        copy.upload.listed();
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -5922,6 +5942,11 @@ impl HostList {
     /// Use this for readback results that are consumed after GPU completion.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
+    }
+
+    /// Publishes texture contents only after a successful graphics fence wait.
+    pub(crate) fn defer_texture_ready(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().texture_ready.push(Box::new(work));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -7787,6 +7812,11 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    pub(crate) fn dedicated_video_memory(&self) -> Option<u64> {
+        // SAFETY: a plain query on a live adapter.
+        Some(unsafe { self.adapter.as_ref()?.GetDesc() }.ok()?.DedicatedVideoMemory as u64)
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

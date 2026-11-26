@@ -380,6 +380,8 @@ struct Fresh {
     first: u32,
     /// Buffer ownership generation last checked for these dynamic slots.
     checked: u64,
+    /// Entries with no recorded GPU use that needed a stand-in.
+    withheld: Vec<u32>,
 }
 
 impl Fresh {
@@ -2336,6 +2338,36 @@ impl State {
                 host.texture_slot_done(index, write, None);
                 continue;
             }
+            let flip = view.as_ref().and_then(|view| {
+                crate::descriptor::host::HostHeap::flip_request(heap, index, handle, view)
+            });
+            let first = match (&placed, view.as_ref()) {
+                (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
+                _ => 0,
+            };
+            if partly.is_none()
+                && let Some(shared) = heap.shared_host()
+                && let Some((job, new)) = crate::texture::ahead::take(resource, first)
+            {
+                if new {
+                    SPENT.fetch_add(job.bytes, Ordering::Relaxed);
+                    HEAP_TEXTURE_BYTES.fetch_add(job.bytes, Ordering::Relaxed);
+                    HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+                }
+                host.texture_slot_later(index, write, frame, 1);
+                let heap = std::sync::Arc::downgrade(shared);
+                let memory = job.memory;
+                job.then(move |fingerprint| {
+                    if let (Some(print), Some(heap)) = (fingerprint, heap.upgrade()) {
+                        if let Some(flip) = flip {
+                            flip.flip_now();
+                        }
+                        let recheck = heap_recheck().then_some((memory, print));
+                        heap.texture_slot_uploaded_ahead(index, write, frame, recheck);
+                    }
+                });
+                continue;
+            }
             // A texture that has a staging buffer now is one draws read
             // through a table: they upload it, and check it at every
             // submission that samples it.
@@ -2345,6 +2377,12 @@ impl State {
             }
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
+            }
+            if !crate::texture::show_after() && crate::texture::ahead::on() {
+                host.mirror(index, handle, true);
+            }
+            if let Some(flip) = flip {
+                list.defer_texture_ready(move || flip.flip_now());
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3031,7 +3069,11 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            let flip = crate::descriptor::host::HostHeap::flip_request(heap, index, handle, &view);
             readable(list, u.kind, &view);
+            if let Some(flip) = flip {
+                list.defer_texture_ready(move || flip.flip_now());
+            }
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -3065,6 +3107,8 @@ impl State {
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
+        // A table that reads a first upload gets list-owned slots so the
+        // draw can use its ordered upload while the shared slots wait.
         for u in used.iter().filter(tables) {
             if fresh.contains(u.slot) {
                 continue;
@@ -3079,7 +3123,10 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if index >= host.count()
+                || (u.kind == ResourceType::Srv && crate::descriptor::view(end)
+                    .as_ref().is_some_and(crate::descriptor::host::waits_for_upload))
+            {
                 fresh.insert(u.slot);
             }
         }
@@ -3142,6 +3189,9 @@ impl State {
             let generation = crate::shadow::buffer_generation();
             if let Some(hit) = self.fresh_tables.get_mut(&key)
                 && hit.matches(table, n, &self.fresh_records)
+                && hit.withheld.iter().all(|&k| {
+                    selected.binary_search(&k).is_err() && !entries().any(|u| u.table_offset_dwords / 8 == k)
+                })
                 && (hit.checked == generation
                     || (0..n).all(|k| {
                         crate::descriptor::view(table + u64::from(k) * 32)
@@ -3180,11 +3230,11 @@ impl State {
             // alive on the list and publish the freshly bound table here.
             let at = self.fresh_records.len();
             self.fresh_records.extend((0..n).map(|k| record(table, k)));
-            self.fresh_tables.insert(key, Fresh { table, n, at, first, checked: generation });
             self.hold_dynamic(std::ptr::from_ref(heap) as usize, first, n);
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            let mut withheld = Vec::new();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3215,12 +3265,22 @@ impl State {
                         }
                     }
                     Some(view) => {
-                        if !list_views || !host.make_listed(index, &mut self.list_views, words, &view, None) {
-                            host.make_at(index, &view);
-                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
+                        let prepared = if kind.is_some() {
+                            Ok(None)
+                        } else {
+                            crate::descriptor::host::pin_unprepared(&view)
+                        };
+                        if prepared.is_err() {
+                            // The list has no upload or transition for this
+                            // entry. A dynamic shader index can still read it.
+                            host.stand_in_at(index, &view);
+                            withheld.push(k);
+                        } else if !list_views || !host.make_listed(index, &mut self.list_views, words, &view, None) {
+                            host.make_at(index, &view);
+                        }
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
                         }
@@ -3234,7 +3294,11 @@ impl State {
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
                             if kind.is_some() {
-                                host.mirror(title + k, table + u64::from(k) * 32, true);
+                                let handle = table + u64::from(k) * 32;
+                                host.mirror(title + k, handle, true);
+                                if let Some(flip) = crate::descriptor::host::HostHeap::flip_request(heap, title + k, handle, &view) {
+                                    list.defer_texture_ready(move || flip.flip_now());
+                                }
                             }
                         }
                     }
@@ -3246,6 +3310,7 @@ impl State {
                     }
                 }
             }
+            self.fresh_tables.insert(key, Fresh { table, n, at, first, checked: generation, withheld });
             self.made.push((slot, first * 32));
         }
         self.table_entries = entry_indices;
@@ -4224,7 +4289,7 @@ mod tests {
         let key = table_hash(table, 2);
         let mut state = State::default();
         state.fresh_records.extend([record(table, 0), record(table, 1)]);
-        state.fresh_tables.insert(key, Fresh { table, n: 2, at: 0, first: 0, checked: 0 });
+        state.fresh_tables.insert(key, Fresh { table, n: 2, at: 0, first: 0, checked: 0, withheld: Vec::new() });
         let fresh = &state.fresh_tables[&key];
         assert!(fresh.matches(table, 2, &state.fresh_records));
         assert!(!fresh.matches(table, 1, &state.fresh_records));

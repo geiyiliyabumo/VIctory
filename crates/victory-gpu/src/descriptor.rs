@@ -1289,6 +1289,12 @@ mod tests {
         let live = host::placed_texture(&srv).unwrap();
         let View::Shader(texture, _) = live.view else { panic!("no sampled texture") };
         let gpu = crate::resource::host_resource(texture as This).unwrap();
+        if crate::texture::show_after() {
+            assert_eq!(host.shows(1, gpu), Some(false));
+            let flip = host::HostHeap::flip_request(heap, 1, heap.handle(1).unwrap(), &srv).unwrap();
+            crate::resource::host_copy(texture as This).unwrap().upload.complete(4);
+            flip.flip_now();
+        }
         assert_eq!(host.shows(1, gpu), Some(true));
 
         // Replacing the selection and writing the original bytes back still creates a new generation.

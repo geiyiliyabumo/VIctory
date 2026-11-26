@@ -1125,6 +1125,7 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    pub(crate) upload: crate::texture::ahead::Upload,
     /// The bytes the host gives it.
     bytes: u64,
     /// Whether its contents come from title memory ([`fills`]): counted in
@@ -2130,6 +2131,7 @@ impl HostTexture {
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
+            upload: Default::default(),
             bytes,
             filled: false,
         }
@@ -2162,6 +2164,7 @@ pub(crate) fn placed_textures() -> u64 {
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let (host, _) = hosted(this, true)?;
+    host.upload.listed();
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -2300,6 +2303,24 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     }
     let r = resource(this);
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
+}
+
+/// Dimension and format of D3D12's default SRV for a texture object.
+#[cfg(windows)]
+pub(crate) fn default_texture_srv(this: This) -> Option<(u32, u32)> {
+    let (_, desc) = texture_memory(this)?;
+    let array = desc.depth_or_array_size > 1;
+    let dimension = match (desc.dimension, desc.sample_count > 1, array) {
+        (2, _, false) => 2,
+        (2, _, true) => 3,
+        (3, false, false) => 4,
+        (3, false, true) => 5,
+        (3, true, false) => 6,
+        (3, true, true) => 7,
+        (4, _, _) => 8,
+        _ => return None,
+    };
+    Some((dimension, pc_format(desc.format)))
 }
 
 /// A buffer's host memory and size; `None` for textures.

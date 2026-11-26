@@ -15,6 +15,8 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
+pub(crate) mod ahead;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -60,6 +62,8 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    // Kept until after the upload buffer is dropped.
+    _ahead: Option<ahead::Reservation>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -276,6 +280,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
     list.keep(&through.buffer);
+    if show_after() && let Some(copy) = crate::resource::host_copy(placed) {
+        list.defer_texture_ready(move || copy.upload.complete(0));
+    }
     // A draw that also writes the source (a view of it handled before
     // this one) needs it in that state again; the next read of the alias
     // then copies once more, as it must after a write.
@@ -591,6 +598,8 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     if host_written || !list.first_use(resource as usize) && staged_from(resource) <= first {
         return;
     }
+    let Some(copy) = crate::resource::host_copy(resource) else { return };
+    copy.upload.listed();
     let Some(staging) = staging(resource, texture, first) else {
         return;
     };
@@ -670,7 +679,16 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         });
     }
     // Once per submission however many of its lists sample the texture.
+    if show_after() && !copy.upload.ready(staging.first) {
+        let first = staging.first;
+        list.defer_texture_ready(move || copy.upload.complete(first));
+    }
     list.defer_texture(staging);
+}
+
+pub(crate) fn show_after() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_none_or(|v| v != "0"))
 }
 
 impl Staging {
@@ -980,35 +998,35 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 /// there count as zeros. (A texture whose change falls between the pieces
 /// is missed.)
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
-    const PIECE: usize = 4 << 10;
-    const PIECES: usize = 12;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let len = len as usize;
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        read.resize(PIECES * PIECE, 0);
-        let mut hasher = blake3::Hasher::new();
-        let mut take = |from: usize, bytes: usize| {
-            read[..bytes].fill(0);
+        fingerprint_from(len as usize, |hasher, from, bytes| {
+            read.resize(bytes, 0);
+            read.fill(0);
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
-            hasher.update(&read[..bytes]);
-        };
-        if len <= PIECES * PIECE {
-            take(0, len);
-        } else {
-            for n in 0..PIECES - 1 {
-                take(((len - PIECE) / (PIECES - 1) * n) & !0xfff, PIECE);
-            }
-            take(len - PIECE, PIECE);
-        }
-        let hash = hasher.finalize();
-        let mut first = [0u8; 8];
-        first.copy_from_slice(&hash.as_bytes()[..8]);
-        // 0 says "none" to the texture queue (`Recheck`, `checked`).
-        u64::from_le_bytes(first) | 1
+            hasher.update(&read);
+        })
     })
+}
+
+fn fingerprint_from(len: usize, mut take: impl FnMut(&mut blake3::Hasher, usize, usize)) -> u64 {
+    const PIECE: usize = 4 << 10;
+    const PIECES: usize = 12;
+    let mut hasher = blake3::Hasher::new();
+    if len <= PIECES * PIECE {
+        take(&mut hasher, 0, len);
+    } else {
+        for n in 0..PIECES - 1 {
+            take(&mut hasher, ((len - PIECE) / (PIECES - 1) * n) & !0xfff, PIECE);
+        }
+        take(&mut hasher, len - PIECE, PIECE);
+    }
+    let hash = hasher.finalize();
+    // 0 says "none" to the texture queue (`Recheck`, `checked`).
+    u64::from_le_bytes(*hash.as_bytes().first_chunk().unwrap()) | 1
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
@@ -1241,6 +1259,12 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     {
         return Some(s.clone());
     }
+    let s = make_staging(resource, texture, first, false)?;
+    map.insert(resource as usize, s.clone());
+    Some(s)
+}
+
+fn make_staging(resource: This, texture: &ID3D12Resource, first: u32, ahead: bool) -> Option<Arc<Staging>> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1281,6 +1305,13 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
+    let reservation = if ahead {
+        // Committed buffers are allocated in 64 KiB units on the host.
+        let bytes = total.checked_next_multiple_of(64 << 10)?.checked_add(size as u64)?;
+        Some(ahead::reserve(bytes)?)
+    } else {
+        None
+    };
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
@@ -1308,9 +1339,55 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        _ahead: reservation,
     });
-    map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+pub(crate) struct TestTexture {
+    pub(crate) resource: This,
+    owner: Option<windows::core::IUnknown>,
+    memory: *mut std::ffi::c_void,
+}
+
+#[cfg(test)]
+impl TestTexture {
+    const PAGE: usize = 64 << 10;
+
+    pub(crate) fn new(value: u8) -> Self {
+        use windows::core::{IUnknown, Interface};
+        use windows_sys::Win32::System::Memory::*;
+        let words = [3u32, 0, 0, 0, 16, 0, 4, 0x1_0001, 10, 1, 0, 256, 0, 0];
+        // SAFETY: the words have the guest resource description's layout.
+        let desc = unsafe { std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(words) };
+        // SAFETY: this reservation is private to the synthetic texture.
+        let memory = unsafe {
+            VirtualAlloc(std::ptr::null(), Self::PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!memory.is_null());
+        // SAFETY: the committed reservation is writable.
+        unsafe { memory.cast::<u8>().write_bytes(value, Self::PAGE) };
+        let null = std::ptr::null();
+        let mut resource = null;
+        assert_eq!(crate::resource::create_at_address(
+            null, memory as u64, &desc, 0, null.cast(), &crate::resource::PAGEABLE_IIDS[0], &mut resource,
+        ), 0);
+        // SAFETY: adopt the title resource's initial reference.
+        let owner = unsafe { IUnknown::from_raw(resource.cast_mut().cast()) };
+        Self { resource, owner: Some(owner), memory }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestTexture {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        drop(self.owner.take());
+        crate::watch::title_memory_remapped(self.memory as usize, Self::PAGE);
+        // SAFETY: the test owns this reservation and has settled its GPU work.
+        assert_ne!(unsafe { VirtualFree(self.memory, 0, MEM_RELEASE) }, 0);
+    }
 }
 
 #[cfg(test)]
