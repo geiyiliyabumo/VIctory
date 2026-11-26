@@ -1571,6 +1571,7 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
+#[cfg(test)]
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let mut runs = Vec::new();
     append_changed_runs(now, was, 0, &mut runs);
