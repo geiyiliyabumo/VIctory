@@ -1819,15 +1819,46 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// 238), and the queue was refused from the first world frame on. With
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
+/// Default reserve (MiB) kept for render targets and other host-written
+/// textures by local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`):
+/// - `<= 9 GiB` (8 GB cards running 1080p): `1536` MiB, unlocking ~1.5 GiB
+///   for streamed textures instead of locking 3,072 MiB (designed for 4K/24 GB).
+/// - `<= 13 GiB` (10–12 GB cards): `2304` MiB.
+/// - Unknown (`None`) or `> 13 GiB` (16–24+ GB cards): `3072` MiB.
+#[cfg(windows)]
+fn default_targets_room_mb(local_vram_budget: Option<u64>) -> u64 {
+    let Some(budget_bytes) = local_vram_budget else {
+        return 3072;
+    };
+    let budget_mb = budget_bytes >> 20;
+    if budget_mb <= 9 * 1024 {
+        1536
+    } else if budget_mb <= 13 * 1024 {
+        2304
+    } else {
+        3072
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
+        let budget = crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[budget, ..]| budget);
+        let default_mb = default_targets_room_mb(budget);
+        let mb = std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or(default_mb, |mb| mb.min(8192));
+        tracing::info!(
+            vram_budget_mb = budget.map(|b| b >> 20),
+            targets_room_mb = mb,
+            "render-target VRAM reserve"
+        );
+        mb << 20
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -3406,6 +3437,20 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn targets_room_scales_with_local_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(default_targets_room_mb(None), 3072);
+        assert_eq!(default_targets_room_mb(Some(7 * GIB)), 1536);
+        assert_eq!(default_targets_room_mb(Some(8 * GIB)), 1536);
+        assert_eq!(default_targets_room_mb(Some(9 * GIB)), 1536);
+        assert_eq!(default_targets_room_mb(Some(10 * GIB)), 2304);
+        assert_eq!(default_targets_room_mb(Some(12 * GIB)), 2304);
+        assert_eq!(default_targets_room_mb(Some(14 * GIB)), 3072);
+        assert_eq!(default_targets_room_mb(Some(24 * GIB)), 3072);
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

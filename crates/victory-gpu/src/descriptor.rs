@@ -56,7 +56,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
     /// Changed pages of a placed shader-visible heap. Some titles copy
@@ -82,7 +82,7 @@ impl Heap {
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
         if let Some(h) = self.host.get() {
-            return h.as_ref();
+            return h.as_deref();
         }
         if self.desc.flags & SHADER_VISIBLE == 0 || !matches!(self.desc.kind, VIEWS_KIND | SAMPLERS)
         {
@@ -98,9 +98,14 @@ impl Heap {
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
-                Some(h)
+                Some(std::sync::Arc::new(h))
             })
-            .as_ref()
+            .as_deref()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn shared_host(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
+        self.host.get()?.as_ref()
     }
 
     /// The handle of descriptor `index` of this heap.
@@ -875,7 +880,7 @@ pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<
         // SAFETY: registered heaps are live (removed when dropped).
         .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
         .filter(|heap| !heap.samplers())
-        .filter_map(|heap| heap.host.get()?.as_ref())
+        .filter_map(|heap| heap.host.get()?.as_deref())
         .max_by_key(|host| host.count())?;
     Some(f(host))
 }
@@ -898,6 +903,40 @@ pub(crate) fn constant_slot(
     {
         host.constant_at(index, buffer, gpu, size);
     }
+}
+
+/// Clears buffer-sweep ranges and descriptor slots holding targeted idle loose
+/// windows while submission is settled so `shadow::let_go_idle` can reclaim L0.
+#[cfg(windows)]
+pub(crate) fn unpin_loose_windows(targets: &crate::shadow::EvictableLooseWindows) -> usize {
+    if targets.is_empty() {
+        return 0;
+    }
+    // Snapshot Arc<HostHeap> references and drop SHADER_HEAPS before acquiring
+    // buffer_sweep, next, made, kept, or shadow::LOOSE.
+    let hosts: Vec<std::sync::Arc<host::HostHeap>> = {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            .filter_map(|&(_, _, at)| {
+                // SAFETY: heaps remove themselves under this lock before destruction.
+                let heap = unsafe { &*(at as *const Heap) };
+                (!heap.samplers()).then(|| heap.shared_host().cloned()).flatten()
+            })
+            .collect()
+    };
+    // Pass 1: drop BufferSweep::ranges entries for targeted windows across all
+    // heaps so Arc::strong_count drops to 1 unless a command list still holds them.
+    let released: Vec<Vec<u32>> = hosts
+        .iter()
+        .map(|host| host.release_buffer_sweep_targets(|raw| targets.contains(raw)))
+        .collect();
+    // Pass 2: unpin matching kept descriptor slots (title and released dynamic).
+    let mut unpinned = 0;
+    for (host, slots) in hosts.iter().zip(&released) {
+        unpinned += host.unpin_loose_windows(slots, |raw, unpin| targets.with_idle_window(raw, unpin));
+    }
+    unpinned
 }
 
 #[cfg(windows)]

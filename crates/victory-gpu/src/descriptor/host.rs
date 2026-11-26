@@ -198,6 +198,10 @@ pub(crate) struct HostHeap {
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
     buffers: Slots,
+    /// Title buffer slots unpinned under WDDM L0 pressure (slot -> evicted
+    /// window `[start, end)`), skipped by passive round-robin heap scans until
+    /// rewritten, bound via a draw table, or remapped.
+    suppressed: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Slots,
@@ -233,6 +237,27 @@ pub(crate) struct HostHeap {
     /// any other view needs nothing of `placed` ([`spans_quick`]).
     spanned: Slots,
 }
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        let suppressed = self.suppressed.get_mut().unwrap_or_else(|e| e.into_inner());
+        if !suppressed.is_empty() {
+            SUPPRESSED_BUFFERS_COUNT.fetch_sub(
+                suppressed.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+/// Number of buffer slots currently suppressed across all view heaps: lets
+/// [`remapped`], [`HostHeap::buffer_slots`], and [`HostHeap::note_buffer`]
+/// take a lock-free fast path with one relaxed atomic load when 0.
+static SUPPRESSED_BUFFERS_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Guest memory ranges remapped while at least one buffer slot is suppressed.
+static BUFFER_REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// Whether a slot's write of no placed texture view leaves `placed` alone
 /// when the slot is not in it ([`HostHeap::spanned`]; `VICTORY_SPANS_QUICK=0`:
@@ -894,6 +919,23 @@ pub(crate) fn remapped(at: usize, len: usize) {
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
+    if SUPPRESSED_BUFFERS_COUNT.load(Relaxed) > 0 {
+        const BUFFER_MOST: usize = 1 << 16;
+        let mut ranges = BUFFER_REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(last) = ranges.last_mut()
+            && last.1 == start
+        {
+            last.1 = end;
+        } else {
+            if ranges.len() >= BUFFER_MOST {
+                join(&mut ranges);
+                if ranges.len() >= BUFFER_MOST {
+                    ranges.clear();
+                }
+            }
+            ranges.push((start, end));
+        }
+    }
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
@@ -1755,6 +1797,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Slots::new(count as usize),
+            suppressed: Mutex::default(),
             changed: Slots::new(count as usize),
             textures: Mutex::new(TextureQueue { queued: queued.clone(), ..Default::default() }),
             queued,
@@ -2645,15 +2688,60 @@ impl HostHeap {
         self.tabled_in(index, false, crate::frame::current());
     }
 
-    /// The title slots that hold buffer views.
+    /// The title slots that hold active (non-suppressed) buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
-        self.buffers.all(u64::MAX)
+        let mut slots = self.buffers.all(u64::MAX);
+        if SUPPRESSED_BUFFERS_COUNT.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            let suppressed = self.suppressed.lock().unwrap_or_else(|e| e.into_inner());
+            if !suppressed.is_empty() {
+                slots.retain(|slot| !suppressed.contains_key(slot));
+            }
+        }
+        slots
     }
 
     /// Of [`HostHeap::buffer_slots`], those of one of `PARTS` parts: every
-    /// slot is in the same part each time.
+    /// slot is in the same part each time (skipping L0-suppressed slots).
     pub(crate) fn buffer_slots_of<const PARTS: u32>(&self, part: u32) -> Vec<u32> {
-        self.buffers.part::<PARTS>(part)
+        let mut slots = self.buffers.part::<PARTS>(part);
+        if SUPPRESSED_BUFFERS_COUNT.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            let suppressed = self.suppressed.lock().unwrap_or_else(|e| e.into_inner());
+            if !suppressed.is_empty() {
+                slots.retain(|slot| !suppressed.contains_key(slot));
+            }
+        }
+        slots
+    }
+
+    /// Wakes suppressed buffer slots whose previously evicted loose-window
+    /// span overlaps guest memory mapped, unmapped, or written via [`remapped`].
+    pub(crate) fn wake_remapped_buffers(&self) -> Vec<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if SUPPRESSED_BUFFERS_COUNT.load(Relaxed) == 0 {
+            return Vec::new();
+        }
+        let mut ranges =
+            std::mem::take(&mut *BUFFER_REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        if ranges.is_empty() {
+            return Vec::new();
+        }
+        join(&mut ranges);
+        let mut suppressed = self.suppressed.lock().unwrap_or_else(|e| e.into_inner());
+        if suppressed.is_empty() {
+            return Vec::new();
+        }
+        let mut woken = Vec::new();
+        suppressed.retain(|&slot, &mut (start, end)| {
+            let hit = ranges.iter().any(|&(a, b)| a < end && start < b);
+            if hit {
+                woken.push(slot);
+            }
+            !hit
+        });
+        if !woken.is_empty() {
+            SUPPRESSED_BUFFERS_COUNT.fetch_sub(woken.len() as u64, Relaxed);
+        }
+        woken
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -2756,9 +2844,16 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
+            let entry = match (stride, view) {
+                (Some(stride), _) => (stride & victory_shader::emit::VIEW_STRIDE_BITS) | kind,
+                (None, Some(View::Constant(..))) if victory_shader::emit::constant_marks() => {
+                    victory_shader::emit::VIEW_CONSTANT
+                }
+                _ => kind,
+            };
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
             write_view_address(*data, index, view);
         }
         let was = if stride.is_some() {
@@ -2767,10 +2862,130 @@ impl HostHeap {
         } else {
             self.buffers.remove(index)
         };
+        if SUPPRESSED_BUFFERS_COUNT.load(std::sync::atomic::Ordering::Relaxed) > 0
+            && self
+                .suppressed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&index)
+                .is_some()
+        {
+            SUPPRESSED_BUFFERS_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if was {
             self.changed.put(index);
         }
         stale
+    }
+
+    /// Drops `BufferSweep::ranges` entries referencing targeted loose windows
+    /// so `Arc::strong_count` reflects only active command lists. Returns the
+    /// removed title slot indices so any slot not subsequently unpinned can be
+    /// re-queued via `self.changed`.
+    pub(super) fn release_buffer_sweep_targets(
+        &self,
+        mut matches: impl FnMut(usize) -> bool,
+    ) -> Vec<u32> {
+        use windows::core::Interface;
+        let mut sweep = self.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
+        sweep.remove_matching(|shadow| matches(shadow.buffer.as_raw() as usize))
+    }
+
+    /// Clears descriptor slots (title and released dynamic) holding targeted
+    /// idle loose windows while submission is settled, suppressing passive
+    /// round-robin re-mirroring of unpinned title slots until rewritten, bound
+    /// via a table, or remapped.
+    pub(super) fn unpin_loose_windows(
+        &self,
+        released_slots: &[u32],
+        mut with_idle_window: impl FnMut(usize, Option<&mut dyn FnMut()>) -> Option<(u64, u64)>,
+    ) -> usize {
+        use windows::core::Interface;
+        let mut candidates = Vec::new();
+        for (index, slot) in self.kept.iter().enumerate() {
+            let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(resource) = guard.as_ref() {
+                let raw = resource.as_raw() as usize;
+                if with_idle_window(raw, None).is_some() {
+                    candidates.push((index as u32, raw));
+                }
+            }
+        }
+        let mut unpinned_title = std::collections::HashSet::new();
+        let mut count = 0;
+        for (index, raw) in candidates {
+            if self.unpin_buffer_candidate(index, raw, |clear| with_idle_window(raw, Some(clear))) {
+                if index < self.count {
+                    unpinned_title.insert(index);
+                }
+                count += 1;
+            }
+        }
+        if !released_slots.is_empty() {
+            for &slot in released_slots {
+                if !unpinned_title.contains(&slot) {
+                    self.changed.put(slot);
+                }
+            }
+        }
+        count
+    }
+
+    fn unpin_buffer_candidate(
+        &self,
+        index: u32,
+        raw: usize,
+        with_idle_window: impl FnOnce(&mut dyn FnMut()) -> Option<(u64, u64)>,
+    ) -> bool {
+        use windows::core::Interface;
+        let dynamic = index.checked_sub(self.count);
+        let next = dynamic.map(|_| self.next.lock().unwrap_or_else(|e| e.into_inner()));
+        if let (Some(next), Some(offset)) = (&next, dynamic)
+            && next.1.get(offset as usize) != Some(&false)
+        {
+            return false;
+        }
+        let _made = dynamic.is_none().then(|| self.made.lock(index));
+        let mut old = None;
+        let span = with_idle_window(&mut || {
+            let Some(slot_lock) = self.kept.get(index as usize) else {
+                return;
+            };
+            let mut slot = slot_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_none_or(|resource| resource.as_raw() as usize != raw) {
+                return;
+            }
+            let at = self.at(index);
+            if index < self.count {
+                let key = self.made.get(index).unwrap_or(0);
+                match view_at(key as u32, (key >> 32) as u32) {
+                    Some(view) => null_for(&view, at),
+                    None => null_buffer_view(at),
+                }
+            } else {
+                null_buffer_view(at);
+            }
+            self.put(index);
+            self.clear_twin(index);
+            old = slot.take();
+        });
+        let (Some(span), Some(old)) = (span, old) else {
+            return false;
+        };
+        if index < self.count {
+            self.quick_is(index, 0);
+            self.made.set(index, 0);
+            let mut suppressed = self.suppressed.lock().unwrap_or_else(|e| e.into_inner());
+            if suppressed.insert(index, span).is_none() {
+                SUPPRESSED_BUFFERS_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // Drop this slot's COM ref immediately (the window's `Arc<Shadow>` in
+        // `LOOSE` still owns the resource, so the GPU VA stays live here, and
+        // `shadow::let_go_idle` retires `Shadow` through `host::retire` with
+        // `bury_lag()` once `references(&s.buffer) == 1`).
+        drop(old);
+        true
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -5388,6 +5603,112 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn constant_buffer_slots_are_marked_in_the_stride_table() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let (_, _, data) = heap.strides.as_ref().expect("view heap stride table");
+        let index = 3;
+        let entry = || {
+            // SAFETY: the slot is inside the mapping.
+            unsafe { (*data as *const u32).add(index as usize).read_volatile() }
+        };
+        let constant = View::Constant(0x1000, 256);
+        let expected = if victory_shader::emit::constant_marks() {
+            victory_shader::emit::VIEW_CONSTANT
+        } else {
+            0
+        };
+        let _ = heap.note_buffer(index, Some(&constant), false);
+        assert_eq!(entry(), expected);
+
+        let texture = View::Placed(
+            false,
+            [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0],
+            [0; 16],
+        );
+        let _ = heap.note_buffer(index, Some(&texture), false);
+        assert_eq!(entry(), 0);
+
+        let mut resource = [0; 14];
+        (resource[0], resource[4]) = (1, 64);
+        let mut desc = [0; 16];
+        (desc[1], desc[6], desc[7]) = (1, 4, 16);
+        let buffer = View::Placed(false, resource, desc);
+        let _ = heap.note_buffer(index, Some(&buffer), false);
+        assert_eq!(entry(), 16);
+        let _ = heap.note_buffer(index, None, false);
+        assert_eq!(entry(), 0);
+    }
+
+    #[test]
+    fn unpin_loose_windows_suppresses_passive_scans_and_wakes_on_remap_or_rewrite() {
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let heap = HostHeap::new(false, 4).unwrap();
+        let (target, _) = host.shared_buffer(4096).unwrap();
+        let (other, _) = host.shared_buffer(4096).unwrap();
+        let dynamic = heap.dynamic(2).unwrap();
+        let span = (0x7fed_0000_0000u64, 0x7fed_0010_0000u64);
+        let raw_target = target.as_raw() as usize;
+        let raw_other = other.as_raw() as usize;
+
+        for slot in [0, 1, dynamic, dynamic + 1] {
+            heap.keep(slot, Some(target.clone()));
+        }
+        heap.keep(2, Some(other.clone()));
+        for slot in 0..3u32 {
+            heap.made.set(slot, u64::from(slot + 1));
+            heap.quick_is(slot, u64::from(slot + 1));
+            heap.buffers.put(slot);
+        }
+        heap.release(dynamic, 1);
+
+        assert_eq!(crate::host::references(&target), 5);
+        let unpinned = heap.unpin_loose_windows(&[0, 1], |raw, clear| {
+            if raw != raw_target {
+                return None;
+            }
+            if let Some(clear) = clear {
+                clear();
+            }
+            Some(span)
+        });
+        assert_eq!(unpinned, 3);
+        assert_eq!(crate::host::references(&target), 2);
+        assert_eq!(crate::host::references(&other), 2);
+        assert_eq!([0, 1, 2].map(|index| heap.made.get(index).unwrap_or(0)), [0, 0, 3]);
+        assert_eq!(heap.kept_in(0), None);
+        assert_eq!(heap.kept_in(1), None);
+        assert_eq!(heap.kept_in(2).map(|r| r.as_raw() as usize), Some(raw_other));
+        assert_eq!(heap.kept_in(dynamic), None);
+        assert_eq!(heap.kept_in(dynamic + 1).map(|r| r.as_raw() as usize), Some(raw_target));
+        // Passive round-robin buffer scans skip suppressed slots 0 and 1.
+        assert_eq!(heap.buffer_slots(), [2]);
+        // Remapping guest memory in the evicted span wakes slots 0 and 1.
+        remapped(span.0 as usize, 4096);
+        let mut woken = heap.wake_remapped_buffers();
+        woken.sort_unstable();
+        assert_eq!(woken, [0, 1]);
+        assert_eq!(heap.buffer_slots(), [0, 1, 2]);
+
+        heap.release(dynamic + 1, 1);
+        let rest = heap.unpin_loose_windows(&[], |raw, clear| {
+            if raw != raw_target {
+                return None;
+            }
+            if let Some(clear) = clear {
+                clear();
+            }
+            Some(span)
+        });
+        assert_eq!(rest, 1);
+        assert_eq!(crate::host::references(&target), 1);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
