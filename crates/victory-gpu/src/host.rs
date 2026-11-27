@@ -9682,7 +9682,12 @@ impl Meter {
         }
         #[cfg(feature = "diagnostics")]
         let copy_stats_frames = if five { std::mem::take(&mut self.copy_stats_frames) as f64 } else { 0.0 };
+        let seconds = elapsed.as_secs_f64();
         meter_lines(move || {
+            // The window's numbers, for averages over a run.
+            tracing::info!(
+                "frame rate: {frames:.0} frames in {seconds:.3} s: {fps:.1} fps, {ms:.1} ms/frame, {draws:.0} draws/frame"
+            );
             // Of a frame, ms preparing submissions and ms waiting for the GPU.
             let [cpu, gpu] = [0, 1].map(|i| {
                 SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames

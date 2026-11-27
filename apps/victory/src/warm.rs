@@ -95,6 +95,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     run_batches(
         &all,
         jobs,
+        retry_alone_enabled(),
         start_worker,
         |n, ms, there| {
             if ms >= SLOW_MS {
@@ -132,9 +133,16 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     Ok(())
 }
 
+/// Whether a pipeline that ended a multi-pipeline batch after earlier progress
+/// is retried alone in a fresh process before being quarantined (`VICTORY_WARM_RETRY=0` disables).
+fn retry_alone_enabled() -> bool {
+    !std::env::var_os("VICTORY_WARM_RETRY").is_some_and(|v| v == "0")
+}
+
 fn run_batches(
     all: &[usize],
     jobs: usize,
+    retry_alone: bool,
     start: impl Fn(&[usize]) -> Result<Child> + Sync,
     each: impl Fn(usize, f64, bool) + Sync,
     bad: impl Fn(usize, String) + Sync,
@@ -161,7 +169,26 @@ fn run_batches(
                                 let Some((&n, after)) = remaining.split_first() else {
                                     break;
                                 };
-                                bad(n, why);
+                                // If earlier pipelines in the batch had already run, retry `n`
+                                // alone in a clean worker before quarantining it to `warm-bad.txt`.
+                                let final_why = if retry_alone && made > 0 {
+                                    match start(&[n])
+                                        .context("could not start warm worker")
+                                        .and_then(|process| child(process, &each))
+                                    {
+                                        Ok(None) => None,
+                                        Ok(Some((_, alone_why))) => Some(alone_why),
+                                        Err(error) => {
+                                            let _ = failure.set(error);
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    Some(why)
+                                };
+                                if let Some(why) = final_why {
+                                    bad(n, why);
+                                }
                                 rest = after;
                             }
                             Ok(None) => break,
@@ -292,6 +319,7 @@ mod tests {
         let result = run_batches(
             &[7, 8, 9],
             1,
+            false,
             |_| {
                 starts.fetch_add(1, Ordering::Relaxed);
                 Ok(Command::new(&missing).spawn()?)
@@ -312,6 +340,7 @@ mod tests {
         let error = run_batches(
             &[1, 2],
             1,
+            false,
             |_| fake_child("exit /b 0", Stdio::null()),
             |_, _, _| panic!("unexpected completion"),
             |_, _| panic!("unexpected bad pipeline"),
@@ -327,6 +356,7 @@ mod tests {
         run_batches(
             &[7, 8, 9],
             1,
+            false,
             |rest| match rest {
                 [7, 8, 9] => fake_child("echo made 7 3.5 1&exit /b 7", Stdio::piped()),
                 [9] => fake_child("echo made 9 2.0 0", Stdio::piped()),
@@ -344,6 +374,28 @@ mod tests {
     }
 
     #[test]
+    fn worker_exit_after_progress_retries_failed_pipeline_alone() {
+        let done = Mutex::new(Vec::new());
+        let bad = Mutex::new(Vec::new());
+        run_batches(
+            &[7, 8, 9],
+            1,
+            true,
+            |rest| match rest {
+                [7, 8, 9] => fake_child("echo made 7 3.5 1&exit /b 7", Stdio::piped()),
+                [8] => fake_child("echo made 8 1.5 1", Stdio::piped()),
+                [9] => fake_child("echo made 9 2.0 0", Stdio::piped()),
+                _ => panic!("unexpected batch {rest:?}"),
+            },
+            |n, ms, there| lock(&done).push((n, ms, there)),
+            |n, why| lock(&bad).push((n, why)),
+        )
+        .unwrap();
+        assert_eq!(*lock(&done), [(7, 3.5, true), (8, 1.5, true), (9, 2.0, false)]);
+        assert!(lock(&bad).is_empty());
+    }
+
+    #[test]
     fn startup_failure_preserves_another_workers_completion() {
         // Hold the failed start until its peer has reported the only key in its chunk.
         let keys: Vec<_> = (0..=AT_ONCE).collect();
@@ -352,6 +404,7 @@ mod tests {
         let error = run_batches(
             &keys,
             2,
+            false,
             |chunk| {
                 if chunk[0] == 0 {
                     assert_eq!(lock(&received).recv_timeout(Duration::from_secs(5)).unwrap(), AT_ONCE);

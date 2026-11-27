@@ -84,6 +84,18 @@ pub fn run(
         let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
         victory_loader::load(&prepared, &cache)?
     } else {
+        // `VICTORY_FSR_PC=1`: the PC FSR 4.1.2 serves the title's own
+        // FidelityFX calls at whatever sizes it asks for (e.g. the Series S
+        // profile's 720p to 1080p), in place of its console DLL translated.
+        // No patch of the title: its own render and output sizes stay.
+        if std::env::var_os("VICTORY_FSR_PC").is_some_and(|v| v == "1") {
+            let dir = cfg.fidelityfx_dir.as_deref().context(
+                "VICTORY_FSR_PC requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+            )?;
+            victory_hle::modules::fidelityfx::use_host_dir(dir)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("loading FSR 4.1.2 from {}", dir.display()))?;
+        }
         victory_loader::load(&prepared, &images)?
     };
     // The program is mapped from the copy `load` wrote: the file's bytes

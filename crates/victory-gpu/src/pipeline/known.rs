@@ -279,6 +279,29 @@ pub fn format_bad_entry(key: &str, fingerprint: &str, reason: &str) -> String {
     }
 }
 
+/// The pipeline key named by one line of `warm-bad.txt` if it applies to
+/// `fingerprint`, else `None` (blank lines, `#` comments, or another
+/// fingerprint).
+pub fn bad_line_key<'a>(line: &'a str, fingerprint: &str) -> Option<&'a str> {
+    let line = line.trim_start();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let first = parts.next()?;
+    if let Some(second) = parts.next() {
+        if let Some(fp) = second.strip_prefix("fp=")
+            && is_hex(fp, 16)
+        {
+            return (fp == fingerprint).then_some(first);
+        }
+        if is_hex(first, 16) && is_hex(second, 32) {
+            return (first == fingerprint).then_some(second);
+        }
+    }
+    Some(first)
+}
+
 /// Pipeline keys from `warm-bad.txt` that apply to `fingerprint`.
 ///
 /// Blank lines and `#` comments are ignored. Entries tagged with a
@@ -288,35 +311,24 @@ pub fn format_bad_entry(key: &str, fingerprint: &str, reason: &str) -> String {
 /// automatically retries them. Legacy or manually added bare-key lines
 /// (`<key> ...`) continue to apply regardless of fingerprint.
 pub fn parse_bad_keys(text: &str, fingerprint: &str) -> HashSet<String> {
-    let mut keys = HashSet::new();
+    text.lines()
+        .filter_map(|line| bad_line_key(line, fingerprint))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `text` (`warm-bad.txt`) with entries for `fingerprint` whose key is in
+/// `made` removed; comments, other fingerprints, and remaining bad keys stay.
+pub fn without_keys(text: &str, fingerprint: &str, made: &HashSet<&str>) -> String {
+    let mut out = String::new();
     for line in text.lines() {
-        let line = line.trim_start();
-        if line.is_empty() || line.starts_with('#') {
+        if bad_line_key(line, fingerprint).is_some_and(|key| made.contains(key)) {
             continue;
         }
-        let mut parts = line.split_whitespace();
-        let Some(first) = parts.next() else {
-            continue;
-        };
-        if let Some(second) = parts.next() {
-            if let Some(fp) = second.strip_prefix("fp=")
-                && is_hex(fp, 16)
-            {
-                if fp == fingerprint {
-                    keys.insert(first.to_owned());
-                }
-                continue;
-            }
-            if is_hex(first, 16) && is_hex(second, 32) {
-                if first == fingerprint {
-                    keys.insert(second.to_owned());
-                }
-                continue;
-            }
-        }
-        keys.insert(first.to_owned());
+        out.push_str(line);
+        out.push('\n');
     }
-    keys
+    out
 }
 
 /// The translations of earlier runs are in `dir` (the pipeline library is
@@ -696,5 +708,24 @@ mod tests {
                 k_bad_tag,
             ])
         );
+    }
+
+    #[test]
+    fn keys_made_alone_leave_the_bad_list() {
+        let k_recovered = "a".repeat(32);
+        let k_still_bad = "b".repeat(32);
+        let text = format!(
+            "# kept comment\n\
+             {} fp=1111111111111111 crash\n\
+             {} fp=1111111111111111 crash\n\
+             {} fp=2222222222222222 other fp\n",
+            k_recovered, k_still_bad, k_recovered
+        );
+        let made = HashSet::from([k_recovered.as_str()]);
+        let kept = without_keys(&text, "1111111111111111", &made);
+        assert!(kept.contains("# kept comment"));
+        assert!(kept.contains(&format!("{k_still_bad} fp=1111111111111111")));
+        assert!(kept.contains(&format!("{k_recovered} fp=2222222222222222")));
+        assert!(!kept.contains(&format!("{k_recovered} fp=1111111111111111")));
     }
 }

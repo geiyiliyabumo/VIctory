@@ -97,9 +97,38 @@ fn set() -> Set {
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
-/// Keep the stand-in on while the builder is disabled, incomplete or resting.
+/// With the structure builder running, `VICTORY_AMBIENT_RT=<multiple>` keeps
+/// the stand-in on as a bound: what the rays left counts up to that multiple
+/// of the estimate (the white blotches of structures written over, on an
+/// RX 9060 XT), and where they left less, the estimate fills in. Unset: off
+/// while the builder runs, as before.
+fn with_rays() -> Option<f32> {
+    static MOST: OnceLock<Option<f32>> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let most = std::env::var("VICTORY_AMBIENT_RT")
+            .ok()?
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite() && *v >= 1.0)?;
+        tracing::info!(most, "the stand-in bounds the rays' light (VICTORY_AMBIENT_RT)");
+        Some(most)
+    })
+}
+
+/// Keep the stand-in on while the builder is disabled, incomplete or resting
+/// (or while `VICTORY_AMBIENT_RT` asks for it as a bound on what the rays find).
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_whole()
+    set() != Set::Off && (!crate::pipeline::builder_whole() || with_rays().is_some())
+}
+
+/// What the title's own output counts for at most, as a multiple of the
+/// estimate.
+fn most() -> f32 {
+    match with_rays() {
+        Some(most) if crate::pipeline::builder_whole() => most,
+        _ => 4.0,
+    }
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -573,7 +602,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most().to_bits();
     words[10] = air().to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
