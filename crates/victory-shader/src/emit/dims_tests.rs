@@ -99,6 +99,7 @@ fn a_buffer_size_read_as_a_number_compiles_on_the_host() {
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
