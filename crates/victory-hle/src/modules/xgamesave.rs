@@ -187,7 +187,7 @@ fn version_number(file: &str) -> Option<u64> {
 }
 
 /// The names in version folder `dir`: container, display, blobs; `None` if
-/// its manifest is missing or does not parse.
+/// its manifest is missing, does not parse, or any blob it names is missing.
 fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     let bytes = match std::fs::read(dir.join(MANIFEST)) {
         Ok(bytes) => bytes,
@@ -198,6 +198,14 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
         return Ok(None);
     };
     let blobs = names.split_off(2);
+    for i in 0..blobs.len() {
+        match std::fs::metadata(dir.join(i.to_string())) {
+            Ok(info) if info.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
     let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
     Ok(Some((name, display, blobs)))
 }
@@ -410,7 +418,9 @@ impl Provider {
             .join(file_name(config));
         std::fs::create_dir_all(&root).map_err(|_| NO_ACCESS)?;
         let _saves = saves_lock();
-        containers(&root); // converts old containers now
+        let found = containers(&root); // converts old containers now
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        tracing::info!(root = %root.display(), containers = ?names, "game save provider opened");
         Ok(Provider { root })
     }
 
@@ -508,10 +518,29 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.highest + 1);
+        let Some(number) = current
+            .as_ref()
+            .map_or(Some(1), |v| v.highest.checked_add(1))
+        else {
+            return NO_ACCESS;
+        };
+        tracing::info!(
+            container = %self.name,
+            version = number,
+            written,
+            blobs = blobs.len(),
+            "submitting local game save"
+        );
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
+            tracing::warn!(
+                container = %self.name,
+                version = number,
+                error = %e,
+                "local game save commit failed"
+            );
             return io_error(&self.dir, &e);
         }
+        tracing::info!(container = %self.name, version = number, "committed local game save");
         // The old version is garbage now; a crash here leaves it for later.
         if let Some(old) = &current {
             let _ = std::fs::remove_dir_all(&old.dir);
@@ -611,8 +640,14 @@ pub struct BlobInfo {
 
 /// Calls `callback` with the information of each container that passes
 /// `keep` until it returns false; never under our lock (it may call us).
-fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callback: ContainerCallback) {
-    let infos: Vec<(CString, CString, u32, u64, i64)> = {
+fn report(
+    root: &Path,
+    kind: &'static str,
+    keep: impl Fn(&str) -> bool,
+    context: *mut c_void,
+    callback: ContainerCallback,
+) {
+    let infos: Vec<(String, CString, CString, u32, u64, i64)> = {
         let _saves = saves_lock();
         containers(root)
             .into_iter()
@@ -626,11 +661,14 @@ fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callba
                     .map_or(0, |d| d.as_secs() as i64);
                 let size = v.sizes().iter().map(|(_, s)| s).sum();
                 let count = v.blobs.len() as u32;
-                (cstring(&v.name), cstring(&v.display), count, size, modified)
+                let label = v.name.clone();
+                (label, cstring(&v.name), cstring(&v.display), count, size, modified)
             })
             .collect()
     };
-    for (name, display, blob_count, total_size, last_modified) in &infos {
+    let mut delivered = 0usize;
+    let mut stopped_early = false;
+    for (_, name, display, blob_count, total_size, last_modified) in &infos {
         let info = ContainerInfo {
             name: name.as_ptr(),
             display_name: display.as_ptr(),
@@ -639,14 +677,36 @@ fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callba
             last_modified: *last_modified,
             needs_sync: false,
         };
+        delivered += 1;
         if !callback(&info, context) {
+            stopped_early = true;
             break;
         }
     }
+    let summary: Vec<(&str, u32, u64)> = infos
+        .iter()
+        .map(|(n, _, _, c, s, _)| (n.as_str(), *c, *s))
+        .collect();
+    tracing::info!(
+        kind,
+        delivered,
+        stopped_early,
+        containers = ?summary,
+        "game save container query"
+    );
 }
 
 fn cstring(s: &str) -> CString {
     CString::new(s.replace('\0', "")).unwrap_or_default()
+}
+
+fn open_provider(config: Option<&str>) -> Result<Provider, HRESULT> {
+    let saves = runtime::title().saves();
+    if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        Err(NO_ACCESS)
+    } else {
+        Provider::open(&saves, config)
+    }
 }
 
 static INIT: u8 = 0;
@@ -655,6 +715,25 @@ static DELETE: u8 = 0;
 static READ: u8 = 0;
 static SUBMIT: u8 = 0;
 
+extern "system" fn initialize_blocking(
+    _: This,
+    _user: *const c_void,
+    config: *const c_char,
+    _sync_on_demand: bool,
+    out: *mut *mut Provider,
+) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    match open_provider(text(config).as_deref()) {
+        Ok(p) => put(out, give(p)),
+        Err(hr) => {
+            let _ = put(out, std::ptr::null_mut());
+            hr
+        }
+    }
+}
+
 extern "system" fn initialize_async(
     _: This,
     _user: *const c_void,
@@ -662,12 +741,7 @@ extern "system" fn initialize_async(
     _sync_on_demand: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let saves = runtime::title().saves();
-    let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
-        Err(NO_ACCESS)
-    } else {
-        Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
-    };
+    let result = open_provider(text(config).as_deref()).map(|p| xasync::bytes(give(p)));
     xasync::finished_with(block, (&raw const INIT).cast(), result)
 }
 extern "system" fn initialize_result(
@@ -679,6 +753,13 @@ extern "system" fn initialize_result(
 }
 extern "system" fn close_provider(_: This, provider: *mut Provider) {
     take(provider);
+}
+
+extern "system" fn quota_blocking(_: This, provider: *const Provider, out: *mut i64) -> HRESULT {
+    let Some(p) = get(provider) else {
+        return E_INVALIDARG;
+    };
+    put(out, p.remaining() as i64)
 }
 
 extern "system" fn quota_async(
@@ -695,6 +776,22 @@ extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) 
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
 }
 
+extern "system" fn delete_blocking(
+    _: This,
+    provider: *const Provider,
+    name: *const c_char,
+) -> HRESULT {
+    match (get(provider), text(name)) {
+        (Some(p), Some(name)) if valid_container(&name) => {
+            let hr = delete(&p.root, &name);
+            tracing::info!(container = %name, hr = format_args!("{:#x}", hr as u32), "game save delete (blocking)");
+            hr
+        }
+        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
+        _ => E_INVALIDARG,
+    }
+}
+
 extern "system" fn delete_async(
     _: This,
     provider: *const Provider,
@@ -702,7 +799,11 @@ extern "system" fn delete_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     let hr = match (get(provider), text(name)) {
-        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
+        (Some(p), Some(name)) if valid_container(&name) => {
+            let hr = delete(&p.root, &name);
+            tracing::info!(container = %name, hr = format_args!("{:#x}", hr as u32), "game save delete (async)");
+            hr
+        }
         (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
         _ => E_INVALIDARG,
     };
@@ -728,7 +829,7 @@ extern "system" fn container_info(
     if !valid_container(&name) {
         return INVALID_CONTAINER_NAME;
     }
-    report(&p.root, |n| n == name, context, callback);
+    report(&p.root, "info", |n| n == name, context, callback);
     S_OK
 }
 
@@ -741,7 +842,28 @@ extern "system" fn enumerate_containers(
     let (Some(p), Some(callback)) = (get(provider), callback) else {
         return E_INVALIDARG;
     };
-    report(&p.root, |_| true, context, callback);
+    report(&p.root, "enumerate", |_| true, context, callback);
+    S_OK
+}
+
+extern "system" fn enumerate_containers_by_name(
+    _: This,
+    provider: *const Provider,
+    prefix: *const c_char,
+    context: *mut c_void,
+    callback: Option<ContainerCallback>,
+) -> HRESULT {
+    let (Some(p), Some(callback)) = (get(provider), callback) else {
+        return E_INVALIDARG;
+    };
+    let prefix = text(prefix).unwrap_or_default();
+    report(
+        &p.root,
+        "enumerate_by_name",
+        |n| n.starts_with(&prefix),
+        context,
+        callback,
+    );
     S_OK
 }
 
@@ -764,6 +886,15 @@ extern "system" fn close_container(_: This, container: *mut Container) {
     take(container);
 }
 
+extern "system" fn enumerate_all_blobs(
+    this: This,
+    container: *const Container,
+    context: *mut c_void,
+    callback: Option<BlobCallback>,
+) -> HRESULT {
+    enumerate_blobs(this, container, std::ptr::null(), context, callback)
+}
+
 extern "system" fn enumerate_blobs(
     _: This,
     container: *const Container,
@@ -780,7 +911,17 @@ extern "system" fn enumerate_blobs(
         let version = current_named(&c.dir, &c.name).ok().flatten();
         version.map(|v| v.sizes()).unwrap_or_default()
     };
-    for (name, size) in blobs.into_iter().filter(|(n, _)| n.starts_with(&prefix)) {
+    let matched: Vec<(String, u64)> = blobs
+        .into_iter()
+        .filter(|(n, _)| n.starts_with(&prefix))
+        .collect();
+    tracing::info!(
+        container = %c.name,
+        prefix = %prefix,
+        blobs = ?matched,
+        "game save enumerate blobs"
+    );
+    for (name, size) in matched {
         let name = cstring(&name);
         let info = BlobInfo {
             name: name.as_ptr(),
@@ -806,9 +947,18 @@ extern "system" fn read_blobs(
     };
     // SAFETY: the title passes its count.
     let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
-    let blobs = match read(c, names(blob_names, wanted)) {
+    let requested = names(blob_names, wanted);
+    let blobs = match read(c, requested.clone()) {
         Ok(blobs) => blobs,
-        Err(hr) => return hr,
+        Err(hr) => {
+            tracing::info!(
+                container = %c.name,
+                requested = ?requested,
+                hr = format_args!("{:#x}", hr as u32),
+                "game save read_blobs failed"
+            );
+            return hr;
+        }
     };
     let bytes = layout(&blobs, out as usize);
     if out.is_null() || size < bytes.len() {
@@ -816,6 +966,12 @@ extern "system" fn read_blobs(
     }
     // SAFETY: the buffer holds `size` bytes, checked above.
     unsafe { out.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
+    tracing::info!(
+        container = %c.name,
+        blobs = blobs.len(),
+        bytes = bytes.len(),
+        "game save read_blobs ok"
+    );
     put(count, blobs.len() as u32)
 }
 
@@ -828,8 +984,30 @@ extern "system" fn read_async(
     count: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let requested = names(blob_names, count);
     let result = match get(container) {
-        Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
+        Some(c) => match read(c, requested.clone()) {
+            Ok(blobs) => {
+                let bytes = layout(&blobs, 0);
+                tracing::info!(
+                    container = %c.name,
+                    requested = ?requested,
+                    blobs = blobs.len(),
+                    bytes = bytes.len(),
+                    "game save read_async ok"
+                );
+                Ok(bytes)
+            }
+            Err(hr) => {
+                tracing::info!(
+                    container = %c.name,
+                    requested = ?requested,
+                    hr = format_args!("{:#x}", hr as u32),
+                    "game save read_async failed"
+                );
+                Err(hr)
+            }
+        },
         None => Err(E_INVALIDARG),
     };
     xasync::finished_with(block, (&raw const READ).cast(), result)
@@ -849,6 +1027,11 @@ extern "system" fn read_result(
         return BUFFER_TOO_SMALL;
     }
     if hr < 0 {
+        tracing::info!(
+            hr = format_args!("{:#x}", hr as u32),
+            size,
+            "game save read_result failed"
+        );
         return hr;
     }
     // The first name follows the blob array, so its offset gives the count.
@@ -931,6 +1114,10 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
     }
 }
 
+extern "system" fn submit_blocking(_: This, update: *const Update) -> HRESULT {
+    get(update).map_or(E_INVALIDARG, Update::submit)
+}
+
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
@@ -944,33 +1131,33 @@ static VTABLE: Methods<30> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),         // 0x18 initialize (blocking)
-    initialize_async as *const (),     // 0x20
-    initialize_result as *const (),    // 0x28
-    close_provider as *const (),       // 0x30
-    missing::<7> as *const (),         // 0x38 remaining quota (blocking)
-    quota_async as *const (),          // 0x40
-    quota_result as *const (),         // 0x48
-    missing::<10> as *const (),        // 0x50 delete (blocking)
-    delete_async as *const (),         // 0x58
-    delete_result as *const (),        // 0x60
-    container_info as *const (),       // 0x68
-    enumerate_containers as *const (), // 0x70
-    missing::<15> as *const (),        // 0x78 by name prefix
-    create_container as *const (),     // 0x80
-    close_container as *const (),      // 0x88
-    missing::<18> as *const (),        // 0x90 all blob info
-    enumerate_blobs as *const (),      // 0x98 by name prefix
-    read_blobs as *const (),           // 0xa0
-    read_async as *const (),           // 0xa8
-    read_result as *const (),          // 0xb0
-    create_update as *const (),        // 0xb8
-    close_update as *const (),         // 0xc0
-    write_blob as *const (),           // 0xc8
-    delete_blob as *const (),          // 0xd0
-    missing::<27> as *const (),        // 0xd8 submit (blocking)
-    submit_async as *const (),         // 0xe0
-    submit_result as *const (),        // 0xe8
+    initialize_blocking as *const (),          // 0x18 initialize (blocking)
+    initialize_async as *const (),             // 0x20
+    initialize_result as *const (),            // 0x28
+    close_provider as *const (),               // 0x30
+    quota_blocking as *const (),               // 0x38 remaining quota (blocking)
+    quota_async as *const (),                  // 0x40
+    quota_result as *const (),                 // 0x48
+    delete_blocking as *const (),              // 0x50 delete (blocking)
+    delete_async as *const (),                 // 0x58
+    delete_result as *const (),                // 0x60
+    container_info as *const (),               // 0x68
+    enumerate_containers as *const (),         // 0x70
+    enumerate_containers_by_name as *const (), // 0x78 by name prefix
+    create_container as *const (),             // 0x80
+    close_container as *const (),              // 0x88
+    enumerate_all_blobs as *const (),          // 0x90 all blob info
+    enumerate_blobs as *const (),              // 0x98 by name prefix
+    read_blobs as *const (),                   // 0xa0
+    read_async as *const (),                   // 0xa8
+    read_result as *const (),                  // 0xb0
+    create_update as *const (),                // 0xb8
+    close_update as *const (),                 // 0xc0
+    write_blob as *const (),                   // 0xc8
+    delete_blob as *const (),                  // 0xd0
+    submit_blocking as *const (),              // 0xd8 submit (blocking)
+    submit_async as *const (),                 // 0xe0
+    submit_result as *const (),                // 0xe8
 ]);
 
 #[cfg(test)]
