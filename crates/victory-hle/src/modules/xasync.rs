@@ -1681,19 +1681,43 @@ mod tests {
     }
 
     #[test]
-    fn get_status_wait_never_observes_pending_after_error_completion() {
-        extern "system" fn work(_: *mut AsyncBlock) -> HRESULT {
-            E_ABORT
+    fn status_waits_through_cleanup() {
+        static IN_CLEANUP: AtomicBool = AtomicBool::new(false);
+        static CLEANUPS: AtomicUsize = AtomicUsize::new(0);
+        extern "system" fn provider(op: u32, _: *const ProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                CLEANUPS.fetch_add(1, Ordering::SeqCst);
+                IN_CLEANUP.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            S_OK
         }
-        for _ in 0..500 {
-            let mut block = AsyncBlock {
-                queue: std::ptr::null(),
-                context: std::ptr::null_mut(),
-                callback: None,
-                internal: [0; 4],
-            };
-            assert_eq!(XAsyncRun(&mut block, Some(work)), S_OK);
-            assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+        IN_CLEANUP.store(false, Ordering::SeqCst);
+        CLEANUPS.store(0, Ordering::SeqCst);
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            XAsyncBegin(
+                &raw mut block,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(provider),
+            ),
+            S_OK
+        );
+        let at = (&raw mut block) as usize;
+        let worker = std::thread::spawn(move || XAsyncComplete(at as *mut AsyncBlock, E_ABORT, 0));
+        while !IN_CLEANUP.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
         }
+        let got = XAsyncGetStatus(&raw mut block, true);
+        worker.join().unwrap();
+        assert_eq!(got, E_ABORT);
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 1);
     }
 }
