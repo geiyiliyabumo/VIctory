@@ -12,8 +12,9 @@
 
 use super::*;
 
-/// A host copy, and the title memory of it (from, to).
-pub(crate) type Refresh = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+/// A host copy (weakly referenced so passive heap sweeps never pin cold loose
+/// windows against WDDM L0 eviction), and the title memory of it (from, to).
+pub(crate) type Refresh = (std::sync::Weak<crate::shadow::Shadow>, u64, u64);
 
 /// What is being found, until it is.
 pub(crate) struct Coming(Mutex<Option<Vec<Refresh>>>, std::sync::Condvar);

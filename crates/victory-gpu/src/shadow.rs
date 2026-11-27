@@ -3040,7 +3040,9 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 struct L0ReclaimPlan {
     target_bytes: u64,
     idle_ms: u64,
+    idle_frames: u64,
     unmapped_cap_bytes: u64,
+    immediate_drop: bool,
 }
 
 fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
@@ -3048,15 +3050,19 @@ fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
     let Some([_, _, budget, used]) = vm else {
         return L0ReclaimPlan {
             target_bytes: if emergency { 512 * MIB } else { 0 },
-            idle_ms: if emergency { 2_000 } else { 12_000 },
+            idle_ms: if emergency { 1_000 } else { 12_000 },
+            idle_frames: if emergency { 1 } else { 2 },
             unmapped_cap_bytes: if emergency { u64::MAX } else { 256 * MIB },
+            immediate_drop: emergency,
         };
     };
     if budget == 0 {
         return L0ReclaimPlan {
             target_bytes: if emergency { 512 * MIB } else { 0 },
-            idle_ms: if emergency { 2_000 } else { 12_000 },
+            idle_ms: if emergency { 1_000 } else { 12_000 },
+            idle_frames: if emergency { 1 } else { 2 },
             unmapped_cap_bytes: if emergency { u64::MAX } else { 256 * MIB },
+            immediate_drop: emergency,
         };
     }
     let pct = (u128::from(used) * 100) / u128::from(budget);
@@ -3064,34 +3070,44 @@ fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
         let goal = (u128::from(budget) * 66 / 100) as u64;
         L0ReclaimPlan {
             target_bytes: used.saturating_sub(goal).max(512 * MIB),
-            idle_ms: 2_000,
+            idle_ms: if emergency { 1_000 } else { 2_000 },
+            idle_frames: 1,
             unmapped_cap_bytes: u64::MAX,
+            immediate_drop: true,
         }
     } else if pct >= 84 {
         let goal = (u128::from(budget) * 70 / 100) as u64;
         L0ReclaimPlan {
             target_bytes: used.saturating_sub(goal),
             idle_ms: 5_000,
+            idle_frames: 2,
             unmapped_cap_bytes: u64::MAX,
+            immediate_drop: false,
         }
     } else if pct >= 72 {
         let goal = (u128::from(budget) * 66 / 100) as u64;
         L0ReclaimPlan {
             target_bytes: used.saturating_sub(goal).min(256 * MIB),
             idle_ms: 12_000,
+            idle_frames: 2,
             unmapped_cap_bytes: u64::MAX,
+            immediate_drop: false,
         }
     } else if pct >= 50 {
         L0ReclaimPlan {
             target_bytes: 0,
             idle_ms: 12_000,
+            idle_frames: 2,
             unmapped_cap_bytes: 256 * MIB,
+            immediate_drop: false,
         }
     } else {
         L0ReclaimPlan {
             target_bytes: 0,
             idle_ms: 12_000,
+            idle_frames: 2,
             unmapped_cap_bytes: 0,
+            immediate_drop: false,
         }
     }
 }
@@ -3101,7 +3117,9 @@ struct EvictableWindow {
     key: (u64, u64),
     span: (u64, u64),
     idle_ms: u64,
+    idle_frames: u64,
     unmapped: bool,
+    immediate_drop: bool,
 }
 
 /// Loose windows selected for descriptor unpinning and immediate L0 reclaim.
@@ -3145,7 +3163,7 @@ impl EvictableLooseWindows {
                 && !crate::host::long_ago(
                     shadow.active.load(Ordering::Relaxed),
                     entry.idle_ms,
-                    2,
+                    entry.idle_frames,
                 ))
         {
             return None;
@@ -3167,6 +3185,8 @@ pub(crate) fn evictable_loose_windows(
     if plan.target_bytes == 0 && plan.unmapped_cap_bytes == 0 {
         return EvictableLooseWindows::default();
     }
+    let min_idle_ms = plan.idle_ms.min(2_000);
+    let min_frames = plan.idle_frames;
     let snapshot: Vec<((u64, u64), usize, u64, u64, (u64, u64))> = {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
@@ -3181,7 +3201,7 @@ pub(crate) fn evictable_loose_windows(
                     return None;
                 }
                 let active = s.active.load(Ordering::Relaxed);
-                if !crate::host::long_ago(active, 2_000, 2) {
+                if !crate::host::long_ago(active, min_idle_ms, min_frames) {
                     return None;
                 }
                 let low = s.asked[0].load(Ordering::Relaxed);
@@ -3207,7 +3227,9 @@ pub(crate) fn evictable_loose_windows(
     for (key, raw, bytes, active, (probe_start, probe_len)) in snapshot {
         if !crate::host::range_has_committed(probe_start, probe_len) {
             unmapped.push((active, key, raw, bytes));
-        } else if plan.target_bytes > 0 && crate::host::long_ago(active, plan.idle_ms, 2) {
+        } else if plan.target_bytes > 0
+            && crate::host::long_ago(active, plan.idle_ms, plan.idle_frames)
+        {
             cold.push((active, key, raw, bytes));
         }
     }
@@ -3225,7 +3247,9 @@ pub(crate) fn evictable_loose_windows(
             key,
             span: (key.0, key.0.saturating_add(key.1)),
             idle_ms: 0,
+            idle_frames: 0,
             unmapped: true,
+            immediate_drop: plan.immediate_drop,
         };
         targets.by_raw.insert(raw, entry);
         targets.by_key.insert(key, entry);
@@ -3240,7 +3264,9 @@ pub(crate) fn evictable_loose_windows(
             key,
             span: (key.0, key.0.saturating_add(key.1)),
             idle_ms: plan.idle_ms,
+            idle_frames: plan.idle_frames,
             unmapped: false,
+            immediate_drop: plan.immediate_drop,
         };
         targets.by_raw.insert(raw, entry);
         targets.by_key.insert(key, entry);
@@ -3250,11 +3276,12 @@ pub(crate) fn evictable_loose_windows(
 }
 
 /// Immediately drops already-unheld loose and exact copies with no pending GPU
-/// writes during an emergency `shared_buffer` allocation retry.
+/// writes during an emergency L0 allocation retry. Uses `try_write`/`try_lock`
+/// so calling from inside `shadow::loose()` or `shadow::exact()` never
+/// self-deadlocks.
 pub(crate) fn let_go_unheld_emergency() -> usize {
     let mut gone = Vec::new();
-    {
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    if let Ok(mut map) = LOOSE.try_write() {
         let keys: Vec<(u64, u64)> = map
             .iter()
             .filter_map(|(&key, s)| {
@@ -3266,8 +3293,7 @@ pub(crate) fn let_go_unheld_emergency() -> usize {
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
-    {
-        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(mut guard) = EXACT.try_lock() {
         let keys: Vec<(u64, u64)> = guard
             .1
             .iter()
@@ -3281,10 +3307,15 @@ pub(crate) fn let_go_unheld_emergency() -> usize {
         gone.extend(keys.into_iter().filter_map(|key| guard.1.remove(&key).map(|(s, _)| s)));
     }
     let count = gone.len();
+    let drop_now = !crate::host::is_flying();
     for shadow in gone {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
-        crate::host::retire(shadow);
+        if drop_now {
+            drop(shadow);
+        } else {
+            crate::host::retire(shadow);
+        }
     }
     count
 }
@@ -3330,7 +3361,7 @@ pub(crate) fn let_go_idle(targets: &EvictableLooseWindows, vm: Option<[u64; 4]>)
     }
     let mut targeted_count = 0usize;
     let mut targeted_bytes = 0u64;
-    let gone: Vec<Arc<Shadow>> = {
+    let (immediate_gone, retired_gone): (Vec<Arc<Shadow>>, Vec<Arc<Shadow>>) = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
@@ -3347,9 +3378,13 @@ pub(crate) fn let_go_idle(targets: &EvictableLooseWindows, vm: Option<[u64; 4]>)
             if let Some(entry) = targets.by_key.get(&key)
                 && s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
                 && (entry.unmapped
-                    || crate::host::long_ago(s.active.load(Ordering::Relaxed), entry.idle_ms, 2))
+                    || crate::host::long_ago(
+                        s.active.load(Ordering::Relaxed),
+                        entry.idle_ms,
+                        entry.idle_frames,
+                    ))
             {
-                targeted.push(key);
+                targeted.push((key, entry.immediate_drop));
                 continue;
             }
             let used = s.used.load(Ordering::Relaxed);
@@ -3357,12 +3392,18 @@ pub(crate) fn let_go_idle(targets: &EvictableLooseWindows, vm: Option<[u64; 4]>)
                 eligible.push((used, key, Arc::as_ptr(s) as usize, s.len));
             }
         }
-        let mut out = Vec::new();
-        for key in targeted {
+        let mut immediate = Vec::new();
+        let mut retired = Vec::new();
+        let can_drop_now = !crate::host::is_flying();
+        for (key, immediate_drop) in targeted {
             if let Some(shadow) = map.remove(&key) {
                 targeted_count += 1;
                 targeted_bytes = targeted_bytes.saturating_add(shadow.len);
-                out.push(shadow);
+                if immediate_drop && can_drop_now {
+                    immediate.push(shadow);
+                } else {
+                    retired.push(shadow);
+                }
             }
         }
         eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
@@ -3375,23 +3416,38 @@ pub(crate) fn let_go_idle(targets: &EvictableLooseWindows, vm: Option<[u64; 4]>)
                 .collect();
             window_victims(&entries, keep)
         };
-        out.extend(victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)));
-        out
+        retired.extend(victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)));
+        (immediate, retired)
     };
     if targeted_count > 0 {
         tracing::info!(
             windows = targeted_count,
             mb = targeted_bytes >> 20,
+            immediate = immediate_gone.len(),
             "reclaimed idle loose windows under L0 pressure"
         );
     }
-    if !gone.is_empty() {
-        let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
+    let total_gone = immediate_gone.len() + retired_gone.len();
+    if total_gone > 0 {
+        let bytes: u64 = immediate_gone
+            .iter()
+            .chain(&retired_gone)
+            .map(|s| s.len)
+            .sum();
         crate::host::trail(|| {
-            format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
+            format!("sweep: {total_gone} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
         });
     }
-    for shadow in gone {
+    // High-pressure / emergency L0 victims when the GPU is completely settled
+    // (`!is_flying()`), unpinned from every descriptor slot, and held by zero
+    // command lists are dropped immediately so WDDM L0 drops before the next
+    // allocation instead of sitting in `RETIRED` for `queued + bury_lag()`.
+    for shadow in immediate_gone {
+        LET_GO[0].fetch_add(1, Ordering::Relaxed);
+        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+        drop(shadow);
+    }
+    for shadow in retired_gone {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
@@ -6102,23 +6158,63 @@ mod window_tests {
         let budget = 8000 * MIB;
         assert_eq!(
             l0_reclaim_plan(Some([budget, 0, budget, 3900 * MIB]), false),
-            L0ReclaimPlan { target_bytes: 0, idle_ms: 12_000, unmapped_cap_bytes: 0 }
+            L0ReclaimPlan {
+                target_bytes: 0,
+                idle_ms: 12_000,
+                idle_frames: 2,
+                unmapped_cap_bytes: 0,
+                immediate_drop: false,
+            }
         );
         assert_eq!(
             l0_reclaim_plan(Some([budget, 0, budget, 5600 * MIB]), false),
-            L0ReclaimPlan { target_bytes: 0, idle_ms: 12_000, unmapped_cap_bytes: 256 * MIB }
+            L0ReclaimPlan {
+                target_bytes: 0,
+                idle_ms: 12_000,
+                idle_frames: 2,
+                unmapped_cap_bytes: 256 * MIB,
+                immediate_drop: false,
+            }
         );
         assert_eq!(
             l0_reclaim_plan(Some([budget, 0, budget, 6000 * MIB]), false),
-            L0ReclaimPlan { target_bytes: 256 * MIB, idle_ms: 12_000, unmapped_cap_bytes: u64::MAX }
+            L0ReclaimPlan {
+                target_bytes: 256 * MIB,
+                idle_ms: 12_000,
+                idle_frames: 2,
+                unmapped_cap_bytes: u64::MAX,
+                immediate_drop: false,
+            }
         );
         assert_eq!(
             l0_reclaim_plan(Some([budget, 0, budget, 6800 * MIB]), false),
-            L0ReclaimPlan { target_bytes: 1200 * MIB, idle_ms: 5_000, unmapped_cap_bytes: u64::MAX }
+            L0ReclaimPlan {
+                target_bytes: 1200 * MIB,
+                idle_ms: 5_000,
+                idle_frames: 2,
+                unmapped_cap_bytes: u64::MAX,
+                immediate_drop: false,
+            }
+        );
+        assert_eq!(
+            l0_reclaim_plan(Some([budget, 0, budget, 7280 * MIB]), false),
+            L0ReclaimPlan {
+                target_bytes: 2000 * MIB,
+                idle_ms: 2_000,
+                idle_frames: 1,
+                unmapped_cap_bytes: u64::MAX,
+                immediate_drop: true,
+            }
         );
         assert_eq!(
             l0_reclaim_plan(Some([budget, 0, budget, 7280 * MIB]), true),
-            L0ReclaimPlan { target_bytes: 2000 * MIB, idle_ms: 2_000, unmapped_cap_bytes: u64::MAX }
+            L0ReclaimPlan {
+                target_bytes: 2000 * MIB,
+                idle_ms: 1_000,
+                idle_frames: 1,
+                unmapped_cap_bytes: u64::MAX,
+                immediate_drop: true,
+            }
         );
     }
 
@@ -6276,6 +6372,14 @@ mod window_tests {
             assert!(start % g == 0 && len % g == 0);
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn find_exact_test_shadow(len: u64) -> Option<Arc<Shadow>> {
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    Some(Arc::new(Shadow::new(buffer, data, gpu, 0x1000, len)))
 }
 
 /// For device-removed reports: the copy of title memory whose host range

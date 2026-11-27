@@ -204,11 +204,14 @@ impl Detached {
         &self.host
     }
 
-    /// Releases this list's dynamic descriptor slots once its GPU submission
-    /// has completed, without waiting for the full `bury_lag` (64 submissions)
-    /// allocator delay: preventing dynamic slot exhaustion at ~10k draws/frame.
-    pub(crate) fn release_tables(&mut self) {
+    /// Releases this list's dynamic descriptor slots and deferred CPU-step
+    /// shadow references once its GPU submission has completed, without
+    /// waiting for the full `bury_lag` allocator delay: preventing both
+    /// dynamic slot exhaustion and stale `Arc<Shadow>` pinning of idle loose
+    /// windows under WDDM L0 pressure.
+    pub(crate) fn release_landed(&mut self) {
         self._state.tables_done();
+        self.host.release_landed_steps();
     }
 }
 
@@ -243,7 +246,7 @@ const IDLE_MOST_BYTES: u64 = 256 << 20;
 
 #[cfg(windows)]
 fn idle_most() -> usize {
-    if crate::residency::limited_host_ram() { 128 } else { 256 }
+    if crate::residency::limited_host_ram() { 256 } else { 512 }
 }
 
 /// Whether host lists that have run are used again (on by default;

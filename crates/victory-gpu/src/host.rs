@@ -612,6 +612,29 @@ fn sweep_interval(video_memory: Option<[u64; 4]>, normal_ms: u64) -> u64 {
     }
 }
 
+fn shared_l0_percent(vm: Option<[u64; 4]>) -> u64 {
+    match vm {
+        Some([_, _, budget, used]) if budget > 0 => ((u128::from(used) * 100) / u128::from(budget)) as u64,
+        _ => 0,
+    }
+}
+
+/// Immediately unpins and reclaims idle loose windows when the GPU is settled
+/// (`!flying()`) during an emergency L0 allocation retry.
+fn sweep_emergency_l0(vm: Option<[u64; 4]>) {
+    let l0_targets = crate::shadow::evictable_loose_windows(vm, true);
+    let unpinned_windows = crate::descriptor::unpin_loose_windows(&l0_targets);
+    if unpinned_windows > 0 {
+        trail(|| format!("emergency: unpinned {unpinned_windows} idle buffer descriptor slots under L0 OOM"));
+    }
+    crate::shadow::let_go_idle(&l0_targets, vm);
+}
+
+/// Whether any late submission is currently executing on the host GPU.
+pub(crate) fn is_flying() -> bool {
+    flying()
+}
+
 /// Once a second (or faster under VRAM/L0 pressure), before a submission
 /// starts: lets go of what nothing names any more (copies of windows of title
 /// memory, staging buffers, host copies of textures the title fills).
@@ -647,12 +670,26 @@ fn sweep() {
     crate::book::check();
     let host_pressure = crate::residency::refresh();
     update_l0_spill(vm);
-    if host_pressure {
+    let l0_pct = shared_l0_percent(vm);
+    let critical_commit = crate::residency::critical_commit();
+    // Avoid nuking working command-allocator pools on routine `avail_phys <= 3 GiB`
+    // (16 GB hosts hit that every sweep and otherwise recreate 100-220 allocators
+    // per frame, churning GBs of WDDM L0 memory). Only trim aggressively when OS
+    // commit or WDDM L0 shared memory is actually tight.
+    if critical_commit || emergency || l0_pct >= 90 {
         trim_spare_chunks();
         send::trim();
         card_steps::trim();
-        crate::list::trim_idle(32);
-        crate::list::thin::trim_backs(16);
+        crate::list::trim_idle(64);
+        crate::list::thin::trim_backs(32);
+    } else if l0_pct >= 80 {
+        trim_spare_chunks();
+        send::trim();
+        card_steps::trim();
+    } else if host_pressure {
+        card_steps::trim();
+        crate::list::trim_idle(192);
+        crate::list::thin::trim_backs(96);
     }
     crate::pool::room(vm, host_pressure);
     crate::pipeline::trim_library();
@@ -2505,6 +2542,10 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Passive heap-sweep refresh (`crate::draw::heap_buffer_pass`): holds a
+    /// `Weak<Shadow>` so queued or landed heap-sweep lists never pin cold
+    /// loose windows against WDDM L0 eviction.
+    HeapRefresh(std::sync::Weak<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only, and the title memory it reads
@@ -2519,6 +2560,16 @@ enum Step {
     /// A title buffer copy that the list does on the card ([`place`]): what
     /// is done on the CPU for it.
     Placed(place::Placed),
+}
+
+impl Step {
+    fn refresh(&self) -> Option<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+        match self {
+            Step::Refresh(shadow, address, len) => Some((shadow.clone(), *address, *len)),
+            Step::HeapRefresh(weak, address, len) => weak.upgrade().map(|shadow| (shadow, *address, *len)),
+            _ => None,
+        }
+    }
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -3302,7 +3353,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 },
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
+                Step::Refresh(..) | Step::HeapRefresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
     }
@@ -3337,16 +3388,16 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     let scanning = std::time::Instant::now();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step {
-                let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
+            if let Some((shadow, address, len)) = step.refresh() {
+                let place = places.entry(Arc::as_ptr(&shadow) as usize).or_insert_with(|| {
                     shadow.writes_pending().then(|| {
-                        spans.push((shadow.clone(), *address, *address + *len));
+                        spans.push((shadow.clone(), address, address + len));
                         spans.len() - 1
                     })
                 });
                 if let Some(i) = *place {
                     let s = &mut spans[i];
-                    (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                    (s.1, s.2) = (s.1.min(address), s.2.max(address + len));
                 }
             }
         }
@@ -4345,11 +4396,29 @@ impl Host {
         list
     }
 
+    /// Emergency WDDM L0 / host-memory reclaim invoked before retrying a failed
+    /// D3D12 allocation (`shared_buffer`, `upload_buffer`, `make_prelude`, or
+    /// `make_list`). When `allow_unpin` is true and no GPU flight is active,
+    /// also unpins and drops idle loose windows immediately.
+    fn emergency_reclaim_l0(&self, allow_unpin: bool) {
+        EMERGENCY_L0_SWEEP.store(true, Ordering::Release);
+        trim_spare_chunks();
+        send::trim();
+        card_steps::trim();
+        crate::list::trim_idle(16);
+        crate::list::thin::trim_backs(8);
+        let _ = crate::shadow::let_go_unheld_emergency();
+        bury(FINISHED.load(Ordering::Acquire));
+        if allow_unpin && !flying() {
+            sweep_emergency_l0(self.video_memory());
+        }
+    }
+
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
-        // SAFETY: plain object creation.
-        let made: windows::core::Result<Prelude> = unsafe {
-            (|| {
+        let create = || -> windows::core::Result<Prelude> {
+            // SAFETY: plain object creation.
+            unsafe {
                 let allocator: ID3D12CommandAllocator =
                     self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
                 let list: ID3D12GraphicsCommandList =
@@ -4357,12 +4426,19 @@ impl Host {
                         .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
                 list.Close()?;
                 Ok((allocator, list))
-            })()
+            }
         };
+        let mut made = create();
+        if let Err(ref e) = made {
+            crate::residency::allocation_error(e);
+            self.emergency_reclaim_l0(true);
+            made = create();
+        }
         LISTS[1].fetch_add(1, Ordering::Relaxed);
         match made {
             Ok(prelude) => Some(prelude),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, "no host list for a prelude");
                 None
             }
@@ -4370,69 +4446,79 @@ impl Host {
     }
 
     fn make_list(&self) -> windows::core::Result<HostList> {
-        // SAFETY: plain object creation.
-        unsafe {
-            let allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &allocator,
-                None,
-            )?;
-            let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
+        let create = || -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+            // SAFETY: plain object creation.
+            unsafe {
+                let allocator: ID3D12CommandAllocator =
+                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator,
+                    None,
+                )?;
+                Ok((allocator, list))
             }
-            #[cfg(feature = "diagnostics")]
-            let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
-            let pipelines = std::sync::Arc::<Mutex<std::collections::BTreeSet<String>>>::default();
-            #[cfg(feature = "diagnostics")]
-            let indirects = indirects::Shared::default();
-            #[cfg(feature = "diagnostics")]
-            if dred_on() || dred_light() {
-                static NUMBER: AtomicU32 = AtomicU32::new(0);
-                let number = NUMBER.fetch_add(1, Ordering::Relaxed);
-                name(&list, || format!("victory host list {number}"));
-                let mut all = LIST_NOTES.lock().unwrap_or_else(|e| e.into_inner());
-                if number.is_multiple_of(256) {
-                    all.retain(|_, l| l.0.strong_count() > 0);
-                }
-                all.insert(
-                    number,
-                    (
-                        std::sync::Arc::downgrade(&notes),
-                        std::sync::Arc::downgrade(&pipelines),
-                        std::sync::Arc::downgrade(&indirects),
-                    ),
-                );
+        };
+        let (allocator, list) = match create() {
+            Ok(pair) => pair,
+            Err(e) => {
+                crate::residency::allocation_error(&e);
+                self.emergency_reclaim_l0(false);
+                create()?
             }
-            Ok(HostList {
-                allocator,
-                list: rec::Rec::new(list),
-                deferred: Mutex::default(),
-                scratch: Mutex::default(),
-                states: Mutex::default(),
-                twins: Mutex::default(),
-                prelude,
-                pipelines,
-                #[cfg(feature = "diagnostics")]
-                indirects,
-                budget: OnceLock::new(),
-                card_budget: OnceLock::new(),
-                indirect_args: Mutex::default(),
-                batch_args: Mutex::default(),
-                coming: Mutex::default(),
-                epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
-                resets: AtomicU32::new(0),
-                _alive: Counted::new(),
-                #[cfg(feature = "diagnostics")]
-                notes,
-                #[cfg(feature = "diagnostics")]
-                stamps: OnceLock::new(),
-            })
+        };
+        let prelude = OnceLock::new();
+        if !lazy_prelude() {
+            let _ = prelude.set(self.make_prelude());
         }
+        #[cfg(feature = "diagnostics")]
+        let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
+        let pipelines = std::sync::Arc::<Mutex<std::collections::BTreeSet<String>>>::default();
+        #[cfg(feature = "diagnostics")]
+        let indirects = indirects::Shared::default();
+        #[cfg(feature = "diagnostics")]
+        if dred_on() || dred_light() {
+            static NUMBER: AtomicU32 = AtomicU32::new(0);
+            let number = NUMBER.fetch_add(1, Ordering::Relaxed);
+            name(&list, || format!("victory host list {number}"));
+            let mut all = LIST_NOTES.lock().unwrap_or_else(|e| e.into_inner());
+            if number.is_multiple_of(256) {
+                all.retain(|_, l| l.0.strong_count() > 0);
+            }
+            all.insert(
+                number,
+                (
+                    std::sync::Arc::downgrade(&notes),
+                    std::sync::Arc::downgrade(&pipelines),
+                    std::sync::Arc::downgrade(&indirects),
+                ),
+            );
+        }
+        Ok(HostList {
+            allocator,
+            list: rec::Rec::new(list),
+            deferred: Mutex::default(),
+            scratch: Mutex::default(),
+            states: Mutex::default(),
+            twins: Mutex::default(),
+            prelude,
+            pipelines,
+            #[cfg(feature = "diagnostics")]
+            indirects,
+            budget: OnceLock::new(),
+            card_budget: OnceLock::new(),
+            indirect_args: Mutex::default(),
+            batch_args: Mutex::default(),
+            coming: Mutex::default(),
+            epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+            resets: AtomicU32::new(0),
+            _alive: Counted::new(),
+            #[cfg(feature = "diagnostics")]
+            notes,
+            #[cfg(feature = "diagnostics")]
+            stamps: OnceLock::new(),
+        })
     }
 
     /// The card's clock ([`CARD_CLOCK_US`]), made at the first send.
@@ -5274,7 +5360,7 @@ impl Host {
                         own.landed();
                     }
                     for detached in &mut flight.lists {
-                        detached.release_tables();
+                        detached.release_landed();
                     }
                     landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
@@ -5744,7 +5830,7 @@ impl Host {
                             self.card_done(card);
                         }
                         for detached in &mut flight.lists {
-                            detached.release_tables();
+                            detached.release_landed();
                         }
                         landed.push((flight.lists, flight.order));
                     }
@@ -5936,13 +6022,13 @@ impl Host {
             let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
+                    if let Some((shadow, address, len)) = step.refresh()
                         && shadow.asked_ahead()
                     {
                         let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                            .entry(std::sync::Arc::as_ptr(&shadow) as usize)
+                            .or_insert((address, address + len));
+                        *span = (span.0.min(address), span.1.max(address + len));
                     }
                 }
             }
@@ -6699,11 +6785,22 @@ impl HostList {
         let at = at.min(deferred.copies.len());
         deferred
             .copies
-            .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
+            .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::HeapRefresh(shadow, from as usize, (to - from) as usize)));
+    }
+
+    /// Drops CPU-side deferred step entries (which carry `Arc<Shadow>` refresh
+    /// and GPU-write references) once the list's GPU submission has completed
+    /// and its read-backs have landed, without resetting the D3D12 command
+    /// allocator or releasing `uploads`/`kept`/`states` before `bury_lag()`.
+    pub(crate) fn release_landed_steps(&self) {
+        let mut deferred = self.deferred();
+        deferred.copies.clear();
+        deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     pub(crate) fn should_retire(&self) -> bool {
-        self.resets.load(Ordering::Relaxed) >= 256
+        self.resets.load(Ordering::Relaxed) >= 512
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -7352,6 +7449,24 @@ impl HostList {
         }
     }
 
+    /// Passive heap-sweep refresh (`crate::draw::heap_buffer_pass`): stores a
+    /// `Weak<Shadow>` so queued lists never pin cold loose windows against L0
+    /// reclaim.
+    pub(crate) fn defer_heap_refresh(
+        &self,
+        shadow: std::sync::Weak<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        let mut deferred = self.deferred();
+        let key = (shadow.as_ptr() as usize, address, len);
+        if deferred.refreshed.insert(key) {
+            deferred
+                .copies
+                .push(Step::HeapRefresh(shadow, address, len));
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     /// Declared once until the list next writes title memory (but with
@@ -7817,6 +7932,17 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
+                Step::HeapRefresh(weak, address, len) => {
+                    if let Some(shadow) = weak.upgrade() {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            refreshes += 1;
+                            refreshed += *len as u64;
+                        }
+                        batch.add(&shadow, *address, *len);
+                    }
+                    continue;
+                }
                 Step::Run(work) | Step::Host(work, _) => {
                     batch.fill();
                     #[cfg(feature = "diagnostics")]
@@ -8236,6 +8362,14 @@ fn list_front(steps: &[Step], textures: bool) -> ListFront {
             }
             Some(Touch::Refresh(key, *from, *from + *len))
         }
+        Step::HeapRefresh(weak, from, len) => {
+            let shadow = weak.upgrade()?;
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            if refreshed.insert(key, ()).is_none() {
+                shadows.push((key, shadow));
+            }
+            Some(Touch::Refresh(key, *from, *from + *len))
+        }
         Step::GpuWrite(shadow, ..) => Some(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
         Step::Texture(upload) if textures => {
             staged.push(upload.staging.clone());
@@ -8650,6 +8784,16 @@ impl Batch {
                         }
                         touches.push(Touch::Refresh(key, *at, *at + *len));
                     }
+                    Step::HeapRefresh(weak, at, len) => {
+                        if let Some(shadow) = weak.upgrade() {
+                            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                            if key != last {
+                                copies.entry(key).or_insert(shadow);
+                                last = key;
+                            }
+                            touches.push(Touch::Refresh(key, *at, *at + *len));
+                        }
+                    }
                     Step::GpuWrite(shadow, ..) => touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
                     Step::Texture(upload) if wide_textures() => {
                         if self.texture_due(&upload.staging) {
@@ -8749,6 +8893,15 @@ impl Batch {
                         let key = std::sync::Arc::as_ptr(shadow) as usize;
                         copies.entry(key).or_insert_with(|| shadow.clone());
                         Touch::Refresh(key, *at, *at + *len)
+                    }
+                    Step::HeapRefresh(weak, at, len) => {
+                        if let Some(shadow) = weak.upgrade() {
+                            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                            copies.entry(key).or_insert(shadow);
+                            Touch::Refresh(key, *at, *at + *len)
+                        } else {
+                            Touch::Nothing
+                        }
                     }
                     Step::GpuWrite(shadow, ..) => Touch::Write(std::sync::Arc::as_ptr(shadow) as usize),
                     Step::Copy(..) if taken(list, i) => Touch::Nothing,
@@ -9326,23 +9479,33 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    not_resident(),
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    b.Map(0, None, Some(&mut data))
-                })
+        let create = |buffer: &mut Option<ID3D12Resource>, data: &mut *mut std::ffi::c_void| {
+            // SAFETY: plain creation and mapping of an upload buffer.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        not_resident(),
+                        &desc,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                        None,
+                        buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        resident(&self.device, b)?;
+                        b.Map(0, None, Some(data))
+                    })
+            }
         };
+        let mut made = create(&mut buffer, &mut data);
+        if let Err(ref e) = made {
+            crate::residency::allocation_error(e);
+            self.emergency_reclaim_l0(false);
+            buffer = None;
+            data = std::ptr::null_mut();
+            made = create(&mut buffer, &mut data);
+        }
         #[cfg(feature = "diagnostics")]
         if made.is_ok()
             && let Some(b) = &buffer
@@ -10324,13 +10487,12 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
-        if made.is_err() {
-            EMERGENCY_L0_SWEEP.store(true, Ordering::Release);
-            let _ = crate::shadow::let_go_unheld_emergency();
-            bury(FINISHED.load(Ordering::Acquire));
+        if let Err(ref e) = made {
+            crate::residency::allocation_error(e);
+            self.emergency_reclaim_l0(false);
             buffer = None;
             data = std::ptr::null_mut();
-            // SAFETY: retry after reclaiming unheld windows and finished retired resources.
+            // SAFETY: retry after reclaiming unheld windows, spare pools, and finished retired resources.
             made = unsafe {
                 self.device
                     .CreateCommittedResource(
@@ -11693,6 +11855,35 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // SAFETY: matches VirtualAlloc above.
         unsafe { VirtualFree(reserved, 0, MEM_RELEASE) };
         assert!(!has_committed);
+    }
+
+    #[test]
+    fn shared_l0_percent_handles_missing_zero_and_overbudget() {
+        use super::shared_l0_percent;
+        assert_eq!(shared_l0_percent(None), 0);
+        assert_eq!(shared_l0_percent(Some([100, 50, 0, 50])), 0);
+        assert_eq!(shared_l0_percent(Some([100, 50, 1000, 799])), 79);
+        assert_eq!(shared_l0_percent(Some([100, 50, 1000, 800])), 80);
+        assert_eq!(shared_l0_percent(Some([100, 50, 1000, 1025])), 102);
+    }
+
+    #[test]
+    fn heap_refresh_weak_step_does_not_pin_shadow_and_expires_on_eviction() {
+        use std::sync::{Arc, Weak};
+        let Some(shadow) = crate::shadow::find_exact_test_shadow(4096) else {
+            return;
+        };
+        assert_eq!(Arc::strong_count(&shadow), 1);
+        let step = super::Step::HeapRefresh(Arc::downgrade(&shadow), 0x1000, 256);
+        assert_eq!(Arc::strong_count(&shadow), 1);
+        let upgraded = step.refresh().expect("live shadow upgrades");
+        assert!(Arc::ptr_eq(&upgraded.0, &shadow));
+        assert_eq!((upgraded.1, upgraded.2), (0x1000, 256));
+        drop(upgraded);
+        drop(shadow);
+        assert!(step.refresh().is_none(), "evicted shadow yields None");
+        let empty = super::Step::HeapRefresh(Weak::new(), 0, 0);
+        assert!(empty.refresh().is_none());
     }
 }
 

@@ -205,6 +205,10 @@ pub(crate) struct HostHeap {
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Slots,
+    /// Title buffer slots dropped from `BufferSweep` during an L0 sweep whose
+    /// window remained held by an active draw; re-scanned passively on the
+    /// next heap pass without marking the window active.
+    rescan: Slots,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -1799,6 +1803,7 @@ impl HostHeap {
             buffers: Slots::new(count as usize),
             suppressed: Mutex::default(),
             changed: Slots::new(count as usize),
+            rescan: Slots::new(count as usize),
             textures: Mutex::new(TextureQueue { queued: queued.clone(), ..Default::default() }),
             queued,
             tabled: (0..if sampler { 0 } else { count })
@@ -2750,6 +2755,13 @@ impl HostHeap {
         self.changed.take()
     }
 
+    /// Title slots removed from `BufferSweep` during an L0 sweep whose window
+    /// stayed pinned by an active draw; re-scanned passively without touching
+    /// `Shadow::active`.
+    pub(crate) fn take_rescan_buffers(&self) -> Vec<u32> {
+        self.rescan.take()
+    }
+
     /// Records what title slot `index` now holds for shaders that pick
     /// buffers from the heap: its element stride in the table, and whether
     /// it is a buffer view at all.
@@ -2924,7 +2936,7 @@ impl HostHeap {
         if !released_slots.is_empty() {
             for &slot in released_slots {
                 if !unpinned_title.contains(&slot) {
-                    self.changed.put(slot);
+                    self.rescan.put(slot);
                 }
             }
         }
@@ -5698,7 +5710,7 @@ mod tests {
         assert_eq!(heap.buffer_slots(), [0, 1, 2]);
 
         heap.release(dynamic + 1, 1);
-        let rest = heap.unpin_loose_windows(&[], |raw, clear| {
+        let rest = heap.unpin_loose_windows(&[2], |raw, clear| {
             if raw != raw_target {
                 return None;
             }
@@ -5709,6 +5721,10 @@ mod tests {
         });
         assert_eq!(rest, 1);
         assert_eq!(crate::host::references(&target), 1);
+        // Non-unpinned released slot 2 goes to passive `rescan`, NOT `changed`
+        // (which would falsely call `touch_active()` on the next heap pass).
+        assert_eq!(heap.buffer_changes(), Vec::<u32>::new());
+        assert_eq!(heap.take_rescan_buffers(), vec![2]);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.

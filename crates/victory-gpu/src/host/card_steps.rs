@@ -200,6 +200,11 @@ pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
             Step::Refresh(shadow, at, len) => copies
                 .iter()
                 .any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow))),
+            Step::HeapRefresh(weak, at, len) => weak.upgrade().is_some_and(|shadow| {
+                copies
+                    .iter()
+                    .any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, &shadow)))
+            }),
             Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
             _ => false,
         })
@@ -446,6 +451,16 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     from: *at,
                     to: *at + *len,
                 },
+                Step::HeapRefresh(weak, at, len) => {
+                    let Some(shadow) = weak.upgrade() else {
+                        continue;
+                    };
+                    Does::Refresh {
+                        shadow: Arc::as_ptr(&shadow) as usize,
+                        from: *at,
+                        to: *at + *len,
+                    }
+                }
                 Step::Run(_) => Does::Run,
                 Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
                 Step::GpuWrite(..) | Step::Host(..) => continue,

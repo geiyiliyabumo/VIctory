@@ -961,6 +961,10 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let mut changed = host.buffer_changes();
     changed.extend(host.wake_remapped_buffers());
     let active_slots: std::collections::HashSet<u32> = changed.iter().copied().collect();
+    // Slots removed from `BufferSweep` during an L0 sweep whose windows were
+    // still held by an active draw are re-populated passively without marking
+    // them active (which would otherwise poison cold-window eviction).
+    changed.extend(host.take_rescan_buffers());
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
         ranges.0.clear();
@@ -1085,7 +1089,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             }
             next_unwatched.insert(id, (frame, *from, *to));
         }
-        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
+        found.push((std::sync::Arc::downgrade(shadow), *from, (*to).min(*from + shadow.left(*from))));
     }
     *unwatched = next_unwatched;
     drop(kept);
@@ -2181,7 +2185,7 @@ impl State {
             });
         } else {
             for (shadow, from, to) in heap_buffer_pass(heap, host, frame) {
-                shadow.refresh(list, from, to - from);
+                list.defer_heap_refresh(shadow, from as usize, (to - from) as usize);
             }
         }
         #[cfg(feature = "diagnostics")]
