@@ -654,7 +654,7 @@ impl<'a> Tracer<'a> {
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
+                Some((p, 0)) if self.layout[p].root != RootType::Constants => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -4060,5 +4060,45 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn root_constant_zero_acts_as_dynamic_offset() {
+        // s0: descriptor table, s1: RootType::Constants dword 0.
+        // Adding s1 onto s0 or passing s1 as soffset must treat s1 as a dynamic
+        // offset rather than a second address base.
+        let r_add = track_words(
+            &[
+                0x8002_0100, // s_add_u32 s2, s0, s1
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0201,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+                0xE000_2000,
+                0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
+                S_ENDPGM,
+            ],
+            &[param(Table, 0, 1), param(Constants, 1, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(r_add.root_indexed_views.len(), 1);
+        assert_eq!(r_add.root_indexed_views[0].table_slot, 0);
+        assert_eq!(r_add.root_indexed_views[0].constant_dword, 0);
+
+        let r_soffset = track_words(
+            &[
+                0xBE82_0300, // s_mov_b32 s2, s0
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0201,
+                0x0200_0000, // s_load_dwordx4 s[8:11], s[2:3], s1
+                0xE000_2000,
+                0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
+                S_ENDPGM,
+            ],
+            &[param(Table, 0, 1), param(Constants, 1, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(r_soffset.root_indexed_views.len(), 1);
+        assert_eq!(r_soffset.root_indexed_views[0].table_slot, 0);
+        assert_eq!(r_soffset.root_indexed_views[0].constant_dword, 0);
     }
 }
