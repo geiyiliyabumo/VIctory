@@ -28,6 +28,8 @@ pub use victory_gpu::console;
 pub use victory_gpu::replay;
 
 #[cfg(windows)]
+pub use victory_gpu::fsr_fg;
+#[cfg(windows)]
 pub use victory_gpu::pipeline::known as known_pipelines;
 /// Renderer port #2's switch and marks, for the launcher.
 #[cfg(windows)]

@@ -677,7 +677,7 @@ pub(super) struct Taken {
 /// the buffer between; on the CPU: the upload memory it filled) is compared
 /// with title memory when the submission has landed (the title has not been
 /// told: what it wrote meanwhile it wrote before the card was to read it).
-/// Pages where they differ are learned, and a submission with any fill there
+/// Constant-buffer slots where they differ are learned, and a submission with any fill there
 /// waits as without card steps. The first time is drawn with the old bytes;
 /// from then on it is exact. At the boat that is about every submission card
 /// steps took: 88 ms a frame against 94 without the check, and 95 without card
@@ -687,11 +687,13 @@ mod late {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
-    const PAGE: usize = 4096;
+    // D3D12 constant buffers are 256-byte aligned. Learning by slot keeps a
+    // late write from blocking fills of unrelated buffers on the same 4 KiB page.
+    const SLOT: usize = 256;
 
-    static PAGES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    static SLOTS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
     /// Fills done on the card compared, found written again, submissions
-    /// refused for a learned page; pages learned in all; fills done on the CPU
+    /// refused for a learned slot; slots learned in all; fills done on the CPU
     /// compared, found written again.
     pub(super) static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
@@ -700,10 +702,10 @@ mod late {
         *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_LEARN").is_none_or(|v| v != "0"))
     }
 
-    /// Whether the title was found writing a page of `[from, to)` late.
+    /// Whether the title was found writing a slot of `[from, to)` late.
     pub(super) fn written(from: usize, to: usize) -> bool {
-        let pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
-        pages.as_ref().is_some_and(|p| (from / PAGE..to.div_ceil(PAGE)).any(|page| p.contains(&page)))
+        let slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        slots.as_ref().is_some_and(|slots| (from / SLOT..to.div_ceil(SLOT)).any(|slot| slots.contains(&slot)))
     }
 
     /// The submission has landed: what the fills of `sent` (place, length,
@@ -740,7 +742,7 @@ mod late {
                 continue;
             }
             COUNTS[1].fetch_add(1, Ordering::Relaxed);
-            learn(src, src + len, "on the card");
+            learn(src, len, "card");
         }
     }
 
@@ -762,23 +764,35 @@ mod late {
                 continue;
             }
             COUNTS[5].fetch_add(1, Ordering::Relaxed);
-            learn(src, src + len, "on the CPU");
+            learn(src, len, "cpu");
         }
     }
 
-    fn learn(from: usize, to: usize, by: &str) {
-        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = pages.get_or_insert_with(Default::default);
-        for page in from / PAGE..to.div_ceil(PAGE) {
-            if pages.insert(page) {
-                COUNTS[3].fetch_add(1, Ordering::Relaxed);
+    fn learn(src: usize, len: usize, by: &str) {
+        let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = slots.get_or_insert_with(Default::default);
+        for slot in src / SLOT..(src + len).div_ceil(SLOT) {
+            if slots.insert(slot) && COUNTS[3].fetch_add(1, Ordering::Relaxed) < 16 {
                 tracing::info!(
-                    page = format_args!("{:#x}", page * PAGE),
-                    fill = format_args!("{from:#x}+{:#x}", to - from),
+                    slot = format_args!("{:#x}", slot * SLOT),
+                    src = format_args!("{src:#x}"),
+                    len,
                     by,
                     "card steps: the title wrote a constant buffer after the submission that reads it was sent; fills \
                      there wait from now on"
                 );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn forget_test_fill(src: usize, len: usize) {
+        let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slots) = slots.as_mut() {
+            for slot in src / SLOT..(src + len).div_ceil(SLOT) {
+                if slots.remove(&slot) {
+                    COUNTS[3].fetch_sub(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1154,7 +1168,7 @@ pub(super) fn log(frames: f64) {
         tracing::info!(
             "card steps, places the title writes after sending (VICTORY_CARD_STEPS_LEARN), per frame: {:.1} fills on the card \
              and {:.1} on the CPU compared at landing, {:.2} and {:.2} found written again, {:.2} submissions waited for a \
-             learned page; {} pages learned",
+             learned slot; {} slots learned",
             c[0],
             c[4],
             c[1],
@@ -1219,26 +1233,27 @@ mod tests {
         plan(does, 2, true, &mut None).unwrap()
     }
 
-    /// A place written between sending and landing is learned, page by page;
-    /// one left alone is not.
+    /// A late-written fill marks the constant-buffer slots it spans.
     #[test]
     fn places_written_after_sending_are_learned() {
         // Two pages of memory of our own, page-aligned, as title memory.
-        let memory = vec![0u8; 4 * 4096];
-        let page = (memory.as_ptr() as usize).next_multiple_of(4096);
+        let mut memory = vec![0u8; 4 * 4096];
+        let base = memory.as_mut_ptr() as usize;
+        let page = base.next_multiple_of(4096);
         let (kept, changed) = (page, page + 4096 + 64);
         // What the card read: the bytes as they were, at 0 and 256 of the
         // buffer between.
         let sent = [(kept, 32, 0), (changed, 240, 256)];
         let card = vec![0u8; 512];
-        // SAFETY: inside `memory`.
-        unsafe { *(changed as *mut u8).add(88) = 1 };
+        memory[changed - base + 88] = 1;
         assert!(!late::written(kept, kept + 32) && !late::written(changed, changed + 240));
         late::compare(&sent, &card);
         assert!(!late::written(kept, kept + 32));
         assert!(late::written(changed, changed + 240));
-        // The whole page: another constant buffer in it waits too.
         assert!(late::written(page + 4096, page + 4096 + 16));
+        assert!(late::written(page + 4096 + 256, page + 4096 + 272));
+        assert!(!late::written(page + 4096 + 512, page + 4096 + 576));
+        late::forget_test_fill(changed, 240);
         drop(memory);
     }
 
@@ -1246,18 +1261,19 @@ mod tests {
     /// again before landing, is learned; one that still matches is not.
     #[test]
     fn fills_done_on_the_cpu_are_learned_too() {
-        let memory = vec![0u8; 4 * 4096];
-        let page = (memory.as_ptr() as usize).next_multiple_of(4096);
+        let mut memory = vec![0u8; 4 * 4096];
+        let base = memory.as_mut_ptr() as usize;
+        let page = base.next_multiple_of(4096);
         let (kept, changed) = (page + 16, page + 4096 + 0xbd0);
         // The upload memory each was filled into: the bytes as they were.
         let upload = vec![0u8; 1024];
         let up = upload.as_ptr() as usize;
         let cpu = [(up, kept, 32), (up + 512, changed, 0x220)];
-        // SAFETY: inside `memory`.
-        unsafe { *(changed as *mut u8).add(0x100) = 7 };
+        memory[changed - base + 0x100] = 7;
         late::landed_cpu(&cpu);
         assert!(!late::written(kept, kept + 32));
         assert!(late::written(changed, changed + 0x220));
+        late::forget_test_fill(changed, 0x220);
         drop((memory, upload));
     }
 

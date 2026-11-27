@@ -23,14 +23,14 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use victory_gpu::object::Object;
+use victory_gpu::{fsr_fg, object::Object};
 use windows::Win32::Graphics::Direct3D12::ID3D12Device;
 use windows::core::Interface;
 
 use crate::{HleModule, hle_export};
 
-/// The PC build's upscaler, which has the five functions itself.
 const DLL: &str = "amd_fidelityfx_upscaler_dx12.dll";
+const LOADER: &str = "amd_fidelityfx_loader_dx12.dll";
 
 // Return codes.
 const OK: u32 = 0;
@@ -48,7 +48,12 @@ const OVERRIDE_VERSION: u64 = 5;
 const GET_PROVIDER_VERSION: u64 = 6;
 const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
 const GET_RENDER_RESOLUTION: u64 = 0x1_0003;
+// Upscaler creation flags. The dispatch flags describe per-dispatch options.
+const HIGH_DYNAMIC_RANGE: u32 = 1 << 0;
 const DISPLAY_RESOLUTION_MOTION_VECTORS: u32 = 1 << 1;
+const MOTION_VECTORS_JITTER_CANCELLATION: u32 = 1 << 2;
+const DEPTH_INVERTED: u32 = 1 << 3;
+const DEPTH_INFINITE: u32 = 1 << 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -100,7 +105,30 @@ struct DispatchUpscale {
     motion_scale: [f32; 2],
     render_size: [u32; 2],
     upscale_size: [u32; 2],
+    // Sharpening enable, sharpness, frame time (ms), pre-exposure, reset,
+    // near, far, vertical FOV, view-space scale and dispatch flags.
     settings: [u32; 10],
+}
+
+impl DispatchUpscale {
+    fn frame_generation_camera(&self, output: [u32; 2], flags: u32) -> fsr_fg::Camera {
+        fsr_fg::Camera {
+            render: self.render_size,
+            output,
+            jitter: self.jitter,
+            motion_scale: self.motion_scale,
+            near: f32::from_bits(self.settings[5]),
+            far: f32::from_bits(self.settings[6]),
+            fov_y: f32::from_bits(self.settings[7]),
+            // The SDK stores a C bool followed by alignment padding.
+            reset: self.settings[4] as u8 != 0,
+            inverted_depth: flags & DEPTH_INVERTED != 0,
+            infinite_depth: flags & DEPTH_INFINITE != 0,
+            display_res_mv: flags & DISPLAY_RESOLUTION_MOTION_VECTORS != 0,
+            mv_jitter_cancelled: flags & MOTION_VECTORS_JITTER_CANCELLATION != 0,
+            hdr: flags & HIGH_DYNAMIC_RANGE != 0,
+        }
+    }
 }
 
 const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
@@ -149,6 +177,7 @@ type Destroy = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
 type Call = unsafe extern "C" fn(*mut *mut c_void, *mut Header) -> u32;
 
 struct Host {
+    _loader: Option<Library>,
     _library: Library,
     create: Create,
     destroy: Destroy,
@@ -259,27 +288,47 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
         LoadLibraryExW,
     };
     // The search flags below want a full path.
-    let path = std::path::absolute(dir.join(DLL)).map_err(|e| e.to_string())?;
-    if !path.is_file() {
-        return Err(format!("no {DLL} there"));
-    }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    // Its own folder and System32 only, never the current folder.
-    let search = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32;
-    // SAFETY: a NUL-terminated path to the user's FidelityFX build.
-    let module = unsafe { LoadLibraryExW(wide.as_ptr(), null_mut(), search) };
-    if module.is_null() {
-        return Err(format!(
-            "{DLL} did not load ({})",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let library = Library(module);
+    let dir = std::path::absolute(dir).map_err(|e| e.to_string())?;
+    let open = |name: &str| {
+        let path = dir.join(name);
+        if !path.is_file() {
+            return Err(format!("no {name} there"));
+        }
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let search = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32;
+        // SAFETY: A NUL-terminated path to the user's FidelityFX build.
+        let module = unsafe { LoadLibraryExW(wide.as_ptr(), null_mut(), search) };
+        if module.is_null() {
+            return Err(format!(
+                "{name} did not load ({})",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Library(module))
+    };
+    let library = open(DLL)?;
+    let symbol = |module: &Library, name: &CStr| {
+        // SAFETY: A live module and a NUL-terminated export name.
+        unsafe { GetProcAddress(module.0, name.as_ptr().cast()) }.map(|f| f as *const c_void)
+    };
+    // Some builds export the full API directly. Split SDK builds resolve the
+    // already-loaded upscaler through the loader beside it.
+    let exports = [
+        c"ffxCreateContext",
+        c"ffxDestroyContext",
+        c"ffxConfigure",
+        c"ffxQuery",
+        c"ffxDispatch",
+    ];
+    let loader = if exports.iter().all(|name| symbol(&library, name).is_some()) {
+        None
+    } else {
+        Some(open(LOADER)?)
+    };
+    let api = loader.as_ref().unwrap_or(&library);
+    let api_name = if loader.is_some() { LOADER } else { DLL };
     let find = |name: &CStr| {
-        // SAFETY: a loaded module and a NUL-terminated name.
-        unsafe { GetProcAddress(module, name.as_ptr().cast()) }
-            .map(|f| f as *const c_void)
-            .ok_or_else(|| format!("{DLL} has no {}", name.to_string_lossy()))
+        symbol(api, name).ok_or_else(|| format!("{api_name} has no {}", name.to_string_lossy()))
     };
     let device = victory_gpu::external::host_device().ok_or("there is no host GPU")?;
     // SAFETY: the SDK's ffxQuery export, with its declared signature.
@@ -293,6 +342,7 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
             configure: std::mem::transmute::<*const c_void, Call>(find(c"ffxConfigure")?),
             query,
             dispatch: std::mem::transmute::<*const c_void, Call>(find(c"ffxDispatch")?),
+            _loader: loader,
             _library: library,
             device,
             provider_id,
@@ -678,6 +728,8 @@ fn record_dispatch(
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
     let mut backing_extents = [None; 7];
+    let (mut depth, mut motion) = (None, None);
+    let noting = fsr_fg::noting();
     for (index, r) in dispatch.resources.iter_mut().enumerate() {
         if r.resource.is_null() {
             continue;
@@ -695,7 +747,7 @@ fn record_dispatch(
             list.texture(r.resource.cast::<Object>(), w)
                 .filter(|&(_, state)| state == w)
         });
-        let Some((texture, _)) = texture else {
+        let Some((texture, state)) = texture else {
             once!(
                 warn,
                 index,
@@ -724,6 +776,13 @@ fn record_dispatch(
             return PARAMETER;
         }
         r.resource = texture.as_raw();
+        if noting {
+            match index {
+                1 => depth = Some((texture.clone(), state)),
+                2 => motion = Some((texture.clone(), state)),
+                _ => {}
+            }
+        }
         textures.push(texture);
     }
     once!(info, formats = ?textures.iter().map(|t| {
@@ -734,6 +793,11 @@ fn record_dispatch(
     // SAFETY: the PC dispatch on host objects. The context is live and locked.
     let code = unsafe { (host.dispatch)(context, &raw mut dispatch.header) };
     if code == OK {
+        if let (Some(depth), Some(motion)) = (depth, motion) {
+            let camera =
+                dispatch.frame_generation_camera(output_size, ctx.creation.description.flags);
+            fsr_fg::note_upscale(depth, motion, f32::from_bits(dispatch.settings[2]), camera);
+        }
         victory_gpu::external::output_written(output);
         ctx.first_dispatch.call_once(|| {
             tracing::info!(render = ?dispatch.render_size, output = ?output_size, ?backing_extents,
@@ -767,6 +831,37 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_upscale_camera_fields_and_creation_flags() {
+        let mut dispatch = DispatchUpscale {
+            header: Header { kind: DISPATCH_UPSCALE, next: null_mut() },
+            list: null_mut(),
+            resources: [Resource { resource: null_mut(), description: [0; 8], state: 0 }; 7],
+            jitter: [0.125, -0.25],
+            motion_scale: [1280.0, 720.0],
+            render_size: [1280, 720],
+            upscale_size: [0; 2],
+            settings: [0; 10],
+        };
+        dispatch.settings[4] = 0x1234_5600;
+        dispatch.settings[5] = 0.25_f32.to_bits();
+        dispatch.settings[6] = 1000.0_f32.to_bits();
+        dispatch.settings[7] = 1.25_f32.to_bits();
+        dispatch.settings[9] = u32::MAX;
+        let camera = dispatch.frame_generation_camera([1920, 1080], DEPTH_INVERTED | HIGH_DYNAMIC_RANGE);
+        assert_eq!(camera.render, [1280, 720]);
+        assert_eq!(camera.output, [1920, 1080]);
+        assert_eq!(camera.jitter, dispatch.jitter);
+        assert_eq!(camera.motion_scale, dispatch.motion_scale);
+        assert_eq!([camera.near, camera.far, camera.fov_y], [0.25, 1000.0, 1.25]);
+        assert!(camera.inverted_depth && camera.hdr);
+        assert!(!camera.infinite_depth && !camera.display_res_mv && !camera.mv_jitter_cancelled);
+        assert!(!camera.reset);
+
+        dispatch.settings[4] |= 1;
+        assert!(dispatch.frame_generation_camera([1920, 1080], 0).reset);
+    }
 
     #[test]
     fn validates_logical_rectangles_against_the_current_context() {
@@ -893,5 +988,24 @@ mod tests {
         assert_eq!(host_state(0x2), Some(0x8));
         assert_eq!(host_state(0x200), Some(0x10));
         assert_eq!(host_state(0x14), None);
+    }
+
+    #[test]
+    #[ignore = "needs VICTORY_FIDELITYFX_DIR and a host D3D12 GPU"]
+    fn host_sdk_loads_upscaler_and_frame_generation_together() {
+        let dir = std::path::PathBuf::from(
+            std::env::var_os("VICTORY_FIDELITYFX_DIR").expect("VICTORY_FIDELITYFX_DIR not set"),
+        );
+        let (host, version) = load(&dir).expect("PC FidelityFX upscaler should load on host GPU");
+        eprintln!(
+            "LIVE PC FSR UPSCALER: version={version}, provider_id={:#x}, via_loader={}",
+            host.provider_id,
+            host._loader.is_some()
+        );
+        assert!(
+            fsr_fg::init(&dir),
+            "FSR 3 frame generation DLLs should verify and load from {}",
+            dir.display()
+        );
     }
 }

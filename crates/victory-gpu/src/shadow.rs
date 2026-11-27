@@ -208,7 +208,7 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - `<= 9 GiB` (8 GB cards): `(8, 640)` MiB so hot >= 8 MiB shader-written
+/// - `<= 9 GiB` (8 GB cards): `(1, 896)` MiB so hot >= 1 MiB shader-written
 ///   buffers stay in local VRAM instead of falling back to CPU-bus staging.
 /// - Unknown (`None`, e.g. WARP) or `> 9 GiB` and `<= 12 GiB`: `(16, 512)` MiB.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
@@ -225,7 +225,7 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= NINE_GIB_MB {
-        (4, 704)
+        (1, 896)
     } else if budget_mb <= TWELVE_GIB_MB {
         (16, 512)
     } else if budget_mb < TWENTY_GIB_MB {
@@ -255,7 +255,8 @@ fn resolve_card_limits(
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
 /// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
-/// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
+/// `> 9 GiB` and `<= 12 GiB` budgets, 1 MiB / 896 MiB on `<= 9 GiB` budgets,
+/// 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
@@ -6282,11 +6283,11 @@ mod window_tests {
         const MIB: u64 = 1 << 20;
 
         // Unknown (WARP / query failure) and >9..=12 GiB keep the 12 GB baseline;
-        // <= 9 GiB (8 GB cards) admit >= 4 MiB buffers up to 704 MiB.
+        // <= 9 GiB (8 GB cards) admit >= 1 MiB buffers up to 896 MiB.
         assert_eq!(default_card_limits_mb(None), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(7 * GIB)), (4, 704));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (4, 704));
-        assert_eq!(default_card_limits_mb(Some(9 * GIB)), (4, 704));
+        for budget in [7, 8, 9] {
+            assert_eq!(resolve_card_limits(Some(budget * GIB), None, None), (1 << 20, 896 << 20));
+        }
         assert_eq!(default_card_limits_mb(Some(10 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));

@@ -2253,6 +2253,7 @@ const IDLE_FRAMES: u64 = 4;
 #[cfg(windows)]
 fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    const SWEEP_BUDGET_US: u64 = 4_000;
     let began = std::time::Instant::now();
     let mut live = live_filled();
     let mut texture_most = 0;
@@ -2299,9 +2300,19 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
         PART
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
+    let host_written = crate::texture::host_written_snapshot();
     let mut looked = 0;
     for at in live.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
         if dxgi_bytes >= most && bytes >= texture_most {
+            break;
+        }
+        if looked & 31 == 0
+            && (went > 0 || looked >= 256)
+            && began.elapsed().as_micros() as u64 >= SWEEP_BUDGET_US
+        {
+            if part == PART {
+                FROM.store(at, Relaxed);
+            }
             break;
         }
         looked += 1;
@@ -2313,11 +2324,15 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
         let r = unsafe { &*(at as *const Resource) };
         // Check the last use before taking the resource lock.
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        if used == 0
+            || !fills(&r.desc)
+            || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
+            || host_written.as_ref().is_some_and(|set| set.contains(&at))
+        {
             continue;
         }
         let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let Ok(mut made) = r.host.made.try_lock() else { continue; };
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && (most == u64::MAX || host.card_bytes() != 0)
@@ -3887,6 +3902,27 @@ mod tests {
     }
 
     #[cfg(windows)]
+    static TEST_SWEEP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
+    fn create_test_texture(desc: &ResourceDesc, source: &[u8]) -> This {
+        let mut title = std::ptr::null();
+        assert_eq!(
+            create_at_address(
+                std::ptr::null(),
+                source.as_ptr() as u64,
+                desc,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut title,
+            ),
+            S_OK
+        );
+        title
+    }
+
+    #[cfg(windows)]
     #[test]
     fn live_filled_tracks_host_copy_creation_eviction_and_drop() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -3895,27 +3931,12 @@ mod tests {
             eprintln!("live texture tracking test requires a D3D12 device");
             return;
         }
-        let create = |desc: &ResourceDesc, source: &[u8]| {
-            let mut title = std::ptr::null();
-            assert_eq!(
-                create_at_address(
-                    std::ptr::null(),
-                    source.as_ptr() as u64,
-                    desc,
-                    0,
-                    std::ptr::null(),
-                    &RESOURCE_IIDS[0],
-                    &mut title,
-                ),
-                S_OK
-            );
-            title
-        };
+        let _sweep = TEST_SWEEP.lock().unwrap_or_else(|e| e.into_inner());
         let desc = texture(4, 4, 28, 1);
         let source = vec![0u8; footprint(&desc).unwrap().size as usize];
         let target_source = source.clone();
-        let filled = create(&desc, &source);
-        let target = create(&ResourceDesc { flags: 1, ..desc }, &target_source);
+        let filled = create_test_texture(&desc, &source);
+        let target = create_test_texture(&ResourceDesc { flags: 1, ..desc }, &target_source);
         let filled_at = filled as usize;
         let target_at = target as usize;
         assert!(hosted(filled, true).is_some());
@@ -3937,6 +3958,49 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(filled, 0x10)(filled);
         assert!(!live_filled().contains(&filled_at));
         slot::<extern "system" fn(This) -> u32>(target, 0x10)(target);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sweep_idle_skips_locked_texture_and_evicts_unlocked_texture() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        if crate::host::host().is_none() {
+            eprintln!("idle texture sweep test requires a D3D12 device");
+            return;
+        }
+        let _sweep = TEST_SWEEP.lock().unwrap_or_else(|e| e.into_inner());
+        let desc = texture(4, 4, 28, 1);
+        let busy_source = vec![0u8; footprint(&desc).unwrap().size as usize];
+        let idle_source = busy_source.clone();
+        let busy = create_test_texture(&desc, &busy_source);
+        let idle = create_test_texture(&desc, &idle_source);
+        for title in [busy, idle] {
+            assert!(hosted(title, true).is_some());
+            resource(title).host.used.store(1 << 32, Relaxed);
+        }
+        for _ in 0..=IDLE_FRAMES {
+            crate::frame::test_advance();
+        }
+
+        let held = resource(busy).host.made.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sweep_idle(0, u64::MAX, None);
+            tx.send(()).unwrap();
+        });
+        let finished = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(held);
+        worker.join().unwrap();
+
+        let busy_kept = hosted(busy, false).is_some();
+        let idle_evicted = hosted(idle, false).is_none();
+        for title in [busy, idle] {
+            slot::<Release>(title, 0x10)(title);
+        }
+        finished.expect("sweep waited for the busy texture's mutex");
+        assert!(busy_kept);
+        assert!(idle_evicted);
     }
 
     #[cfg(windows)]

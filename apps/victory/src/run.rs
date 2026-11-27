@@ -98,6 +98,19 @@ pub fn run(
         }
         victory_loader::load(&prepared, &images)?
     };
+    #[cfg(windows)]
+    if victory_hle::fsr_fg::wanted() {
+        let dir = cfg
+            .fidelityfx_dir
+            .clone()
+            .unwrap_or_else(victory_hle::fsr_fg::dir_from_env);
+        let ready = victory_hle::fsr_fg::init(&dir);
+        tracing::info!(
+            dir = %dir.display(),
+            ready,
+            "AMD FSR 3 frame generation initialization"
+        );
+    }
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in

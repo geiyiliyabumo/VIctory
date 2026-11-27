@@ -4121,6 +4121,7 @@ fn late_line(frames: f64) {
     }
     card_steps::log(frames);
     dynamic_wait_line(frames);
+    crate::fsr_fg::log_line(frames);
     crate::port::log(frames);
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
@@ -10071,7 +10072,13 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = match crate::fsr_fg::shown_per_frame() {
+            1 => format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
+            per => format!(
+                " | VIctory {fps:.0} fps (FSR3 FG {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame",
+                fps * f64::from(per)
+            ),
+        };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -10183,6 +10190,7 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
+            crate::fsr_fg::resizing();
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -10376,6 +10384,17 @@ impl Host {
                 ));
                 list.ResourceBarrier(&post);
             }
+            // FSR 3 frame generation: dispatch prepare right before closing the
+            // present list (restores/uses its own descriptor heaps).
+            crate::fsr_fg::before_present(
+                &self.device,
+                &p.swap_chain,
+                list,
+                [width, height],
+                format,
+                (texture, state_u32),
+                composed && overlay.is_some(),
+            );
             copy.close();
             let flown = match slot {
                 Some(i) => {
@@ -10443,9 +10462,12 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let swap_chain = match crate::fsr_fg::swap_chain(&factory, &self.queue, hwnd, &desc) {
+                Some(swap_chain) => swap_chain,
+                None => factory
+                    .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                    .cast::<IDXGISwapChain3>()?,
+            };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
