@@ -1096,8 +1096,8 @@ impl Queued {
 }
 
 /// Slots due of a [`TextureQueue`], of those looked at before and of the
-/// others: the frame each was written in, the slot and its write's number.
-type Due = [Vec<(u64, u32, u64)>; 2];
+/// others: the slot and its write's number.
+type Due = [Vec<(u32, u64)>; 2];
 
 impl TextureQueue {
     fn insert(&mut self, index: u32, waiting: Waiting) {
@@ -1165,30 +1165,49 @@ impl TextureQueue {
     fn all_due(&self, frame: u64) -> Due {
         let mut due = Due::default();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
+            due[usize::from(w.looks == 0 && w.mapped == 0)].push((index, w.write));
         }
         due
     }
 
-    /// What [`TextureQueue::due`] says of `due` (with nothing held: some
-    /// ten thousand slots are sorted).
+    /// Order only the entries that fit in this pass.
     fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
-            }
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        if max == 0 {
+            return Vec::new();
         }
-        order.truncate(max);
-        order
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
+        again.sort_unstable_by(newest_first);
+        let take = (max - again.len()).min(fresh.len());
+        if take == 0 {
+            return again;
+        }
+        let newest_count = take.div_ceil(2);
+        let (newest, oldest) = if take == fresh.len() {
+            fresh.sort_unstable_by(newest_first);
+            fresh.split_at_mut(newest_count)
+        } else {
+            fresh.select_nth_unstable_by(newest_count, newest_first);
+            let (newest, rest) = fresh.split_at_mut(newest_count);
+            let start_of_oldest = rest.len() - take / 2;
+            if start_of_oldest < rest.len() {
+                rest.select_nth_unstable_by(start_of_oldest, newest_first);
+            }
+            let oldest = &mut rest[start_of_oldest..];
+            newest.sort_unstable_by(newest_first);
+            oldest.sort_unstable_by(newest_first);
+            (newest, oldest)
+        };
+        again.reserve(take);
+        let mut oldest = oldest.iter().rev();
+        for &entry in newest.iter() {
+            again.push(entry);
+            again.extend(oldest.next().copied());
+        }
+        again
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -6045,6 +6064,17 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    #[test]
+    fn limited_texture_passes_match_the_full_order() {
+        let fresh = vec![(2, 4), (3, 8), (5, 1), (1, 6), (4, 2), (8, 10), (9, 3)];
+        let again = vec![(6, 7), (7, 5), (0, 9)];
+        let full = [(0, 9), (6, 7), (7, 5), (8, 10), (5, 1), (3, 8), (4, 2), (1, 6), (9, 3), (2, 4)];
+        for max in 0..=full.len() + 1 {
+            let ordered = TextureQueue::in_order([again.clone(), fresh.clone()], max);
+            assert_eq!(ordered.as_slice(), &full[..max.min(full.len())]);
+        }
     }
 
     /// Slots held back for lack of room on the card are not handed out
