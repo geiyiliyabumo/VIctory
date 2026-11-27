@@ -2048,6 +2048,83 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Whether a list's tables of dynamic slots are cut from runs it takes at
+/// once ([`HostHeap::dynamic_in`]): `VICTORY_SLOT_CHUNKS=1`. Unset or 0:
+/// every table searches the heap under its lock, as before.
+fn slot_chunks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SLOT_CHUNKS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// A list's first run of dynamic slots ([`SlotChunks`]); each further one
+/// is twice the last, up to [`CHUNK_MOST`].
+const CHUNK_FIRST: u32 = 16;
+
+/// The longest run a list takes; a longer table is searched for alone.
+const CHUNK_MOST: u32 = 1024;
+
+/// No run of free dynamic slots for a table of `n` (logged once).
+fn dynamic_refused(n: u32) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+}
+
+/// The runs of dynamic slots one list cuts its tables from
+/// ([`HostHeap::dynamic_in`]): per host heap, the one it took last. Held by
+/// the list's `crate::draw::State` with the runs themselves, and cleared
+/// when they are given back.
+#[derive(Default)]
+pub(crate) struct SlotChunks {
+    open: Vec<OpenChunk>,
+}
+
+/// A run of a host heap's (by its `id`) dynamic slots, by heap index:
+/// the next slot not cut yet, its end, and its length.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OpenChunk {
+    heap: u64,
+    next: u32,
+    end: u32,
+    size: u32,
+}
+
+impl SlotChunks {
+    /// Forgets every run (they were given back).
+    pub(crate) fn clear(&mut self) {
+        self.open.clear();
+    }
+
+    /// `n` slots cut from the run held of heap `heap`, if they fit: the
+    /// first's index.
+    fn carve(&mut self, heap: u64, n: u32) -> Option<u32> {
+        let chunk = self.open.iter_mut().find(|c| c.heap == heap)?;
+        if chunk.end - chunk.next < n {
+            return None;
+        }
+        let first = chunk.next;
+        chunk.next += n;
+        Some(first)
+    }
+
+    /// How long the next run of heap `heap` is, for a table of `n` (at
+    /// most [`CHUNK_MOST`]).
+    fn next_size(&self, heap: u64, n: u32) -> u32 {
+        let last = self.open.iter().find(|c| c.heap == heap).map_or(0, |c| c.size);
+        last.saturating_mul(2).clamp(CHUNK_FIRST, CHUNK_MOST).max(n)
+    }
+
+    /// The run of `size` slots from `first` of heap `heap` was taken, and its
+    /// first `n` went to a table. What was left of the one before stays
+    /// held (and unused) until the list gives its slots back.
+    fn opened(&mut self, heap: u64, first: u32, size: u32, n: u32) {
+        let chunk = OpenChunk { heap, next: first + n, end: first + size, size };
+        match self.open.iter_mut().find(|c| c.heap == heap) {
+            Some(open) => *open = chunk,
+            None => self.open.push(chunk),
+        }
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -2059,6 +2136,69 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        let found = self.search(n);
+        if found.is_none() {
+            dynamic_refused(n);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            if found.is_none() {
+                add(C::DynamicRefused, 1);
+            }
+            add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+        }
+        found
+    }
+
+    /// [`HostHeap::dynamic`] for a table of the list whose runs are
+    /// `chunks` (`VICTORY_SLOT_CHUNKS=1`; else just that): the table's
+    /// first slot, and a run of slots now taken for the list, which it
+    /// gives back with [`HostHeap::release`] as it gives back its tables
+    /// (none: the table was cut from a run the list holds already).
+    pub(crate) fn dynamic_in(&self, chunks: &mut SlotChunks, n: u32) -> Option<(u32, Option<(u32, u32)>)> {
+        if !slot_chunks_on() || self.sampler || n == 0 || n > CHUNK_MOST || n > self.dynamic {
+            return self.dynamic(n).map(|first| (first, Some((first, n))));
+        }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        let found = chunks.carve(self.id, n).map(|first| (first, None)).or_else(|| {
+            // With a quarter of the slots or fewer free, a run's unused
+            // part could refuse another list's table: tables take what
+            // they need, as before.
+            let size = chunks.next_size(self.id, n);
+            let roomy = self.free.load(std::sync::atomic::Ordering::Relaxed) >= self.dynamic / 4;
+            if roomy
+                && size <= self.dynamic
+                && let Some(first) = self.search(size)
+            {
+                chunks.opened(self.id, first, size, n);
+                return Some((first, Some((first, size))));
+            }
+            self.search(n).map(|first| (first, Some((first, n))))
+        });
+        if found.is_none() {
+            dynamic_refused(n);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            if found.is_none() {
+                add(C::DynamicRefused, 1);
+            }
+            add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+        }
+        found
+    }
+
+    /// `n` consecutive free dynamic slots, taken: the first's index (no
+    /// statistics; [`HostHeap::dynamic`]).
+    fn search(&self, n: u32) -> Option<u32> {
+        if n == 0 || n > self.dynamic {
+            return None;
+        }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
@@ -2089,18 +2229,8 @@ impl HostHeap {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
-            }
             return None;
         };
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
@@ -7202,6 +7332,69 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn slot_chunks_cut_tables_in_turn_and_never_past_the_run() {
+        let mut chunks = SlotChunks::default();
+        assert_eq!(chunks.carve(1, 1), None);
+        assert_eq!(chunks.next_size(1, 3), CHUNK_FIRST);
+        chunks.opened(1, 100, CHUNK_FIRST, 3);
+        assert_eq!(chunks.carve(1, 4), Some(103));
+        assert_eq!(chunks.carve(1, 9), Some(107));
+        assert_eq!(chunks.carve(1, 1), None);
+        assert_eq!(chunks.carve(2, 1), None);
+        assert_eq!(chunks.next_size(1, 1), 2 * CHUNK_FIRST);
+        assert_eq!(chunks.next_size(1, 500), 500);
+        chunks.opened(1, 200, CHUNK_MOST, 1);
+        assert_eq!(chunks.next_size(1, 1), CHUNK_MOST);
+        assert_eq!(chunks.carve(1, CHUNK_MOST - 1), Some(201));
+        assert_eq!(chunks.carve(1, 1), None);
+    }
+
+    #[test]
+    fn slot_chunks_of_two_heaps_stay_apart_and_go_when_cleared() {
+        let mut chunks = SlotChunks::default();
+        chunks.opened(1, 10, 16, 2);
+        chunks.opened(2, 10, 32, 5);
+        assert_eq!(chunks.carve(1, 2), Some(12));
+        assert_eq!(chunks.carve(2, 2), Some(15));
+        chunks.opened(1, 50, 32, 1);
+        assert_eq!(chunks.carve(1, 1), Some(51));
+        assert_eq!(chunks.carve(2, 1), Some(17));
+        chunks.clear();
+        assert_eq!(chunks.carve(1, 1), None);
+        assert_eq!(chunks.carve(2, 1), None);
+        assert_eq!(chunks.next_size(1, 1), CHUNK_FIRST);
+    }
+
+    #[test]
+    fn slot_chunks_hand_each_slot_out_once() {
+        let mut chunks = SlotChunks::default();
+        let mut taken = vec![false; 1 << 20];
+        let mut heap_next = 0u32;
+        let mut seed = 0x2545_f491_u32;
+        for _ in 0..5_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let n = 1 + seed % 40;
+            let first = match chunks.carve(7, n) {
+                Some(first) => first,
+                None => {
+                    let size = chunks.next_size(7, n);
+                    let first = heap_next;
+                    heap_next += size;
+                    chunks.opened(7, first, size, n);
+                    first
+                }
+            };
+            for slot in first..first + n {
+                assert!(!taken[slot as usize], "slot {slot} handed out twice");
+                taken[slot as usize] = true;
+            }
+            assert!(first + n <= heap_next);
+        }
     }
 }
 

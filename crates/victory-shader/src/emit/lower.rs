@@ -9616,7 +9616,6 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
-                let (mine, any) = self.first_lane(a, guard);
                 // two host waves that exchange: the console's first lane may be in the other
                 // one, unless every lane holds the same value
                 let alike = match v.src.first() {
@@ -9626,6 +9625,17 @@ impl<'a> Lower<'a> {
                     _ => true,
                 };
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
+                // Alike in every lane the console runs: threads past a DispatchX count
+                // (`partial_active`) skipped the LDS and memory reads it is made of and hold
+                // another value, so the first lane is the first of the others (the structure
+                // builder's prefix sums: `s17 + lds[s18 * 4]`).
+                let guard = match (guard, self.partial_active) {
+                    (g, Some(on)) if halves && alike => {
+                        Some(g.map_or(on, |g| self.s.m.bin(self.cur, Bin::And, g, on)))
+                    }
+                    (g, _) => g,
+                };
+                let (mine, any) = self.first_lane(a, guard);
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
                         // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own

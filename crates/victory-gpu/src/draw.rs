@@ -643,6 +643,10 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, host heap id, first,
     /// count; given back when the list has run, is reset or released.
     dynamic: Vec<(usize, u64, u32, u32)>,
+    /// The runs of `dynamic` the list cuts its next tables from
+    /// (`VICTORY_SLOT_CHUNKS=1`, [`crate::descriptor::host::HostHeap::dynamic_in`]):
+    /// cleared whenever `dynamic` is given back, never apart from it.
+    slot_chunks: crate::descriptor::host::SlotChunks,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -684,6 +688,7 @@ impl State {
         for (heap, id, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
+        self.slot_chunks.clear();
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
@@ -2145,10 +2150,10 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some((index, held)) = host.dynamic_in(&mut self.slot_chunks, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, host.id(), index, 1));
+                self.dynamic.extend(held.map(|(at, k)| (key.0, host.id(), at, k)));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2216,10 +2221,10 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some((index, held)) = host.dynamic_in(&mut self.slot_chunks, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, host.id(), index, 1));
+                self.dynamic.extend(held.map(|(at, k)| (key.0, host.id(), at, k)));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -4080,7 +4085,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some((first, held)) = host.dynamic_in(&mut self.slot_chunks, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -4088,7 +4093,7 @@ impl State {
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
+                .extend(held.map(|(at, k)| (std::ptr::from_ref(heap) as usize, host.id(), at, k)));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
