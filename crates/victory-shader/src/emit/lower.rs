@@ -2939,8 +2939,11 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
-                    // No wave overlaps this one (see `ordered_section`).
-                    None if self.pops_collision(v) => Val::I32(self.s.m.i32(0)),
+                    // No wave overlaps this one (see `ordered_section`): bit 31 = 0,
+                    // wave_id = 1 (bits 16..=25) != collision_id = 0 (bits 0..=9),
+                    // so the POPS wait loop exits on its first check even if
+                    // inactive lanes fall through `s_cbranch_vccnz`.
+                    None if self.pops_collision(v) => Val::I32(self.s.m.i32(1 << 16)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),

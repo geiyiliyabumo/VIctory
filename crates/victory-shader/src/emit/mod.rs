@@ -3260,4 +3260,112 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    #[test]
+    #[cfg(windows)]
+    fn pops_wait_loop_exits_in_one_pass() {
+        use super::bitcode::{Attr, Term};
+        use super::host::{Draw, Host};
+        use super::shader::Shader;
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0x9390_FF01u32, // s_bfe_u32 s16, s1, 0x2001c
+            0x0002_001C,
+            0x9391_FF01, // s_bfe_u32 s17, s1, 0xa0000
+            0x000A_0000,
+            0x8F10_8110, // s_lshl_b32 s16, s16, 1
+            0x9392_FF01, // s_bfe_u32 s18, s1, 0xa0010
+            0x000A_0010,
+            0xBE91_0711, // s_not_b32 s17, s17
+            0x9013_9F01, // s_lshr_b32 s19, s1, 31
+            0x8810_8110, // s_or_b32 s16, s16, 1
+            0x8112_1112, // s_add_i32 s18, s18, s17
+            0xB990_1019, // s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s16
+            0xBEEA_0380, // s_mov_b32 vcc_lo, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xBF87_0005, // s_cbranch_vccnz +5 (skip wait if active)
+            0xBF8E_FFFF, // s_sleep 0xffff
+            0x4A06_0681, // v_add_nc_u32 v3, 1, v3
+            0x8115_11EF, // s_add_i32 s21, src_pops_exiting_wave_id, s17
+            0xBF0A_1512, // s_cmp_lt_u32 s18, s21
+            0xBF84_FFFB, // s_cbranch_scc0 -5 (loop while s18 >= s21)
+            0x7E04_0D03, // v_cvt_f32_u32 v2, v3
+            0xBEFC_0380, // s_mov_b32 m0, 0
+            0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let ps = pixel(&words, 0).expect("pops wait loop lowers");
+        validate(&ps);
+
+        let mut s = Shader::new(false);
+        s.inputs = vec![element("POSITION", 0, 0), element("TEXCOORD", 0, 1)];
+        for e in &mut s.inputs {
+            e.usage = 15;
+        }
+        s.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+        for (i, e) in s.outputs.iter_mut().enumerate() {
+            e.usage = 15;
+            e.interp = if i == 1 { 4 } else { 2 };
+        }
+        for row in 0..2 {
+            for col in 0..4 {
+                let args = [s.m.i32(row), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(s.entry, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                let args = [s.m.i32(1 - row), s.m.i32(0), s.m.i8(col), v];
+                s.op(s.entry, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+        }
+        s.m.terminate(s.entry, Term::Ret);
+        let vs = HostShader {
+            stage: HwStage::Vs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        };
+        validate(&vs);
+
+        let vertices = [
+            -1.0f32, 1.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0, -3.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0,
+            3.0, 1.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let mut ran = 0;
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let (root, pso) = host.pipeline(&vs, &ps).expect("pops pipeline");
+            let out = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: Vec::new(),
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &vertices,
+                        stride: 32,
+                        size: (4, 4),
+                        mesh_groups: 0,
+                    },
+                )
+                .expect("draw pops wait loop");
+            for (n, texel) in out.iter().enumerate() {
+                assert_eq!(
+                    texel[0], 1.0,
+                    "{backend} pixel {n}: expected 1 wait iteration, got {}",
+                    texel[0]
+                );
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "expected at least one D3D12 host (WARP or GPU)");
+    }
 }
