@@ -120,8 +120,8 @@ pub(super) enum FillTo {
     /// A descriptor slot that shows the fill's memory, and nothing else does
     /// (title heap, slot): it is made to show our buffer instead.
     Slot(usize, u32),
-    /// A buffer the card can write, filled from its beginning.
-    Buffer(ID3D12Resource),
+    /// A buffer the card can write, filled at a byte offset.
+    Buffer(ID3D12Resource, u64),
 }
 
 /// Title memory something in the air writes: the host copy it goes through
@@ -542,8 +542,8 @@ enum To {
     Copy(Arc<Shadow>, usize),
     /// A descriptor slot (title heap, slot).
     Slot(usize, u32),
-    /// A buffer's beginning.
-    Buffer(ID3D12Resource),
+    /// A buffer and byte offset in it.
+    Buffer(ID3D12Resource, u64),
 }
 
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
@@ -635,6 +635,10 @@ pub(super) fn trim() {
 /// Since the last frame-rate line: fills and copies done on the card, their
 /// bytes, and submissions that waited instead, refused by a check.
 static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Since the last frame-rate line: why submissions were refused and waited
+/// (the check's own words), and how many for each.
+static REFUSED_WHY: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
@@ -850,9 +854,15 @@ impl Host {
             Ok(taken) => taken,
             Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
+                {
+                    let mut all = REFUSED_WHY.lock().unwrap_or_else(|e| e.into_inner());
+                    match all.iter_mut().find(|w| w.0 == why) {
+                        Some(w) => w.1 += 1,
+                        None => all.push((why, 1)),
+                    }
+                }
                 #[cfg(feature = "diagnostics")]
                 refused(why);
-                let _ = why;
                 None
             }
         }
@@ -948,7 +958,7 @@ impl Host {
                 }
                 _ => match fill_to(runs, steps[i]) {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
-                    Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
+                    Some(FillTo::Buffer(buffer, offset)) => To::Buffer(buffer, offset),
                     None => continue,
                 },
             };
@@ -1004,7 +1014,7 @@ impl Host {
                 }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
-                    To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                    To::Buffer(buffer, offset) => writes.push((buffer, *offset, op.at, len)),
                     To::Slot(..) => {}
                 }
             }
@@ -1106,7 +1116,7 @@ fn noted(ops: &[Op]) {
     for op in ops {
         let (to, dst) = match &op.to {
             To::Copy(to, dst) => (to.span(), *dst),
-            To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
+            To::Slot(..) | To::Buffer(..) => ((0, 0), 0),
         };
         let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
         *e = (e.0 + 1, op.from.1, dst);
@@ -1128,6 +1138,12 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    let mut why = std::mem::take(&mut *REFUSED_WHY.lock().unwrap_or_else(|e| e.into_inner()));
+    if !why.is_empty() {
+        why.sort_unstable_by_key(|w| std::cmp::Reverse(w.1));
+        let text: Vec<String> = why.iter().take(6).map(|(why, n)| format!("{:.2} {why}", *n as f64 / frames)).collect();
+        tracing::info!("submissions refused steps on the card and waited for flights, per frame, by why: {}", text.join("; "));
+    }
     if late::on() {
         // (Index 3 counts in all, the others since the last line.)
         let c: Vec<f64> = late::COUNTS
@@ -1575,8 +1591,8 @@ mod tests {
             // What depends on them: a copy of the first copy, upload memory
             // filled from that, and the first one's bytes copied over.
             b.defer_copy((start + 1_500_000) as *mut u8, (start + HALF + 600) as *const u8, 700);
-            let (staging, staged) = b.upload(host, 4096).unwrap();
-            b.defer_fill_buffer(&staging, staged, (start + 1_500_100) as *const u8, 500);
+            let (staging, staging_offset, staged) = b.upload(host, 4096).unwrap();
+            b.defer_fill_buffer(&staging, staging_offset, staged, (start + 1_500_100) as *const u8, 500);
             b.defer_copy((start + HALF + 300) as *mut u8, (start + 8000) as *const u8, 64);
             b.close();
             host.execute_own(&b);

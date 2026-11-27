@@ -1080,22 +1080,22 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let buffer = match list.place_source(data as usize, bytes as usize) {
+            let (buffer, offset) = match list.place_source(data as usize, bytes as usize) {
                 // What shaders wrote to it, at this place of the list.
-                Some(buffer) => buffer,
+                Some(buffer) => (buffer, 0),
                 None => {
-                    let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    let Some((buffer, offset, staging)) = list.upload(host, bytes) else {
                         return;
                     };
                     // The list owns this mapped D3D12 upload buffer. Wine can
                     // report its address as MEM_FREE, so use the host-upload
                     // path.
-                    list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
-                    buffer
+                    list.defer_fill_buffer(&buffer, offset, staging, data, bytes as usize);
+                    (buffer, offset)
                 }
             };
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint.offset = offset;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.

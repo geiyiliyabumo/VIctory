@@ -269,14 +269,26 @@ impl<W: Work> Lane<W> {
             let (asked, limit) = {
                 let mut state = self.lock();
                 while state.asked == state.served {
-                    if state.items.is_empty() {
+                    let began = Instant::now();
+                    let why = if state.items.is_empty() {
+                        0
+                    } else if state.items.iter().any(|e| {
+                        e.what.folded() && e.what.ask().is_some_and(|ask| !W::met(&ask))
+                    }) {
+                        1
+                    } else {
+                        2
+                    };
+                    if why == 0 {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
+                        STOOD[why].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
                     } else {
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
+                        STOOD[why].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
                         if out.timed_out() {
                             break;
                         }
@@ -688,6 +700,10 @@ static LANE: Lane<Job> = Lane::new();
 /// yet.
 static QUEUED: AtomicU64 = AtomicU64::new(0);
 
+/// Idle microseconds since the last frame-rate line: no work submitted,
+/// a submission with lists still translating, and waits alone.
+static STOOD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Since the last frame-rate line: submissions put in the line, presents, the
 /// times they found things in it (the sum of their numbers) and the most; what
 /// threads of the title waited, in microseconds, for room in the line, at a
@@ -945,6 +961,15 @@ pub(super) fn line(frames: f64) {
         s[DRAINS] / frames,
         s[FORCED] / frames,
         s[JOINED] / frames
+    );
+    let stood = STOOD.each_ref().map(|s| s.swap(0, Relaxed) as f64 / 1000.0 / frames);
+    tracing::info!(
+        "the thread that prepares submissions stood with nothing free to run, per frame: {:.1} ms with nothing in the line \
+         (the title had not submitted), {:.1} ms with lists in the line that were not translated yet (VICTORY_THIN), \
+         {:.1} ms at waits alone",
+        stood[0],
+        stood[1],
+        stood[2]
     );
 }
 

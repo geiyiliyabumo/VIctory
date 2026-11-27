@@ -105,7 +105,7 @@ const BACK: u64 = 256 << 10;
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
 /// pages there are in the first seconds (run light-4).
 const FAULTS: usize = 128;
-const FAULTS_ALL: usize = 2048;
+const FAULTS_ALL: usize = 8192;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -324,9 +324,11 @@ impl Memory {
         if self.copy_of(page).is_some() {
             return true;
         }
-        if !self.possible(page) {
-            return false;
-        }
+        self.possible(page) && self.map_possible(page)
+    }
+
+    /// Maps an eligible title page that does not already have a copy.
+    fn map_possible(&mut self, page: u64) -> bool {
         let start = page * PAGE;
         if crate::shadow::in_buffer(start, PAGE).is_some() {
             let Some(shadow) = crate::shadow::find(start, PAGE) else {
@@ -675,8 +677,20 @@ impl Memory {
         }
         pages.sort_unstable();
         let mut made = 0;
+        let mut left = [0u32; 4];
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
+            if made >= FAULTS {
+                left[0] += 1;
+            } else if self.faulted >= FAULTS_ALL {
+                left[1] += 1;
+            } else if self.copy_of(page).is_some() {
+                // Another fault may already have mapped this page.
+                continue;
+            } else if !self.possible(page) {
+                left[2] += 1;
+            } else if !self.map_possible(page) {
+                left[3] += 1;
+            } else {
                 made += 1;
                 self.faulted += 1;
                 self.bring(page, page + 1);
@@ -696,6 +710,10 @@ impl Memory {
                 frame = self.frame,
                 pages = pages.len(),
                 made,
+                over_the_frame = left[0],
+                over_the_run = left[1],
+                not_the_titles = left[2],
+                no_place = left[3],
                 held = self.pages.len(),
                 ?some,
                 "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); those that are the title's are there now"

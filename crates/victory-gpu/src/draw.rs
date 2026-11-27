@@ -2150,7 +2150,10 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some((index, held)) = host.dynamic_in(&mut self.slot_chunks, 1) else {
+                let Some((index, held)) = host
+                    .dynamic_in(&mut self.slot_chunks, 1)
+                    .or_else(|| crate::host::wait_for_slots(|| host.dynamic_in(&mut self.slot_chunks, 1)))
+                else {
                     return false;
                 };
                 self.dynamic.extend(held.map(|(at, k)| (key.0, host.id(), at, k)));
@@ -2221,7 +2224,10 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some((index, held)) = host.dynamic_in(&mut self.slot_chunks, 1) else {
+                let Some((index, held)) = host
+                    .dynamic_in(&mut self.slot_chunks, 1)
+                    .or_else(|| crate::host::wait_for_slots(|| host.dynamic_in(&mut self.slot_chunks, 1)))
+                else {
                     return false;
                 };
                 self.dynamic.extend(held.map(|(at, k)| (key.0, host.id(), at, k)));
@@ -4085,7 +4091,10 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some((first, held)) = host.dynamic_in(&mut self.slot_chunks, n) else {
+            let Some((first, held)) = host
+                .dynamic_in(&mut self.slot_chunks, n)
+                .or_else(|| crate::host::wait_for_slots(|| host.dynamic_in(&mut self.slot_chunks, n)))
+            else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));

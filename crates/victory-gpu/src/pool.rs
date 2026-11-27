@@ -30,8 +30,11 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 const BLOCK: u64 = 64 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
-/// The same while the card has room ([`room`]): 4 GiB of them.
+/// The same while the card has room ([`room`]): 4 GiB of them on 12+ GiB cards.
 const SPARE_KEPT: usize = 64;
+/// Spare empty texture blocks kept on <= 8 GiB VRAM cards (`256 MiB`) so idle
+/// blocks do not hold 1+ GiB of scarce local VRAM.
+const SPARE_KEPT_8GB: usize = 4;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
@@ -48,14 +51,17 @@ pub(crate) fn room(memory: Option<[u64; 4]>, host_pressure: bool) {
     if residency && let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
+    let staging_limit = staging_spares(
+        limit,
+        host_pressure,
+        crate::residency::critical_commit(),
+        crate::residency::limited_host_ram(),
+    );
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = staging_spares(
-            limit,
-            host_pressure,
-            crate::residency::critical_commit(),
-            crate::residency::limited_host_ram(),
-        );
         pool.reclaim(tick, staging_limit, true);
+    }
+    if let Ok(mut pool) = SHARED_STAGING.try_lock() {
+        pool.reclaim(tick, staging_limit.min(2), true);
     }
 }
 
@@ -73,7 +79,13 @@ fn staging_spares(limit: usize, host_pressure: bool, critical_commit: bool, limi
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            if budget < 9 << 30 {
+                SPARE_KEPT_8GB
+            } else {
+                SPARE_KEPT
+            }
+        }
         _ => SPARE,
     }
 }
@@ -361,6 +373,7 @@ unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static SHARED_STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -377,7 +390,8 @@ pub(crate) fn texture_room() -> u64 {
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+    let staging_blocks = lock(&STAGING).blocks() + lock(&SHARED_STAGING).blocks();
+    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), staging_blocks as u64 * (BLOCK >> 20)]
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -387,6 +401,38 @@ impl Drop for StagingPiece {
     fn drop(&mut self) {
         lock(&STAGING).give(self.0, now());
     }
+}
+
+/// Part of a block of mapped shared L0 staging memory (`COMMON` / `WRITE_BACK`,
+/// writable by both CPU and `card_steps` GPU copies), back in the pool when dropped.
+pub(crate) struct SharedStagingPiece(Piece);
+
+impl Drop for SharedStagingPiece {
+    fn drop(&mut self) {
+        lock(&SHARED_STAGING).give(self.0, now());
+    }
+}
+
+/// `bytes` of shared L0 staging memory (512-byte aligned, writable by both CPU
+/// and GPU `CopyBufferRegion` for `VICTORY_CARD_STEPS=2`): the buffer it lies
+/// in, its offset, and its CPU mapping. `None`: not pooled.
+pub(crate) fn shared_staging(
+    host: &crate::host::Host,
+    bytes: u64,
+) -> Option<(SharedStagingPiece, ID3D12Resource, u64, *mut u8)> {
+    if !on() {
+        return None;
+    }
+    let bytes = bytes.max(1).next_multiple_of(512);
+    let (piece, memory, _) = lock(&SHARED_STAGING).take(bytes, 512, now(), || {
+        let (buffer, data) = host.transient_shared_buffer(BLOCK)?;
+        crate::host::name(&buffer, || "shared staging of list uploads (a block)".into());
+        Some(Upload(buffer, data))
+    })?;
+    let owned = SharedStagingPiece(piece);
+    // SAFETY: the piece lies in the block's mapping.
+    let data = unsafe { memory.1.add(piece.start as usize) };
+    Some((owned, memory.0, piece.start, data))
 }
 
 /// `bytes` of upload memory, all zeros: the buffer it lies in, where in
@@ -788,9 +834,9 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        assert_eq!(spares(Some([100 << 30, 84 << 30, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([100 << 30, 85 << 30, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([100 << 30, 10 << 30, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
     }
 
@@ -940,5 +986,39 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn spares_caps_8gb_vram_cards_to_256_mib() {
+        let budget_8gb = 7_500u64 << 20;
+        let used_low = 4_000u64 << 20;
+        let used_high = 6_600u64 << 20;
+        assert_eq!(spares(Some([budget_8gb, used_low, 0, 0]), true), SPARE_KEPT_8GB);
+        assert_eq!(spares(Some([budget_8gb, used_high, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([budget_8gb, used_low, 0, 0]), false), SPARE);
+
+        let budget_16gb = 15_000u64 << 20;
+        assert_eq!(spares(Some([budget_16gb, 8_000u64 << 20, 0, 0]), true), SPARE_KEPT);
+    }
+
+    #[test]
+    fn shared_staging_pools_512_aligned_pieces_and_reclaims() {
+        let Some(host) = crate::host::host() else { return };
+        let (p1, b1, off1, ptr1) = shared_staging(host, 1000).unwrap();
+        let (p2, b2, off2, ptr2) = shared_staging(host, 2000).unwrap();
+        assert!(off1.is_multiple_of(512));
+        assert!(off2.is_multiple_of(512));
+        assert_eq!(b1.as_raw(), b2.as_raw());
+        assert_ne!(off1, off2);
+        // SAFETY: disjoint 512-aligned ranges within the mapped block.
+        unsafe {
+            std::ptr::write_bytes(ptr1, 0x3C, 1000);
+            std::ptr::write_bytes(ptr2, 0xA5, 2000);
+            assert_eq!(*ptr1, 0x3C);
+            assert_eq!(*ptr2, 0xA5);
+        }
+        drop(p1);
+        drop(p2);
+        lock(&SHARED_STAGING).rested(u64::MAX);
     }
 }

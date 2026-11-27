@@ -36,6 +36,10 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
+    /// Taken by a worker from the requested resolve queue.
+    as_resolve: AtomicBool,
+    /// May skip a dispatch while its host pipeline is being made.
+    no_wait: bool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -51,6 +55,12 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders.iter().any(|shader| {
+        shader.stage == "compute" && shader.container.windows(name.len()).any(|bytes| bytes == name)
+    })
+}
+
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
@@ -59,12 +69,15 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let no_wait = named(&shaders, b"CS_RaytracingResolve");
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            as_resolve: AtomicBool::new(false),
+            no_wait,
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -307,11 +320,7 @@ fn lost(slot: usize) {
         }
     }
     let _ = p.made.set(None);
-    if p.was_slow.swap(false, Ordering::Relaxed) {
-        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        queue.slow_now = queue.slow_now.saturating_sub(1);
-        AVAILABLE.notify_all();
-    }
+    release_slot(&p);
     {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -388,6 +397,9 @@ fn screens_first() -> bool {
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
+/// Requests that skipped waiting for a ray-tracing resolve pipeline.
+static NOT_WAITED: AtomicU64 = AtomicU64::new(0);
+
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
@@ -403,7 +415,16 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.no_wait {
+            if p.made.get().is_none() {
+                let n = NOT_WAITED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(n, shaders = ?p.shaders, "ray-tracing resolve pipeline still pending; skipped waiting");
+                }
+            }
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -477,6 +498,25 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     waiting.end();
+    if waited >= Duration::from_millis(50) {
+        static LONG: AtomicU64 = AtomicU64::new(0);
+        static LONG_MS: AtomicU64 = AtomicU64::new(0);
+        let ms = waited.as_millis() as u64;
+        let all_ms = LONG_MS.fetch_add(ms, Ordering::Relaxed) + ms;
+        let n = LONG.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n.is_multiple_of(64) {
+            let made = p.made.get().is_some();
+            tracing::warn!(
+                n,
+                all_ms,
+                ms,
+                made,
+                being_made = !made && p.queue_state.load(Ordering::Relaxed) == MAKING,
+                shaders = ?p.shaders,
+                "waited at least 50 ms for a host pipeline"
+            );
+        }
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -537,6 +577,8 @@ struct Queue {
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    resolves: VecDeque<Arc<Pending>>,
+    resolves_now: usize,
 }
 
 impl Queue {
@@ -547,6 +589,8 @@ impl Queue {
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            resolves: VecDeque::new(),
+            resolves_now: 0,
         }
     }
 
@@ -562,7 +606,9 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED && p.screen && screens_first() {
+        if priority == REQUESTED && p.no_wait {
+            self.resolves.push_back(p.clone());
+        } else if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
@@ -581,7 +627,17 @@ impl Queue {
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = self.requested.pop_front();
+            if p.is_none() && self.resolves_now < resolve_limit() {
+                p = self.resolves.pop_front();
+                if let Some(p) = &p {
+                    p.as_resolve.store(true, Ordering::Relaxed);
+                    self.resolves_now += 1;
+                }
+            }
+            if p.is_none() {
+                p = unclaimed(&mut self.early);
+            }
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -598,6 +654,18 @@ impl Queue {
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
+
+/// Releases a capped slot after completion or a driver compiler crash.
+fn release_slot(p: &Pending) {
+    let slow = p.was_slow.swap(false, Ordering::Relaxed);
+    let resolve = p.as_resolve.swap(false, Ordering::Relaxed);
+    if slow || resolve {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.slow_now -= usize::from(slow);
+        queue.resolves_now -= usize::from(resolve);
+        AVAILABLE.notify_all();
+    }
+}
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -661,18 +729,31 @@ fn worker_count_for_ram(asked: Option<usize>, processors: usize, total_ram_bytes
     }
 }
 
-/// Starts the workers ([`worker_count`]) on first use.
-fn workers() -> bool {
-    static RUNNING: OnceLock<bool> = OnceLock::new();
-    *RUNNING.get_or_init(|| {
-        let mut running = false;
-        let workers = worker_count_for_ram(
+fn general_worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        worker_count_for_ram(
             std::env::var("VICTORY_PIPELINE_WORKERS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok()),
             std::thread::available_parallelism().map_or(2, |n| n.get()),
             crate::residency::total_physical_ram(),
-        );
+        )
+    })
+}
+
+/// Leaves a quarter of general-purpose workers available for draw pipelines.
+fn resolve_limit() -> usize {
+    let workers = general_worker_count();
+    (workers - workers / 4).max(1)
+}
+
+/// Starts the workers on first use.
+fn workers() -> bool {
+    static RUNNING: OnceLock<bool> = OnceLock::new();
+    *RUNNING.get_or_init(|| {
+        let mut running = false;
+        let workers = general_worker_count();
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         guard_start();
@@ -711,11 +792,7 @@ fn spawn_worker(screens_only: bool) -> bool {
                     let _compile = Compile::begin(slot, &p, screens_only);
                     p.make();
                 }
-                if p.was_slow.load(Ordering::Relaxed) {
-                    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                    queue.slow_now -= 1;
-                    AVAILABLE.notify_all();
-                }
+                release_slot(&p);
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
                 } else {

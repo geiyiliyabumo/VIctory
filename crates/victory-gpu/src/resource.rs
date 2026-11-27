@@ -1453,6 +1453,12 @@ pub(crate) fn want_level(this: This, first: u32) {
     if let Some(old) = made.take() {
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
+    drop(made);
+    let mut live = live_filled();
+    // A concurrent use may already have remade the host copy.
+    if r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        live.remove(&(this as usize));
+    }
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1477,8 +1483,8 @@ impl Drop for RetiringTextureBytes {
     }
 }
 
-/// Every title texture alive (not buffers), by address: for the sweep and
-/// the memory line. A texture leaves the table before it is freed.
+/// Every title texture alive (not buffers), by address, for the memory line.
+/// A texture leaves the table before it is freed.
 #[cfg(windows)]
 static TEXTURES: std::sync::Mutex<std::collections::BTreeSet<usize>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
@@ -1486,6 +1492,19 @@ static TEXTURES: std::sync::Mutex<std::collections::BTreeSet<usize>> =
 #[cfg(windows)]
 fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Title textures the title fills ([`fills`]) that have a live host copy.
+/// Lets the idle sweep skip evicted and unmade textures. Lock order is
+/// LIVE_FILLED before the resource's host.made. Never hold TEXTURES
+/// and LIVE_FILLED together.
+#[cfg(windows)]
+static LIVE_FILLED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(windows)]
+fn live_filled() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
+    LIVE_FILLED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The title textures the host renders to or writes (targets, depth,
@@ -1630,6 +1649,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         return None;
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let mut made_filled = false;
     if made.is_none() {
         if !make || r.host.refused.load(Relaxed) {
             return None;
@@ -1739,6 +1759,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        made_filled = host.filled;
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
@@ -1748,7 +1769,16 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     if r.host.used.load(Relaxed) != now {
         r.host.used.store(now, Relaxed);
     }
-    made.clone()
+    let out = made.clone();
+    drop(made);
+    if made_filled {
+        let mut live = live_filled();
+        // Mip growth can take the copy between dropping made and locking live.
+        if r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            live.insert(this as usize);
+        }
+    }
+    out
 }
 
 /// The host copy of title texture `this` if it is made, without making it
@@ -2181,8 +2211,6 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
-    use std::sync::atomic::Ordering::{Acquire, Relaxed};
-    const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -2202,7 +2230,7 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    let (mut idle_ms, mut most) = match memory {
+    let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
@@ -2216,8 +2244,17 @@ pub(crate) fn let_go_idle() {
     } else {
         None
     };
+    sweep_idle(idle_ms, most, limit);
+}
+
+#[cfg(windows)]
+const IDLE_FRAMES: u64 = 4;
+
+#[cfg(windows)]
+fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
     let began = std::time::Instant::now();
-    let all = textures();
+    let mut live = live_filled();
     let mut texture_most = 0;
     if let Some(limit) = limit {
         // If a queued copy just dropped, read the live counters after its decrement.
@@ -2228,6 +2265,8 @@ pub(crate) fn let_go_idle() {
     if most == 0 && texture_most == 0 {
         return;
     }
+    let mut evicted = Vec::new();
+    let mut to_retire = Vec::new();
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2235,7 +2274,7 @@ pub(crate) fn let_go_idle() {
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
     if most != u64::MAX {
-        for &at in all.iter() {
+        for &at in live.iter() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
@@ -2246,7 +2285,7 @@ pub(crate) fn let_go_idle() {
         by_age.sort_unstable();
     }
     // Without one, while textures are kept for minutes, a part of them at
-    // each look, the next one at the next: a play has over 100,000
+    // each look, the next one at the next.
     // (`VICTORY_TEXTURE_SWEEP=whole`: all each time, as before).
     const PART: usize = 8192;
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2261,7 +2300,7 @@ pub(crate) fn let_go_idle() {
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    for at in live.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
         if dxgi_bytes >= most && bytes >= texture_most {
             break;
         }
@@ -2272,7 +2311,7 @@ pub(crate) fn let_go_idle() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        // (Without its lock first: most were used lately or have none.)
+        // Check the last use before taking the resource lock.
         let used = r.host.used.load(Relaxed);
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
             continue;
@@ -2307,18 +2346,30 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
-            if limit.is_some() {
+            evicted.push(at);
+            let pending = limit.map(|_| {
                 RETIRING_TEXTURE_BYTES.fetch_add(backing, Relaxed);
-                // The host copy drops before its pending byte count.
-                crate::host::retire((host, RetiringTextureBytes(backing)));
-            } else {
-                crate::host::retire(host);
-            }
+                RetiringTextureBytes(backing)
+            });
+            // The host copy drops before its pending byte count.
+            to_retire.push((host, pending));
         }
     }
+    // Churn may have removed every entry after the cursor.
+    if part == PART && looked == 0 {
+        FROM.store(0, Relaxed);
+    }
+    for at in evicted {
+        live.remove(&at);
+    }
+    drop(live);
+    for made in to_retire {
+        crate::host::retire(made);
+    }
+    let elapsed = began.elapsed().as_micros() as u64;
     SWEPT_US[0].fetch_add(1, Relaxed);
-    SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
-    SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
+    SWEPT_US[1].fetch_add(elapsed, Relaxed);
+    SWEPT_US[2].fetch_max(elapsed, Relaxed);
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -2930,13 +2981,13 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
-        // Out of the table of textures first: the sweep looks at the ones
-        // in it, under its lock.
+        // Remove the address from both tables before freeing the texture.
         if self.desc.dimension != BUFFER {
             let address = std::ptr::from_ref::<Resource>(self) as usize;
             crate::texback::released(address);
             crate::texlate::gone(address);
             textures().remove(&address);
+            live_filled().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
@@ -3833,6 +3884,59 @@ mod tests {
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_filled_tracks_host_copy_creation_eviction_and_drop() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        if crate::host::host().is_none() {
+            eprintln!("live texture tracking test requires a D3D12 device");
+            return;
+        }
+        let create = |desc: &ResourceDesc, source: &[u8]| {
+            let mut title = std::ptr::null();
+            assert_eq!(
+                create_at_address(
+                    std::ptr::null(),
+                    source.as_ptr() as u64,
+                    desc,
+                    0,
+                    std::ptr::null(),
+                    &RESOURCE_IIDS[0],
+                    &mut title,
+                ),
+                S_OK
+            );
+            title
+        };
+        let desc = texture(4, 4, 28, 1);
+        let source = vec![0u8; footprint(&desc).unwrap().size as usize];
+        let target_source = source.clone();
+        let filled = create(&desc, &source);
+        let target = create(&ResourceDesc { flags: 1, ..desc }, &target_source);
+        let filled_at = filled as usize;
+        let target_at = target as usize;
+        assert!(hosted(filled, true).is_some());
+        assert!(hosted(target, true).is_some());
+        assert!(live_filled().contains(&filled_at));
+        assert!(!live_filled().contains(&target_at));
+
+        // An old nonzero moment, even when this is the first frame in the test process.
+        resource(filled).host.used.store(1 << 32, Relaxed);
+        for _ in 0..=IDLE_FRAMES {
+            crate::frame::test_advance();
+        }
+        sweep_idle(0, u64::MAX, None);
+        assert!(!live_filled().contains(&filled_at));
+        assert!(hosted(filled, false).is_none());
+
+        assert!(hosted(filled, true).is_some());
+        assert!(live_filled().contains(&filled_at));
+        slot::<extern "system" fn(This) -> u32>(filled, 0x10)(filled);
+        assert!(!live_filled().contains(&filled_at));
+        slot::<extern "system" fn(This) -> u32>(target, 0x10)(target);
     }
 
     #[cfg(windows)]

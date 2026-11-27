@@ -254,19 +254,33 @@ struct Aside {
 // thread at a time (the lock).
 unsafe impl Send for Aside {}
 
+/// Monotonic ticket counters for coalescing concurrent [`mapped`] waits:
+/// every thread whose `ticket` is `<= MAPPED_DONE` after acquiring `ASIDE`
+/// completed its resource creation and `MakeResident` before the preceding
+/// copy-queue `ExecuteCommandLists` ran and signalled completion.
+static MAPPED_WANTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAPPED_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAPPED_COALESCED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// New memory of the card is mapped into its address space when this
 /// returns: a copy of a few bytes is sent to a queue of ours after the
 /// memory was made, which the system starts only when all mappings asked
 /// for so far are done, and waited for. (`MakeResident` came back before
-/// that: run n11 was lost as n08 was with it alone.) Best done off a hot
-/// path: a tenth of a millisecond to some.
+/// that: run n11 was lost as n08 was with it alone.) Concurrent callers are
+/// coalesced onto one copy-queue fence wait via [`MAPPED_WANTED`]/[`MAPPED_DONE`].
 pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
     if !wait_resident() {
         return Ok(());
     }
     let started = std::time::Instant::now();
+    let ticket = MAPPED_WANTED.fetch_add(1, Ordering::AcqRel) + 1;
     let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
+    if MAPPED_DONE.load(Ordering::Acquire) >= ticket {
+        MAPPED_COALESCED.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    let target = MAPPED_WANTED.load(Ordering::Acquire).max(ticket);
     // SAFETY: plain object creation; the objects the list names are kept.
     unsafe {
         if aside.is_none() {
@@ -319,14 +333,16 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
             WaitForSingleObject(a.event, INFINITE);
         }
     }
+    MAPPED_DONE.store(target, Ordering::Release);
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
     MAPPED[1].fetch_add(us, Ordering::Relaxed);
     MAPPED[2].fetch_max(us, Ordering::Relaxed);
     let n = MAPPED[0].load(Ordering::Relaxed);
     if n == 1 || n.is_multiple_of(200) {
+        let coalesced = MAPPED_COALESCED.load(Ordering::Relaxed);
         tracing::info!(
-            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} flushes ({coalesced} coalesced), {:.1} ms, the longest {:.1} ms",
             MAPPED[1].load(Ordering::Relaxed) as f64 / 1000.0,
             MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0
         );
@@ -2577,11 +2593,19 @@ impl Step {
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
+#[allow(dead_code)]
+enum HeldStaging {
+    Upload(crate::pool::StagingPiece),
+    Shared(crate::pool::SharedStagingPiece),
+}
+
 #[derive(Default)]
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Pooled pieces backing [`HostList::upload`] until the list is reset.
+    staging_pieces: Vec<HeldStaging>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -3595,6 +3619,85 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether a draw that finds no free dynamic descriptor slot waits for the next
+/// landing without holding the submission lock (`VICTORY_DYNAMIC_WAIT=1`).
+fn dynamic_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line: draws that found no free dynamic descriptor
+/// slot; microseconds waited; those satisfied after a landing; those that fell
+/// back to `settle_for_fence`; and those that went without.
+static DYNAMIC_WAITS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Waits for flights to land when dynamic descriptor slots run out and retries
+/// `take`. With `VICTORY_DYNAMIC_WAIT=1` and the relay on, waits on
+/// `LINE_LANDED` without taking the submission lock; when off, returns `None`
+/// immediately without stalling.
+pub(crate) fn wait_for_slots<T>(mut take: impl FnMut() -> Option<T>) -> Option<T> {
+    if !dynamic_wait() {
+        return None;
+    }
+    let began = std::time::Instant::now();
+    DYNAMIC_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    let mut found = None;
+    if relay() {
+        let _waiting = crate::timeline::span("waiting for landings: dynamic descriptor slots");
+        loop {
+            let nothing = {
+                let line = line();
+                line.line.is_empty() && !line.settling
+            };
+            found = take();
+            if found.is_some() || nothing {
+                break;
+            }
+            let line = line();
+            drop(
+                LINE_LANDED
+                    .wait_timeout(line, std::time::Duration::from_millis(1))
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+        }
+    }
+    if found.is_some() {
+        DYNAMIC_WAITS[2].fetch_add(1, Ordering::Relaxed);
+    } else {
+        DYNAMIC_WAITS[3].fetch_add(1, Ordering::Relaxed);
+        settle_for_fence();
+        found = take();
+        if found.is_none() {
+            DYNAMIC_WAITS[4].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    DYNAMIC_WAITS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    found
+}
+
+/// For the frame-rate line: [`DYNAMIC_WAITS`] per frame, and the fewest dynamic
+/// slots a view heap had free since the last line.
+fn dynamic_wait_line(frames: f64) {
+    let w: Vec<f64> = DYNAMIC_WAITS.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let low = crate::descriptor::host::DYNAMIC_LOW[0].swap(u32::MAX, Ordering::Relaxed);
+    if low == u32::MAX && w[0] <= 0.0 {
+        return;
+    }
+    tracing::info!(
+        "dynamic descriptor slots: the fewest free since the last line {} of {}; per frame {:.2} draws found none and waited \
+         {:.1} ms, {:.2} had their slots after a landing, {:.2} settled everything in the air under the submission lock, \
+         {:.2} went without (VICTORY_DYNAMIC_WAIT=1 waits for the next landing without that lock: now {})",
+        if low == u32::MAX { 0 } else { low },
+        crate::descriptor::host::DYNAMIC_LOW[1].load(Ordering::Relaxed),
+        w[0],
+        w[1] / 1000.0,
+        w[2],
+        w[3],
+        w[4],
+        if dynamic_wait() && relay() { "on" } else { "off" }
+    );
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -4017,6 +4120,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    dynamic_wait_line(frames);
     crate::port::log(frames);
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
@@ -7433,10 +7537,17 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
     }
 
-    /// As [`HostList::defer_fill`], for the beginning of a buffer
+    /// As [`HostList::defer_fill`], for a range inside a buffer
     /// [`HostList::upload`] made.
-    pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
-        let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
+    pub(crate) fn defer_fill_buffer(
+        &self,
+        buffer: &ID3D12Resource,
+        offset: u64,
+        dst: *mut u8,
+        src: *const u8,
+        len: usize,
+    ) {
+        let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone(), offset));
         self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
     }
 
@@ -7507,16 +7618,35 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    /// A mapped upload buffer slice `(buffer, offset, data)` of `size` bytes,
+    /// 512-byte aligned and alive until the list is reset. Draws from the
+    /// 64 MiB shared/upload staging pool first to avoid per-copy committed
+    /// allocations and WDDM residency waits.
+    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
-        Some((buffer, data))
+        if card_steps::stage() > 1 {
+            if let Some((piece, buffer, offset, data)) = crate::pool::shared_staging(host, size) {
+                let mut deferred = self.deferred();
+                deferred.staging_pieces.push(HeldStaging::Shared(piece));
+                deferred.kept.push(buffer.clone().into());
+                return Some((buffer, offset, data));
+            }
+            let (buffer, data) = host.transient_shared_buffer(size)?;
+            name(&buffer, || format!("list upload {size:#x}"));
+            self.deferred().hold_upload(buffer.clone(), size);
+            Some((buffer, 0, data))
+        } else {
+            if let Some((piece, buffer, offset, data)) = crate::pool::staging(host, size) {
+                let mut deferred = self.deferred();
+                deferred.staging_pieces.push(HeldStaging::Upload(piece));
+                deferred.kept.push(buffer.clone().into());
+                return Some((buffer, offset, data));
+            }
+            let (buffer, data) = host.upload_buffer(size)?;
+            name(&buffer, || format!("list upload {size:#x}"));
+            self.deferred().hold_upload(buffer.clone(), size);
+            Some((buffer, 0, data))
+        }
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -9489,12 +9619,16 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         let create = |buffer: &mut Option<ID3D12Resource>, data: &mut *mut std::ffi::c_void| {
-            // SAFETY: plain creation and mapping of an upload buffer.
+            // SAFETY: plain creation and mapping of an upload buffer. Upload
+            // buffers are only referenced by commands recorded on unsubmitted
+            // lists (never placed into persistent bindless descriptor slots read
+            // by in-flight submissions), so WDDM guarantees residency before the
+            // list executes without synchronous `MakeResident`.
             unsafe {
                 self.device
                     .CreateCommittedResource(
                         &heap,
-                        not_resident(),
+                        D3D12_HEAP_FLAG_NONE,
                         &desc,
                         D3D12_RESOURCE_STATE_GENERIC_READ,
                         None,
@@ -9502,7 +9636,6 @@ impl Host {
                     )
                     .and_then(|()| {
                         let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                        resident(&self.device, b)?;
                         b.Map(0, None, Some(data))
                     })
             }
@@ -10556,6 +10689,78 @@ impl Host {
                     self.log_video_memory("after shared_buffer failure");
                     tracing::warn!(error = %e, size, failures = count, "no shared buffer");
                 }
+                None
+            }
+        }
+    }
+
+    /// A mapped L0 `WRITE_BACK` buffer (`COMMON` state, `ALLOW_UNORDERED_ACCESS`)
+    /// used strictly for transient list-local copies (`HostList::upload` and
+    /// `pool::shared_staging`, never placed into persistent bindless descriptor
+    /// slots read by already-in-flight submissions). Avoids synchronous
+    /// `MakeResident` and `mapped()` copy-queue fence stalls.
+    pub(crate) fn transient_shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        MADE[2].fetch_add(1, Ordering::Relaxed);
+        MADE[3].fetch_add(size, Ordering::Relaxed);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        let create = |buffer: &mut Option<ID3D12Resource>, data: &mut *mut std::ffi::c_void| {
+            // SAFETY: plain creation and mapping of a transient CPU-visible L0 buffer.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(data))
+                    })
+            }
+        };
+        let mut made = create(&mut buffer, &mut data);
+        if let Err(ref e) = made {
+            crate::residency::allocation_error(e);
+            self.emergency_reclaim_l0(false);
+            buffer = None;
+            data = std::ptr::null_mut();
+            made = create(&mut buffer, &mut data);
+        }
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::book::made(b, || "a transient shared buffer".into());
+        }
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                crate::residency::allocation_error(&e);
+                tracing::warn!(error = %e, size, "no transient shared buffer");
                 None
             }
         }

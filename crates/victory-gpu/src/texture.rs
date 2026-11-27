@@ -1016,12 +1016,14 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
     if bytes == 0 || bytes == u64::MAX {
         return;
     }
-    let Some((buffer, data)) = list.upload(host, bytes) else {
+    let Some((buffer, offset, data)) = list.upload(host, bytes) else {
         return;
     };
     // SAFETY: a mapped buffer of `bytes` bytes, just made.
     unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
     for (i, footprint) in footprints.iter().enumerate() {
+        let mut placed = *footprint;
+        placed.Offset += offset;
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -1032,7 +1034,7 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
             // SAFETY: as above; the list holds the buffer until it is reset.
             pResource: unsafe { std::mem::transmute_copy(&buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed },
         };
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
@@ -1082,12 +1084,13 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 host.device
                     .GetCopyableFootprints(&d, level, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
             }
-            let Some((buffer, data)) = list.upload(host, bytes) else {
+            let Some((buffer, offset, data)) = list.upload(host, bytes) else {
                 // (With the levels that share its tiles, if it is one of
                 // the small ones.)
                 unzeroed |= tiled.with_level(level);
                 continue;
             };
+            footprint.Offset += offset;
             // SAFETY: a mapped buffer of `bytes` bytes, just made.
             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             let to = D3D12_TEXTURE_COPY_LOCATION {
