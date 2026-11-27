@@ -495,6 +495,7 @@ struct Call {
     provider: Provider,
     context: usize,
     identity: usize,
+    completing: AtomicBool,
     cleaned: AtomicBool,
     done: Mutex<bool>,
     finished: Condvar,
@@ -600,6 +601,7 @@ pub fn XAsyncBegin(
         provider,
         context: context as usize,
         identity: identity as usize,
+        completing: AtomicBool::new(false),
         cleaned: AtomicBool::new(false),
         done: Mutex::new(false),
         finished: Condvar::new(),
@@ -675,11 +677,7 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
             routine(block);
         }
     }
-    if result == E_PENDING {
-        return;
-    }
-    let mut done = lock(&call.done);
-    if *done {
+    if result == E_PENDING || call.completing.swap(true, Ordering::AcqRel) {
         return;
     }
     // Read before publishing: once the status is set, the title may free
@@ -690,10 +688,12 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     let drop_call = result < 0 || required_size == 0;
     if drop_call {
         // Run cleanup before publishing status (while the title cannot free
-        // `block`), but keep the call filed in `CALLS` until status is stored
-        // so `XAsyncGetStatus(_, true)` cannot skip waiting and read `E_PENDING`.
+        // `block`) and without holding `call.done` or `CALLS`. `OP_CLEANUP`
+        // must not synchronously re-enter `XAsyncGetStatus(block, true)` for
+        // the same block, as its status is not published until cleanup ends.
         call.cleanup(block);
     }
+    let mut done = lock(&call.done);
     size.store(required_size, Ordering::Release);
     status.store(result as u32 as usize, Ordering::Release);
     if drop_call {
@@ -743,7 +743,7 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 /// provider completed it first. A completed call is left alone.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
-        if *lock(&call.done) {
+        if call.completing.load(Ordering::Acquire) {
             return;
         }
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
