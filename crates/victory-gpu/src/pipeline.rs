@@ -456,6 +456,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Compute shader skipped at runtime via `VICTORY_SKIP_COMPUTE_NAMES`.
+    #[cfg(windows)]
+    skip_compute: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -484,14 +487,51 @@ pub(crate) fn bound(this: This) {
 }
 
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
-/// not translate, the host refuses it, or it is still being made (its first
+/// not translate, the host refuses it, it is skipped via
+/// `VICTORY_SKIP_COMPUTE_NAMES`, or it is still being made (its first
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    if p.skip_compute {
+        return None;
+    }
+    make::ready(&p.host)
+}
+
+/// Comma-separated compute shader name substrings (`VICTORY_SKIP_COMPUTE_NAMES`),
+/// e.g. `CS_RaytracingResolve,CS_RTDistantShadow` when ray tracing is off.
+#[cfg(any(windows, test))]
+fn parse_skip_compute_names(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+fn match_skip_compute_name<'a>(container: &[u8], patterns: &'a [String]) -> Option<&'a str> {
+    patterns
+        .iter()
+        .find(|pat| {
+            let bytes = pat.as_bytes();
+            !bytes.is_empty() && container.windows(bytes.len()).any(|w| w == bytes)
+        })
+        .map(String::as_str)
+}
+
+#[cfg(windows)]
+fn skipped_compute_name(container: &[u8]) -> Option<&'static str> {
+    static PATTERNS: OnceLock<Vec<String>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        parse_skip_compute_names(&std::env::var("VICTORY_SKIP_COMPUTE_NAMES").unwrap_or_default())
+    });
+    match_skip_compute_name(container, patterns)
 }
 
 /// Host pipelines queued and not made yet.
@@ -544,7 +584,10 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    !this.is_null() && {
+        let p = pipeline(this);
+        p.skip_compute || skipped_shader(p).is_some()
+    }
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -555,9 +598,13 @@ pub(crate) fn note_drop(this: This) {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
-        skipped_shader(p)
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+        if p.skip_compute {
+            Some("skipped compute name (VICTORY_SKIP_COMPUTE_NAMES)".to_owned())
+        } else {
+            skipped_shader(p)
+                .map(|hash| format!("skipped shader {hash}"))
+                .or_else(|| make::missing(&p.host))
+        }
     };
     if let Some(why) = why {
         note_why(why);
@@ -602,11 +649,30 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
+    let skip_compute = shaders.iter().any(|shader| {
+        if shader.stage == "compute"
+            && let Some(pattern) = skipped_compute_name(&shader.container)
+        {
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+                tracing::info!(
+                    hash = %shader.hash,
+                    pattern,
+                    "compute pipeline skipped by VICTORY_SKIP_COMPUTE_NAMES"
+                );
+            }
+            true
+        } else {
+            false
+        }
+    });
+    #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    known::note(host.key(), &shaders, host.graphics.as_deref());
-    #[cfg(windows)]
-    make::early(&host);
+    if !skip_compute {
+        known::note(host.key(), &shaders, host.graphics.as_deref());
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -623,6 +689,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        skip_compute,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -861,6 +929,21 @@ mod tests {
         builder.pipelines.push(Arc::new(make::Pending::new(Vec::new(), None)));
         builder.whole = false;
         assert!(!builder.whole_at(12));
+    }
+
+    #[test]
+    fn parse_skip_compute_names_splits_and_matches() {
+        let patterns = parse_skip_compute_names(" CS_RaytracingResolve , , CS_RTDistantShadow ");
+        assert_eq!(patterns, ["CS_RaytracingResolve", "CS_RTDistantShadow"]);
+        assert_eq!(
+            match_skip_compute_name(b"\x00foo_CS_RaytracingResolve_bar\x00", &patterns),
+            Some("CS_RaytracingResolve")
+        );
+        assert_eq!(
+            match_skip_compute_name(b"CS_RTDistantShadow_Pass0", &patterns),
+            Some("CS_RTDistantShadow")
+        );
+        assert_eq!(match_skip_compute_name(b"CS_OtherShader", &patterns), None);
     }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {

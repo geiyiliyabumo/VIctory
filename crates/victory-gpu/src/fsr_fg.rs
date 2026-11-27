@@ -2,6 +2,7 @@
 //! Enable with VICTORY_FSR_FRAMEGEN=1. The signed runtime DLLs are loaded
 //! from VICTORY_FIDELITYFX_DIR or the executable's fidelityfx directory.
 
+use std::collections::VecDeque;
 use std::ffi::{CStr, OsString, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -54,20 +55,36 @@ struct Inputs {
     camera: Camera,
 }
 
-struct Latest<T>(Option<(Instant, T)>);
+/// Bounded FIFO of recent upscaler dispatches so async submission pipelining
+/// (recording frame N+1 before frame N presents) never drops frame N's inputs
+/// and causes frame generation to toggle off between presents.
+struct Latest<T>(VecDeque<(Instant, T)>);
 
 impl<T> Latest<T> {
+    const MAX_QUEUED: usize = 4;
+
+    const fn new() -> Self {
+        Self(VecDeque::new())
+    }
+
     fn note(&mut self, now: Instant, inputs: T) {
-        self.0 = Some((now, inputs));
+        if self.0.len() >= Self::MAX_QUEUED {
+            self.0.pop_front();
+        }
+        self.0.push_back((now, inputs));
     }
 
     fn take(&mut self, now: Instant) -> Option<T> {
-        let (noted, inputs) = self.0.take()?;
-        (now.duration_since(noted) < Duration::from_millis(2000)).then_some(inputs)
+        while let Some((noted, inputs)) = self.0.pop_front() {
+            if now.duration_since(noted) < Duration::from_millis(2000) {
+                return Some(inputs);
+            }
+        }
+        None
     }
 }
 
-static INPUTS: Mutex<Latest<Inputs>> = Mutex::new(Latest(None));
+static INPUTS: Mutex<Latest<Inputs>> = Mutex::new(Latest::new());
 
 /// Saves the most recent successful upscaler dispatch for the next present.
 pub fn note_upscale(
@@ -1222,13 +1239,25 @@ mod tests {
 
     #[test]
     fn latest_upscale_is_consumed_once_and_expires() {
-        let mut latest = Latest(None);
+        let mut latest = Latest::new();
         let now = Instant::now();
         assert_eq!(latest.take(now), None);
+        // Pipelined recording (N then N+1 before N presents) preserves FIFO order.
         latest.note(now, 1);
         latest.note(now, 2);
+        assert_eq!(latest.take(now + Duration::from_millis(1999)), Some(1));
         assert_eq!(latest.take(now + Duration::from_millis(1999)), Some(2));
         assert_eq!(latest.take(now), None);
+        // Bounded to MAX_QUEUED (oldest dropped when exceeded).
+        for v in 10..16 {
+            latest.note(now, v);
+        }
+        assert_eq!(latest.take(now), Some(12));
+        assert_eq!(latest.take(now), Some(13));
+        assert_eq!(latest.take(now), Some(14));
+        assert_eq!(latest.take(now), Some(15));
+        assert_eq!(latest.take(now), None);
+        // Expired entries are skipped cleanly.
         latest.note(now, 3);
         assert_eq!(latest.take(now + Duration::from_millis(2000)), None);
         assert_eq!(latest.take(now), None);
