@@ -1933,6 +1933,8 @@ mod tests {
         assert!(without_skips(&program(ENTRY, RESTORE, &[0x7E04_0206]), true).is_none());
         // read after EXEC changed again (s_mov_b64 exec, s[40:41]): kept
         assert!(without_skips(&program(ENTRY, RESTORE, &[0xBEFE_0428, LOAD, LOAD1]), true).is_none());
+        // the join sets EXEC from no register (s_mov_b64 exec, -1), not from the saved mask: kept
+        assert!(without_skips(&program(ENTRY, 0xBEFE_04C1, &[LOAD, LOAD1]), true).is_none());
     }
 
     #[test]
