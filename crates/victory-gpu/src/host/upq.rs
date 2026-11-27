@@ -120,6 +120,21 @@ fn make_slot(device: &ID3D12Device) -> Option<Slot> {
     }
 }
 
+/// Use the smallest idle buffer that fits, leaving larger ones for larger
+/// submissions. If none fits, grow the largest idle buffer (Belobug PR #560).
+fn idle_slot(needed: u64, capacities: impl Iterator<Item = u64>) -> Option<usize> {
+    capacities
+        .enumerate()
+        .min_by_key(|&(_, capacity)| {
+            if capacity >= needed {
+                (false, capacity)
+            } else {
+                (true, needed - capacity)
+            }
+        })
+        .map(|(index, _)| index)
+}
+
 /// One range: the card side, its offset, the CPU side, the bytes.
 pub(super) type Range<'a> = (&'a ID3D12Resource, u64, &'a ID3D12Resource, u64);
 
@@ -149,7 +164,11 @@ pub(super) unsafe fn send(
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
-    let Some(mut slot) = q.free.pop().or_else(|| make_slot(&host.device)) else {
+    let idle = idle_slot(total, q.free.iter().map(|slot| slot.bounce.as_ref().map_or(0, |b| b.1)));
+    let Some(mut slot) = idle
+        .map(|index| q.free.swap_remove(index))
+        .or_else(|| make_slot(&host.device))
+    else {
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
@@ -226,5 +245,18 @@ pub(super) fn line(frames: f64) {
              {copies:.0} ranges, {:.1} MB; {before:.1} submissions sent up on the drawing queue (too big, or nothing to send with)",
             bytes / 1048576.0
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::idle_slot;
+
+    #[test]
+    fn idle_slot_picks_smallest_fit_or_largest_underfit() {
+        assert_eq!(idle_slot(1024, [].into_iter()), None);
+        assert_eq!(idle_slot(2048, [4096, 2048, 8192].into_iter()), Some(1));
+        assert_eq!(idle_slot(3000, [1024, 8192, 4096].into_iter()), Some(2));
+        assert_eq!(idle_slot(16384, [1024, 8192, 4096].into_iter()), Some(1));
     }
 }

@@ -166,7 +166,7 @@ static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-const BACKS_MOST: usize = 128;
+const BACKS_MOST: usize = 256;
 
 pub(crate) fn trim_backs(keep: usize) {
     let gone: Vec<usize> = {

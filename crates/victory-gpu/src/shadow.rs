@@ -190,7 +190,7 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= NINE_GIB_MB {
-        (8, 640)
+        (4, 704)
     } else if budget_mb <= TWELVE_GIB_MB {
         (16, 512)
     } else if budget_mb < TWENTY_GIB_MB {
@@ -1568,8 +1568,10 @@ fn workers() -> &'static Workers {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                let mut priority = crate::cores::Priority::new();
                 let workers = WORKERS.get().expect("made above");
                 loop {
+                    priority.keep();
                     let job = {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
@@ -3066,8 +3068,8 @@ fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
         };
     }
     let pct = (u128::from(used) * 100) / u128::from(budget);
-    if emergency || pct >= 90 {
-        let goal = (u128::from(budget) * 66 / 100) as u64;
+    if emergency || pct >= 93 {
+        let goal = (u128::from(budget) * 74 / 100) as u64;
         L0ReclaimPlan {
             target_bytes: used.saturating_sub(goal).max(512 * MIB),
             idle_ms: if emergency { 1_000 } else { 2_000 },
@@ -3075,20 +3077,20 @@ fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
             unmapped_cap_bytes: u64::MAX,
             immediate_drop: true,
         }
-    } else if pct >= 84 {
-        let goal = (u128::from(budget) * 70 / 100) as u64;
+    } else if pct >= 88 {
+        let goal = (u128::from(budget) * 78 / 100) as u64;
         L0ReclaimPlan {
-            target_bytes: used.saturating_sub(goal),
-            idle_ms: 5_000,
+            target_bytes: used.saturating_sub(goal).min(384 * MIB),
+            idle_ms: 6_000,
             idle_frames: 2,
             unmapped_cap_bytes: u64::MAX,
             immediate_drop: false,
         }
-    } else if pct >= 72 {
-        let goal = (u128::from(budget) * 66 / 100) as u64;
+    } else if pct >= 82 {
+        let goal = (u128::from(budget) * 78 / 100) as u64;
         L0ReclaimPlan {
-            target_bytes: used.saturating_sub(goal).min(256 * MIB),
-            idle_ms: 12_000,
+            target_bytes: used.saturating_sub(goal).min(128 * MIB),
+            idle_ms: 15_000,
             idle_frames: 2,
             unmapped_cap_bytes: u64::MAX,
             immediate_drop: false,
@@ -3096,7 +3098,7 @@ fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
     } else if pct >= 50 {
         L0ReclaimPlan {
             target_bytes: 0,
-            idle_ms: 12_000,
+            idle_ms: 15_000,
             idle_frames: 2,
             unmapped_cap_bytes: 256 * MIB,
             immediate_drop: false,
@@ -3104,7 +3106,7 @@ fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
     } else {
         L0ReclaimPlan {
             target_bytes: 0,
-            idle_ms: 12_000,
+            idle_ms: 15_000,
             idle_frames: 2,
             unmapped_cap_bytes: 0,
             immediate_drop: false,
@@ -6160,46 +6162,46 @@ mod window_tests {
             l0_reclaim_plan(Some([budget, 0, budget, 3900 * MIB]), false),
             L0ReclaimPlan {
                 target_bytes: 0,
-                idle_ms: 12_000,
+                idle_ms: 15_000,
                 idle_frames: 2,
                 unmapped_cap_bytes: 0,
                 immediate_drop: false,
             }
         );
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 5600 * MIB]), false),
+            l0_reclaim_plan(Some([budget, 0, budget, 6400 * MIB]), false),
             L0ReclaimPlan {
                 target_bytes: 0,
-                idle_ms: 12_000,
+                idle_ms: 15_000,
                 idle_frames: 2,
                 unmapped_cap_bytes: 256 * MIB,
                 immediate_drop: false,
             }
         );
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 6000 * MIB]), false),
+            l0_reclaim_plan(Some([budget, 0, budget, 6600 * MIB]), false),
             L0ReclaimPlan {
-                target_bytes: 256 * MIB,
-                idle_ms: 12_000,
+                target_bytes: 128 * MIB,
+                idle_ms: 15_000,
                 idle_frames: 2,
                 unmapped_cap_bytes: u64::MAX,
                 immediate_drop: false,
             }
         );
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 6800 * MIB]), false),
+            l0_reclaim_plan(Some([budget, 0, budget, 7100 * MIB]), false),
             L0ReclaimPlan {
-                target_bytes: 1200 * MIB,
-                idle_ms: 5_000,
+                target_bytes: 384 * MIB,
+                idle_ms: 6_000,
                 idle_frames: 2,
                 unmapped_cap_bytes: u64::MAX,
                 immediate_drop: false,
             }
         );
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 7280 * MIB]), false),
+            l0_reclaim_plan(Some([budget, 0, budget, 7480 * MIB]), false),
             L0ReclaimPlan {
-                target_bytes: 2000 * MIB,
+                target_bytes: 1560 * MIB,
                 idle_ms: 2_000,
                 idle_frames: 1,
                 unmapped_cap_bytes: u64::MAX,
@@ -6207,9 +6209,9 @@ mod window_tests {
             }
         );
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 7280 * MIB]), true),
+            l0_reclaim_plan(Some([budget, 0, budget, 7480 * MIB]), true),
             L0ReclaimPlan {
-                target_bytes: 2000 * MIB,
+                target_bytes: 1560 * MIB,
                 idle_ms: 1_000,
                 idle_frames: 1,
                 unmapped_cap_bytes: u64::MAX,
@@ -6244,11 +6246,11 @@ mod window_tests {
         const MIB: u64 = 1 << 20;
 
         // Unknown (WARP / query failure) and >9..=12 GiB keep the 12 GB baseline;
-        // <= 9 GiB (8 GB cards) admit >= 8 MiB buffers up to 640 MiB.
+        // <= 9 GiB (8 GB cards) admit >= 4 MiB buffers up to 704 MiB.
         assert_eq!(default_card_limits_mb(None), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(7 * GIB)), (8, 640));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (8, 640));
-        assert_eq!(default_card_limits_mb(Some(9 * GIB)), (8, 640));
+        assert_eq!(default_card_limits_mb(Some(7 * GIB)), (4, 704));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (4, 704));
+        assert_eq!(default_card_limits_mb(Some(9 * GIB)), (4, 704));
         assert_eq!(default_card_limits_mb(Some(10 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));

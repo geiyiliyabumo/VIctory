@@ -124,7 +124,13 @@ impl Made {
     }
 }
 
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// Identity of this host heap instance, checked by [`release_if`] so a
+    /// stale list resetting after a title heap was replaced at the same
+    /// address never frees slots belonging to the new heap.
+    id: u64,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1776,6 +1782,7 @@ impl HostHeap {
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -2998,6 +3005,19 @@ impl HostHeap {
         // `bury_lag()` once `references(&s.buffer) == 1`).
         drop(old);
         true
+    }
+
+    /// Identity of this host heap instance (see [`release_if`]).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Gives back `n` dynamic slots from `first` only if `id` matches this
+    /// host heap instance.
+    pub(crate) fn release_if(&self, id: u64, first: u32, n: u32) {
+        if id == self.id {
+            self.release(first, n);
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -5725,6 +5745,13 @@ mod tests {
         // (which would falsely call `touch_active()` on the next heap pass).
         assert_eq!(heap.buffer_changes(), Vec::<u32>::new());
         assert_eq!(heap.take_rescan_buffers(), vec![2]);
+        // Dynamic slot release ignores mismatched host heap IDs.
+        let slot = heap.dynamic(1).unwrap();
+        let free_before = heap.free.load(std::sync::atomic::Ordering::Relaxed);
+        heap.release_if(heap.id().wrapping_add(1), slot, 1);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free_before);
+        heap.release_if(heap.id(), slot, 1);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free_before + 1);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.

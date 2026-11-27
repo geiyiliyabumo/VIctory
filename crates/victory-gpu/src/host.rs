@@ -604,7 +604,7 @@ static EMERGENCY_L0_SWEEP: std::sync::atomic::AtomicBool =
 fn sweep_interval(video_memory: Option<[u64; 4]>, normal_ms: u64) -> u64 {
     if video_memory.is_some_and(|[budget, used, shared_budget, shared_used]| {
         (budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90)
-            || (shared_budget > 0 && u128::from(shared_used) * 100 >= u128::from(shared_budget) * 80)
+            || (shared_budget > 0 && u128::from(shared_used) * 100 >= u128::from(shared_budget) * 85)
     }) {
         PRESSURE_SWEEP_MS
     } else {
@@ -673,23 +673,25 @@ fn sweep() {
     let l0_pct = shared_l0_percent(vm);
     let critical_commit = crate::residency::critical_commit();
     // Avoid nuking working command-allocator pools on routine `avail_phys <= 3 GiB`
-    // (16 GB hosts hit that every sweep and otherwise recreate 100-220 allocators
-    // per frame, churning GBs of WDDM L0 memory). Only trim aggressively when OS
-    // commit or WDDM L0 shared memory is actually tight.
-    if critical_commit || emergency || l0_pct >= 90 {
+    // (16 GB hosts hit that every sweep and otherwise recreate 65-220 allocators
+    // per frame, churning GBs of WDDM L0 memory). Keep floors above a full ~220-list
+    // gameplay frame unless OS commit or WDDM L0 shared memory is actually critical.
+    if critical_commit || emergency || l0_pct >= 92 {
         trim_spare_chunks();
         send::trim();
         card_steps::trim();
         crate::list::trim_idle(64);
         crate::list::thin::trim_backs(32);
-    } else if l0_pct >= 80 {
+    } else if l0_pct >= 85 {
         trim_spare_chunks();
         send::trim();
         card_steps::trim();
+        crate::list::trim_idle(256);
+        crate::list::thin::trim_backs(192);
     } else if host_pressure {
         card_steps::trim();
-        crate::list::trim_idle(192);
-        crate::list::thin::trim_backs(96);
+        crate::list::trim_idle(320);
+        crate::list::thin::trim_backs(224);
     }
     crate::pool::room(vm, host_pressure);
     crate::pipeline::trim_library();
@@ -6800,7 +6802,7 @@ impl HostList {
     }
 
     pub(crate) fn should_retire(&self) -> bool {
-        self.resets.load(Ordering::Relaxed) >= 512
+        self.resets.load(Ordering::Relaxed) >= 1024
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -11822,9 +11824,9 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         for (normal_ms, expected) in [(super::SWEEP_MS, 1_000), (super::SETTLE_SWEEP_MS, 1_500)] {
             assert_eq!(sweep_interval(None, normal_ms), expected);
             assert_eq!(sweep_interval(Some([0, 100, 0, 0]), normal_ms), expected);
-            assert_eq!(sweep_interval(Some([100, 89, 100, 79]), normal_ms), expected);
+            assert_eq!(sweep_interval(Some([100, 89, 100, 84]), normal_ms), expected);
             assert_eq!(sweep_interval(Some([100, 90, 100, 10]), normal_ms), 800);
-            assert_eq!(sweep_interval(Some([100, 50, 100, 80]), normal_ms), 800);
+            assert_eq!(sweep_interval(Some([100, 50, 100, 85]), normal_ms), 800);
         }
     }
 

@@ -328,6 +328,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
+    list.keep(from);
+    list.keep(to);
     list.keep(&through.buffer);
     // A draw that also writes the source (a view of it handled before
     // this one) needs it in that state again; the next read of the alias

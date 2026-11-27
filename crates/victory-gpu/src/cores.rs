@@ -93,6 +93,53 @@ fn l3_of_sets() -> Vec<(u32, u32)> {
     sizes
 }
 
+/// Whether the threads the submitting thread waits for run at its priority
+/// (`VICTORY_HELPER_PRIORITY`, on unless `0`): above normal, ahead of the
+/// title's threads and of the threads that translate lists. On 6-core /
+/// 12-thread CPUs this prevents translating/title threads from preempting the
+/// helpers the submitting thread blocks on.
+fn helpers_raised() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HELPER_PRIORITY") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_PRIORITY").is_none_or(|v| v != "0"))
+}
+
+/// A helper thread's priority ([`helpers_raised`]). [`Self::keep`] is called
+/// before each piece of work and only calls the OS when the setting changes.
+pub(crate) struct Priority {
+    applied: Option<bool>,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        let mut priority = Self { applied: None };
+        priority.keep();
+        priority
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            THREAD_PRIORITY_NORMAL,
+        };
+        let on = helpers_raised();
+        if self.applied == Some(on) {
+            return;
+        }
+        let priority = if on {
+            THREAD_PRIORITY_ABOVE_NORMAL
+        } else {
+            THREAD_PRIORITY_NORMAL
+        };
+        // SAFETY: adjusts only this thread's own scheduling priority.
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+        self.applied = Some(on);
+    }
+}
+
 /// Whether the cores of the largest last-level cache count as the fast
 /// ones where all cores are of one class (`VICTORY_CACHE_CORES=0`: not).
 /// On a processor with two core complexes of which one has the stacked cache
