@@ -406,6 +406,41 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
     }
 }
 
+/// A MUBUF access `op` (bit 7 is the first word's bit 25) of `vdata`
+/// through the buffer at `srsrc`, at byte 0.
+const fn mubuf(op: u16, vdata: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | (op as u32 >> 7 & 1) << 25 | (op as u32 & 0x7F) << 18,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
+/// A d16 load of a typed view in a table (root type `Table`, not one picked
+/// from the heap) asks the host's word for the view's format kind, whether
+/// an integer one: the face network's views of halves are in tables, and
+/// were read as f16 (`docs/findings.md`, 2026-11-25). Only that check reads
+/// the word here, so the strides root view is bound for it and for nothing
+/// else: the same view loaded without d16, or by a tbuffer load (whose
+/// format is its own), does not bind it.
+#[test]
+fn a_tables_typed_d16_view_asks_whether_it_is_an_integer_one() {
+    use super::SLOT_STRIDES;
+    let load = |op| {
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        body.extend(mubuf(op, 0, 8));
+        build_valu_cs(&body)
+    };
+    let strides = |shader: &HostShader| shader.root_srvs.contains(&SLOT_STRIDES);
+    // buffer_load_format_d16_xy and buffer_load_format_xy v0, s[8:11].
+    let shader = load(0x081);
+    assert!(strides(&shader), "a d16 load of a table's view reads its kind: {:?}", shader.root_srvs);
+    let shader = load(0x001);
+    assert!(!strides(&shader), "a 32-bit load has no kind to ask: {:?}", shader.root_srvs);
+    // tbuffer_load_format_d16_xy, 16_16_UINT.
+    let shader = tbuffer_load_of_v1(9, 27);
+    assert!(!strides(&shader), "a tbuffer load has its format: {:?}", shader.root_srvs);
+}
+
 #[test]
 fn normalized_buffer_formats_load_their_ends_exactly() {
     // tbuffer_load_format_x.
