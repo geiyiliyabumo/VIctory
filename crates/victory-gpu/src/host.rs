@@ -3611,6 +3611,19 @@ pub(crate) fn settle_now(why: usize) {
     host.settle(&mut submitted, why);
 }
 
+/// A bake publishes directly into the shared view heap. Keep already
+/// submitted lists from seeing its descriptors before the bake uploads.
+pub(crate) fn with_bake_source_publication(publish: impl FnOnce() -> bool) -> bool {
+    let Some(host) = host() else {
+        return false;
+    };
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    if flying() {
+        host.settle(&mut submitted, WHY_SYNC);
+    }
+    publish()
+}
+
 /// [`settle_now`] at a present, and for a fence the title blocks on.
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
@@ -8771,8 +8784,9 @@ fn wide_fills() -> bool {
 }
 
 /// Whether a submission's textures are brought up to date on several
-/// threads (`VICTORY_WIDE_TEXTURES=0`: one after the other, where the lists
-/// name them, as before).
+/// threads. `VICTORY_PARALLEL_REFRESH=1` enables it independently of wide
+/// buffer refreshes, `0` disables it, and `alt` alternates every 20 seconds.
+/// Without that override, `VICTORY_WIDE_TEXTURES` keeps its existing default.
 ///
 /// They are read, hashed and, if they changed, detiled into their staging
 /// buffers: 5 ms a frame of the submitting thread, for some 16 MB. Each has
@@ -8784,8 +8798,33 @@ fn wide_fills() -> bool {
 /// an earlier list of the submission asked for, not behind it. The texture
 /// is then uploaded by a later list too, once more than needed.
 fn wide_textures() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
+    static MODE: OnceLock<TextureRefresh> = OnceLock::new();
+    let mode = MODE.get_or_init(|| match std::env::var("VICTORY_PARALLEL_REFRESH").as_deref() {
+        Ok("0") => TextureRefresh::Serial,
+        Ok("1") => TextureRefresh::Parallel,
+        Ok("alt") => TextureRefresh::Alternate(std::time::Instant::now()),
+        _ if std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh() =>
+            TextureRefresh::Parallel,
+        _ => TextureRefresh::Serial,
+    });
+    match mode {
+        TextureRefresh::Serial => false,
+        TextureRefresh::Parallel => true,
+        TextureRefresh::Alternate(started) => {
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            let parallel = (started.elapsed().as_secs() / 20) % 2 == 1;
+            if LAST.swap(u8::from(parallel), Ordering::Relaxed) != u8::from(parallel) {
+                tracing::info!(parallel, "VICTORY_PARALLEL_REFRESH=alt switched texture refresh mode");
+            }
+            parallel
+        }
+    }
+}
+
+enum TextureRefresh {
+    Serial,
+    Parallel,
+    Alternate(std::time::Instant),
 }
 
 impl Batch {
@@ -9931,7 +9970,7 @@ impl Meter {
                          as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                          {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
                          {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
-                         {} made slots found unmapped and made null",
+                         {} made slots found unmapped and made null; {} re-read out of queue (VICTORY_TABLED_REREAD={})",
                         crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                         crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
                         crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
@@ -9939,7 +9978,9 @@ impl Meter {
                         crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
                         crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                         crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
-                        crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                        crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                        crate::descriptor::host::TABLED_WRITES[2].load(Ordering::Relaxed),
+                        u8::from(crate::descriptor::host::tabled_reread())
                     );
                 }
                 tracing::info!(

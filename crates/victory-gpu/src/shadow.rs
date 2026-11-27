@@ -53,6 +53,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free mirror of `!pending.is_empty()` to skip mutex acquisitions on
+    /// read-only shadows inside `writes_pending` and `nothing_new`.
+    pending_nonempty: std::sync::atomic::AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -3228,7 +3231,7 @@ impl EvictableLooseWindows {
     }
 
     /// With no action, checks membership without locking `LOOSE`.
-    /// With an action, rechecks under `LOOSE.read()` that the window is still
+    /// With an action, rechecks under `LOOSE.write()` that the window is still
     /// idle, has no in-flight GPU writes, and is not held by any command list
     /// or buffer sweep (`Arc::strong_count == 1`), then invokes `unpin`.
     pub(crate) fn with_idle_window(
@@ -3241,11 +3244,11 @@ impl EvictableLooseWindows {
         let Some(unpin) = unpin else {
             return Some(entry.span);
         };
-        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let shadow = map.get(&entry.key)?;
         if shadow.buffer.as_raw() as usize != raw
             || Arc::strong_count(shadow) != 1
-            || !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || shadow.writes_pending()
             || (!entry.unmapped
                 && !crate::host::long_ago(
                     shadow.active.load(Ordering::Relaxed),
@@ -3253,6 +3256,11 @@ impl EvictableLooseWindows {
                     entry.idle_frames,
                 ))
         {
+            return None;
+        }
+        // Stop cached handouts before checking whether another caller holds it.
+        BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        if Arc::strong_count(shadow) != 1 {
             return None;
         }
         unpin();
@@ -3394,17 +3402,22 @@ pub(crate) fn evictable_loose_windows(
 /// self-deadlocks.
 pub(crate) fn let_go_unheld_emergency() -> usize {
     let mut gone = Vec::new();
+    let unheld = |s: &Arc<Shadow>| {
+        Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1 && !s.writes_pending()
+    };
     if let Ok(mut map) = LOOSE.try_write() {
         let keys: Vec<(u64, u64)> = map
             .iter()
-            .filter_map(|(&key, s)| {
-                let unheld = Arc::strong_count(s) == 1
-                    && crate::host::references(&s.buffer) == 1
-                    && s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-                unheld.then_some(key)
-            })
+            .filter_map(|(&key, s)| unheld(s).then_some(key))
             .collect();
-        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        if !keys.is_empty() {
+            BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+            for key in keys {
+                if map.get(&key).is_some_and(unheld) {
+                    gone.extend(map.remove(&key));
+                }
+            }
+        }
     }
     if let Ok(mut guard) = EXACT.try_lock() {
         let keys: Vec<(u64, u64)> = guard
@@ -3475,29 +3488,28 @@ pub(crate) fn let_go_idle(targets: &EvictableLooseWindows, vm: Option<[u64; 4]>)
     let mut targeted_count = 0usize;
     let mut targeted_bytes = 0u64;
     let (immediate_gone, retired_gone): (Vec<Arc<Shadow>>, Vec<Arc<Shadow>>) = {
-        // Held from the look to the removal: `loose` hands a copy out
-        // under the same lock, so none is handed out in between.
+        // Exclude map readers from the look to the removal. Cached readers
+        // are excluded by the generation change before rechecking victims.
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
             return;
         }
+        let unheld = |s: &Arc<Shadow>| Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1;
+        let reclaim_ready = |s: &Shadow, entry: &EvictableWindow| {
+            !s.writes_pending()
+                && (entry.unmapped
+                    || crate::host::long_ago(s.active.load(Ordering::Relaxed), entry.idle_ms, entry.idle_frames))
+        };
         let mut targeted = Vec::new();
         let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = Vec::new();
         for (&key, s) in map.iter() {
-            let unheld = Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1;
-            if !unheld {
+            if !unheld(s) {
                 continue;
             }
             if let Some(entry) = targets.by_key.get(&key)
-                && s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-                && (entry.unmapped
-                    || crate::host::long_ago(
-                        s.active.load(Ordering::Relaxed),
-                        entry.idle_ms,
-                        entry.idle_frames,
-                    ))
+                && reclaim_ready(s, entry)
             {
-                targeted.push((key, entry.immediate_drop));
+                targeted.push((key, entry));
                 continue;
             }
             let used = s.used.load(Ordering::Relaxed);
@@ -3508,11 +3520,17 @@ pub(crate) fn let_go_idle(targets: &EvictableLooseWindows, vm: Option<[u64; 4]>)
         let mut immediate = Vec::new();
         let mut retired = Vec::new();
         let can_drop_now = !crate::host::is_flying();
-        for (key, immediate_drop) in targeted {
+        if !targeted.is_empty() || !eligible.is_empty() {
+            BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        }
+        for (key, entry) in targeted {
+            if !map.get(&key).is_some_and(|s| unheld(s) && reclaim_ready(s, entry)) {
+                continue;
+            }
             if let Some(shadow) = map.remove(&key) {
                 targeted_count += 1;
                 targeted_bytes = targeted_bytes.saturating_add(shadow.len);
-                if immediate_drop && can_drop_now {
+                if entry.immediate_drop && can_drop_now {
                     immediate.push(shadow);
                 } else {
                     retired.push(shadow);
@@ -3529,7 +3547,14 @@ pub(crate) fn let_go_idle(targets: &EvictableLooseWindows, vm: Option<[u64; 4]>)
                 .collect();
             window_victims(&entries, keep)
         };
-        retired.extend(victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)));
+        for i in victims {
+            let key = eligible[i].1;
+            if map.get(&key).is_some_and(|s| {
+                unheld(s) && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+            }) {
+                retired.extend(map.remove(&key));
+            }
+        }
         (immediate, retired)
     };
     if targeted_count > 0 {
@@ -3713,6 +3738,7 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            pending_nonempty: std::sync::atomic::AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3792,6 +3818,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.pending_nonempty.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3816,6 +3843,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.pending_nonempty.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -4105,6 +4133,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.pending_nonempty.store(!pending.is_empty(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -4162,13 +4191,14 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.pending_nonempty.load(Ordering::Acquire)
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        self.pending_nonempty.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -4522,7 +4552,7 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.writes_pending_in(from, to) {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -5504,6 +5534,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.pending_nonempty.store(true, Ordering::Release);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };
@@ -5577,21 +5608,19 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     map
 }
 
-/// How often [`BUFFERS`] was taken to be changed.
+/// Generation of the lookup maps ([`BUFFERS`] and [`LOOSE`]).
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 
 /// Answers a thread remembers.
 const FOUND_MOST: usize = 1024;
 
-/// An ask (address, bytes), the count of changes it was answered at, and the
+/// An ask (address, bytes, any), the count of changes it was answered at, and the
 /// answer.
-type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
+type Found = (u64, u64, bool, u64, std::sync::Weak<Shadow>);
 
 thread_local! {
-    /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
-    /// ask: the same buffers are asked about draw after draw, from five
-    /// threads, each time through the map's lock and a dozen of its nodes
-    /// (7 % of the recording threads' time, profile waits-1).
+    /// The last answers of [`lookup`] out of [`BUFFERS`] and [`LOOSE`], by a hash of the
+    /// ask: the same buffers and windows are asked about draw after draw across recording threads.
     static FOUND: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -5600,33 +5629,40 @@ fn quick_find() -> bool {
     crate::toggled!("VICTORY_QUICK_FIND")
 }
 
-fn found_at(address: u64, len: u64) -> usize {
-    let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+fn found_at(address: u64, len: u64, any: bool) -> usize {
+    let h = (address ^ len.rotate_left(32) ^ u64::from(any)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     (h >> 54) as usize % FOUND_MOST
 }
 
 /// What this thread remembers of an ask, if nothing changed since.
-fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
+fn found(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
     let shadow = FOUND.with(|f| {
         let f = f.borrow();
-        let (a, n, at, shadow) = f.get(found_at(address, len))?;
-        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+        let (a, n, kind, at, shadow) = f.get(found_at(address, len, any))?;
+        ((*a, *n, *kind, *at) == (address, len, any, changed)).then(|| shadow.upgrade()).flatten()
     })?;
-    // Whoever takes the map to let a copy go that nobody holds finds it held
+    // Whoever takes a map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    if BUFFERS_CHANGED.load(Ordering::SeqCst) != changed {
+        return None;
+    }
+    if shadow.window {
+        let now = crate::host::moment();
+        note_window_ask(&shadow, now, address, address.saturating_add(len.max(1)), len <= 1);
+    }
+    Some(shadow)
 }
 
 /// Remembers an answer given while `changed` was the count.
-fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
+fn remember(address: u64, len: u64, any: bool, changed: u64, shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+            f.resize_with(FOUND_MOST, || (0, 0, false, 0, std::sync::Weak::new()));
         }
-        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
+        f[found_at(address, len, any)] = (address, len, any, changed, Arc::downgrade(shadow));
     });
 }
 
@@ -5676,6 +5712,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        if !keys.is_empty() {
+            BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
@@ -5744,10 +5783,14 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
-    if quick && let Some(shadow) = found(address, len) {
+    if quick && let Some(shadow) = found(address, len, any) {
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
+    // Capture generation BEFORE consulting BUFFERS/LOOSE so a concurrent
+    // `in_place_let_go`, `let_go_idle`, or `register`/`unregister` can never
+    // leave a removed/unmapped window stamped with the post-eviction generation.
+    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
     {
         let map = buffers_read();
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
@@ -5755,14 +5798,18 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
                     // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    remember(address, len, any, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
                 }
                 return Some(shadow.clone());
             }
             Some(_) => {}
             None => {
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                let shadow = loose(address, end, len <= 1, any)?;
+                if quick {
+                    remember(address, len, any, changed, &shadow);
+                }
+                return Some(shadow);
             }
         }
     }
@@ -6043,47 +6090,50 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+fn note_window_ask(shadow: &Shadow, now: u64, address: u64, end: u64, unsized_ask: bool) {
+    // Read first: the lines are shared by all recording threads.
+    if shadow.used.load(Ordering::Relaxed) != now {
+        shadow.used.store(now, Ordering::Relaxed);
+    }
+    if shadow.asked[0].load(Ordering::Relaxed) > address {
+        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    }
+    if shadow.asked[1].load(Ordering::Relaxed) < end {
+        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    }
+    if unsized_ask {
+        shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        // (Read first: the lines are shared by all recording threads.)
-        let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
-            shadow.used.store(now, Ordering::Relaxed);
-        }
-        if shadow.asked[0].load(Ordering::Relaxed) > address {
-            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        }
-        if shadow.asked[1].load(Ordering::Relaxed) < end {
-            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        }
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    let note = |shadow: &Shadow| note_window_ask(shadow, crate::host::moment(), address, end, unsized_ask);
+    let tail = unsized_ask && tails();
+    let any = any && !unsized_ask && fine();
+    let pick = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
+        // Only windows that begin in the ask's cell at or below its start.
+        let there = || map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        if tail {
+            longest_tail(there(), address, end).unwrap_or_else(|| tail_of(address, end))
+        } else if any {
+            holder(there(), address, end).unwrap_or(named)
+        } else {
+            named
         }
     };
-    // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+    // Existing named, tail and holder windows all share the read lock.
+    {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
+        if let Some(shadow) = map.get(&pick(&map)) {
             note(shadow);
             return Some(shadow.clone());
         }
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
-    };
+    let (start, len) = pick(&map);
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
@@ -6094,6 +6144,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -6107,6 +6158,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -6134,6 +6186,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let shadow = share(shadow);
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
     Some(shadow)
 }
 

@@ -579,7 +579,7 @@ pub(crate) fn flip_now() {
 pub(crate) static FLIPPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The key of the record at `handle`, a view's descriptor slot; 0: none.
-fn record_key(handle: u64) -> u64 {
+pub(crate) fn record_key(handle: u64) -> u64 {
     // SAFETY: the handle is a descriptor slot in title memory.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     if tag == VIEW_TAG { u64::from(generation) << 32 | u64::from(i) } else { 0 }
@@ -1026,10 +1026,10 @@ const COPIED_GRACE: u64 = 4;
 const TABLED_READ: u32 = 1 << 31;
 
 /// Since the start: writes of texture views into slots that count as a
-/// table's (due later), and slots that left the queue because a draw read
-/// them through a table.
-pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// table's (due later), slots that left the queue because a draw read them
+/// through a table, and of the latter those re-read in the same frame (`VICTORY_TABLED_REREAD=1`).
+pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether slots draws read through tables leave the queue of textures
 /// picked by index; `VICTORY_TABLED_TEXTURES=1` keeps them in it as
@@ -1037,6 +1037,14 @@ pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 2] =
 fn tabled_out() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
+}
+
+/// Whether a table read of a slot the queue holds leaves it out also when
+/// the slot was read through a table before in the same frame
+/// (`VICTORY_TABLED_REREAD=0` disables it).
+pub(crate) fn tabled_reread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_REREAD").is_none_or(|v| v != "0"))
 }
 
 /// What the queue of textures picked by index knows of a title slot.
@@ -2707,6 +2715,37 @@ impl HostHeap {
         self.flip(list, index, handle, None);
     }
 
+    /// Publishes the record whose texture the bake list just made readable.
+    /// The upload and its transition precede the draw in GPU execution order.
+    /// Recreate an already-made view too, since the upload may have promoted
+    /// its first resident mip without changing the record.
+    pub(crate) fn publish_bake_source(&self, index: u32, handle: u64, key: u64) -> bool {
+        if self.sampler || index >= self.count || key == 0 {
+            return false;
+        }
+        let _made = self.made.lock(index);
+        if record_key(handle) != key {
+            return false;
+        }
+        let Some(view) = view_at(key as u32, (key >> 32) as u32).filter(is_texture_view) else {
+            return false;
+        };
+        let Some(Some(kept)) = make(&view, self.at(index)) else {
+            return false;
+        };
+        if self.made.get(index) != Some(key) {
+            // A draw making a recorded view does not invalidate other spans.
+            let _ = self.note_buffer(index, Some(&view), true);
+        }
+        self.quick_is(index, 0);
+        self.put(index);
+        self.clear_twin(index);
+        self.made.set(index, key);
+        self.keep(index, Some(kept));
+        self.quick_is(index, key);
+        true
+    }
+
     /// The same of a slot that shows nothing of the texture the record at
     /// `handle` views, or something else: until then it shows the neutral
     /// texture ([`show_after`]).
@@ -2947,6 +2986,11 @@ impl HostHeap {
 
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
+        self.tabled_in_as(index, read, frame, tabled_reread());
+    }
+
+    /// [`HostHeap::tabled_in`], with [`tabled_reread`] as `reread` says.
+    fn tabled_in_as(&self, index: u32, read: bool, frame: u64, reread: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(stamp) = self.tabled.get(index as usize) else {
             return;
@@ -2959,16 +3003,25 @@ impl HostHeap {
             }
             return;
         }
-        // Once per slot and frame: tables are read by every draw.
-        if old != now | TABLED_READ {
+        let read_already = old == now | TABLED_READ;
+        if !read_already {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() && self.queued.may(index) {
-                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.take_out(index) {
-                    TABLED_WRITES[1].fetch_add(1, Relaxed);
+        }
+        if (!read_already || reread) && tabled_out() && self.queued.may(index) {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if textures.take_out(index) {
+                TABLED_WRITES[1].fetch_add(1, Relaxed);
+                if read_already {
+                    TABLED_WRITES[2].fetch_add(1, Relaxed);
                 }
             }
         }
+    }
+
+    /// Whether title slot `index` may be in the queue of textures picked by
+    /// index, lock-free via [`QueueMarks`].
+    pub(crate) fn texture_slot_queued(&self, index: u32) -> bool {
+        self.queued.may(index)
     }
 
     /// Whether title slot `index` was a table's within the last
@@ -5818,6 +5871,43 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn forced_bake_source_replaces_the_pending_view_in_its_slot() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // SAFETY: reserve and commit one private page range for the placed texture.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), 1 << 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!memory.is_null());
+        let address = memory as u64;
+        let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut desc = [0; 16];
+        desc[..6].copy_from_slice(&[98, 4, 5768, 0, 0, 1]);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        let view = View::Placed(false, resource, desc);
+        let [i, generation] = super::super::words_for(view);
+        let words = [VIEW_TAG, i, generation];
+        let handle = std::ptr::from_ref(&words) as u64;
+        let key = record_key(handle);
+        assert!(crate::texture::mapped_bytes(memory.cast(), 4096) > 0);
+
+        // This is the mismatch the bake observes while a new view is held back.
+        assert!(heap.show_later(2, handle));
+        assert!(!heap.texture_slot_made_from(2, handle));
+        assert!(!heap.publish_bake_source(2, handle, key.wrapping_add(1)));
+        assert!(!heap.texture_slot_made_from(2, handle));
+
+        assert!(heap.publish_bake_source(2, handle, key));
+        assert!(heap.texture_slot_made_from(2, handle));
+        assert!(!heap.texture_slot_made_from(3, handle));
+        // SAFETY: release the private reservation after the last title memory access.
+        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+    }
+
     /// Every host sampler heap backs all 2,048 hardware descriptors and
     /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
     /// `victory-shader` never reads past smaller title sampler heaps.
@@ -7428,6 +7518,32 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn a_slot_written_after_its_read_leaves_at_the_next_read_when_asked() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if !tabled_out() {
+            return;
+        }
+        let frame = 200;
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        heap.tabled_in_as(4, true, frame, true);
+        heap.queue_texture(4, true, false, frame);
+        assert_eq!(slots(frame + TABLED_GRACE - 1), []);
+        assert_eq!(slots(frame + TABLED_GRACE), [4]);
+        heap.tabled_in_as(4, true, frame, false);
+        assert_eq!(slots(frame + TABLED_GRACE), [4]);
+        let before = TABLED_WRITES[2].load(std::sync::atomic::Ordering::Relaxed);
+        heap.tabled_in_as(4, true, frame, true);
+        assert_eq!(slots(u64::MAX), []);
+        assert!(TABLED_WRITES[2].load(std::sync::atomic::Ordering::Relaxed) > before);
+        assert!(!heap.texture_slot_queued(4));
+        heap.tabled_in_as(5, true, frame, true);
+        heap.tabled_in_as(5, true, frame, true);
+        assert_eq!(slots(u64::MAX), []);
     }
 
     #[test]

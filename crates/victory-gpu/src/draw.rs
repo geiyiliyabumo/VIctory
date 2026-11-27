@@ -2880,7 +2880,7 @@ impl State {
             if n < sourced && !source {
                 once!("a decoration bake draw samples more than VICTORY_BAKE_SOURCES_MB megabytes of textures not on the card yet: the rest take their turn");
             }
-            if !source && (SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span) {
+            if !source && (only || SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span) {
                 served = false;
                 break;
             }
@@ -2914,7 +2914,7 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            if !source && let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
@@ -2971,16 +2971,7 @@ impl State {
                 host.texture_slot_here(index);
                 there = Some(mapped);
                 if mapped < len {
-                    // (One of a bake draw's own is left so only if the
-                    // host slot shows what was uploaded then.)
-                    if mapped <= host.texture_slot_mapped(index)
-                        && !(source
-                            && !heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle)))
-                    {
-                        if source {
-                            let [uploaded, bytes, unmapped, as_before] = PASS_SOURCED.get();
-                            PASS_SOURCED.set([uploaded, bytes, unmapped, as_before + 1]);
-                        }
+                    if !source && mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
                         host.texture_slot_later(index, write, frame, most);
                         continue;
@@ -3062,9 +3053,16 @@ impl State {
                 && !source
                 && crate::descriptor::host::show_after()
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
-            let view = heap.handle(index).and_then(|handle| {
-                if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
+            let handle = heap.handle(index);
+            let source_key = handle.filter(|_| source).map(crate::descriptor::host::record_key);
+            let view = handle.and_then(|handle| {
+                if source || shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
             });
+            let publish_source = || {
+                handle.zip(source_key).is_some_and(|(handle, key)| {
+                    crate::host::with_bake_source_publication(|| host.publish_bake_source(index, handle, key))
+                })
+            };
             let at_once = || {
                 if late && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
@@ -3082,6 +3080,10 @@ impl State {
             let texture = crate::resource::host_resource(resource);
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
+                if source && !publish_source() {
+                    served = false;
+                    continue;
+                }
                 at_once();
                 // a render target, a depth or unordered access texture: the host's own
                 host.texture_slot_done(index, write, None);
@@ -3097,7 +3099,7 @@ impl State {
                 _ => 0,
             };
             let same = !tabled && crate::texture::unchanged(resource, first);
-            if same {
+            if same && !source {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 if shows_other && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
@@ -3157,6 +3159,12 @@ impl State {
                 served = false;
                 break;
             }
+            // Readable recorded the upload and its shader-resource transition.
+            // Publish only this bake source, including in a source-only pass.
+            if source && !publish_source() {
+                served = false;
+                continue;
+            }
             if let Some((since, waited, away)) = host.texture_slot_since(index) {
                 use crate::texlate::{Kind, note};
                 note(if waited { Kind::Waited } else { Kind::Ready }, since);
@@ -3210,7 +3218,12 @@ impl State {
             }
             if source {
                 let [uploaded, was, unmapped, as_before] = PASS_SOURCED.get();
-                PASS_SOURCED.set([uploaded + 1, was + if tabled { 0 } else { bytes }, unmapped, as_before]);
+                PASS_SOURCED.set([
+                    uploaded + u64::from(!same),
+                    was + if tabled || same { 0 } else { bytes },
+                    unmapped,
+                    as_before + u64::from(same),
+                ]);
                 sourced_bytes += bytes;
             }
             if tabled {
@@ -4040,8 +4053,24 @@ impl State {
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
+            let title_first = heap.index(table).filter(|first| first + n <= host.count());
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
+                if let Some(title) = title_first
+                    && crate::descriptor::host::tabled_reread()
+                {
+                    let reads = entries.iter().filter(|u| u.kind != ResourceType::Cbv).map(|u| u.table_offset_dwords / 8);
+                    let indexed = selected.iter().copied().filter(|&k| group.entry(k).is_none());
+                    for k in reads.chain(indexed) {
+                        if host.texture_slot_queued(title + k) {
+                            let handle = table + u64::from(k) * 32;
+                            if crate::descriptor::view(handle).is_some_and(|view| crate::descriptor::host::is_texture_view(&view)) {
+                                host.texture_slot_tabled(title + k, true);
+                                host.mirror_after(list, title + k, handle);
+                            }
+                        }
+                    }
+                }
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
                 let once = ready_once() && selected.is_empty() && !group.has_uav;
@@ -4105,7 +4134,6 @@ impl State {
                 .extend(held.map(|(at, k)| (std::ptr::from_ref(heap) as usize, host.id(), at, k)));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
             // They are such a table's, whatever they hold. (Of a big one,
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
@@ -4160,7 +4188,10 @@ impl State {
                     }
                     if let Some(title) = title_first
                         && listed.texture
-                        && listed.tabled != Some((title + k, kind.is_some()))
+                        && (listed.tabled != Some((title + k, kind.is_some()))
+                            || (crate::descriptor::host::tabled_reread()
+                                && kind.is_some()
+                                && host.texture_slot_queued(title + k)))
                     {
                         listed.tabled = Some((title + k, kind.is_some()));
                         host.texture_slot_tabled(title + k, kind.is_some());

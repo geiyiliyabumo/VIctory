@@ -1562,10 +1562,23 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
+    drop(unstage_detach(resource));
+}
+
+/// Detach the staging buffer so the caller can drop it after releasing its locks.
+pub(crate) fn unstage_detach(resource: This) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
-    }
+    map.as_mut()?.remove(&(resource as usize))
+}
+
+/// During an idle sweep, skip eviction if another thread is staging a texture.
+pub(crate) fn try_unstage_detach(resource: This) -> Result<Option<Arc<Staging>>, ()> {
+    let mut map = match STAGING.try_lock() {
+        Ok(map) => map,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Err(()),
+    };
+    Ok(map.as_mut().and_then(|map| map.remove(&(resource as usize))))
 }
 
 /// Where a staged title texture's memory is: address and bytes.

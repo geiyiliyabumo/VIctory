@@ -127,6 +127,9 @@ pub(crate) struct AllocationInfo {
 
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
+// Placed views copy the two field spans on either side of the padding.
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
@@ -1220,6 +1223,8 @@ struct Hosted {
     /// The host copy (and twin) once made. Taken out again only by
     /// [`let_go_idle`] and when the title releases the resource.
     made: std::sync::Mutex<Option<Made>>,
+    /// Last observed backing of `made`, for ordering idle copies without its lock.
+    backing_bytes: std::sync::atomic::AtomicU64,
     /// The state and clear value the title created the texture with.
     state: u32,
     clear: Option<[u32; 5]>,
@@ -1278,29 +1283,42 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
-/// The share of the card's local VRAM budget in use, in percent (cached for
-/// a tenth of a second via [`crate::host::now_ms`]).
+#[cfg(any(windows, test))]
+fn default_texture_max_side(budget: Option<u64>, used: u64) -> u64 {
+    let Some(budget) = budget else { return 1024 };
+    if budget <= 9 << 30 {
+        return if used >= budget * 88 / 100 { 256 } else { 512 };
+    }
+    match u128::from(used) * 100 / u128::from(budget) {
+        0..92 => 1024,
+        92..97 => 512,
+        _ => 256,
+    }
+}
+
+/// The adaptive cap, cached for a tenth of a second.
 #[cfg(windows)]
-fn video_memory_percent() -> u64 {
+fn adaptive_texture_max_side() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tenth = crate::host::now_ms() / 100 + 1;
     let last = LAST.load(Relaxed);
-    if last >> 8 == tenth {
-        return last & 0xff;
+    if last >> 11 == tenth {
+        return last & 0x7ff;
     }
-    let pct = crate::host::host()
+    let max = crate::host::host()
         .and_then(|h| h.video_memory())
-        .and_then(|[budget, used, ..]| (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64))
-        .unwrap_or(0);
-    LAST.store((tenth << 8) | pct, Relaxed);
-    pct
+        .map_or_else(|| default_texture_max_side(None, 0), |[budget, used, ..]| {
+            default_texture_max_side((budget != 0).then_some(budget), used)
+        });
+    LAST.store((tenth << 11) | max, Relaxed);
+    max
 }
 
 /// How many of a streamed placed 2D texture's largest mips to skip so no side
-/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
-/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
-/// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
+/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: adaptive). Budgets of up
+/// to 9 GiB start at 512 and go to 256 at 88 %. Larger budgets start at 1024
+/// and go to 512 at 92 % and 256 at 97 %.
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1312,11 +1330,7 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     if set == Some(0) {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..92 => 1024,
-        92..97 => 512,
-        _ => 256,
-    });
+    let max = set.unwrap_or_else(adaptive_texture_max_side);
     let mut skip = 0u32;
     while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
         if skip + 1 >= u32::from(desc.mip_levels) {
@@ -1449,13 +1463,15 @@ pub(crate) fn want_level(this: This, first: u32) {
     }
     r.host.wanted.store(first, Relaxed);
     // Under the lock, as in `let_go_idle`.
-    crate::texture::unstage(this);
+    let staging = crate::texture::unstage_detach(this);
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
     if let Some(old) = made.take() {
+        r.host.backing_bytes.store(0, Relaxed);
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
     drop(made);
+    drop(staging);
     let mut live = live_filled();
     // A concurrent use may already have remade the host copy.
     if r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
@@ -1763,6 +1779,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         KINDS[6].fetch_add(1, Relaxed);
         made_filled = host.filled;
         r.host.pinned_until.store(0, Relaxed);
+        r.host.backing_bytes.store(host.backing_bytes(), Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
@@ -1770,6 +1787,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     }
     let now = crate::host::moment();
     if r.host.used.load(Relaxed) != now {
+        if let Some((host, _)) = made.as_ref().filter(|(host, _)| host.tiled.is_some()) {
+            r.host.backing_bytes.store(host.backing_bytes(), Relaxed);
+        }
         r.host.used.store(now, Relaxed);
     }
     let out = made.clone();
@@ -2254,15 +2274,31 @@ pub(crate) fn let_go_idle() {
 const IDLE_FRAMES: u64 = 4;
 
 #[cfg(windows)]
+type IdleCandidate = (u64, std::cmp::Reverse<u64>, usize);
+
+/// The last key visited, so a sweep can resume even after evictions shrink the list.
+#[cfg(windows)]
+static PRESSURE_CURSOR: std::sync::Mutex<Option<IdleCandidate>> = std::sync::Mutex::new(None);
+
+#[cfg(windows)]
 fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
-    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
     const RELAXED_BUDGET_US: u64 = 4_000;
     const PRESSURE_BUDGET_US: u64 = 8_000;
-    static PRESSURE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+    const PRESSURE_WALL_US: u64 = 12_000;
+    const PRESSURE_MIN_BYTES: u64 = 16 << 20;
     static LAST_LOG: AtomicU64 = AtomicU64::new(0);
     let began = std::time::Instant::now();
-    let mut live = live_filled();
+    let mut live = if most != u64::MAX || limit.is_some() {
+        match LIVE_FILLED.try_lock() {
+            Ok(live) => live,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        }
+    } else {
+        live_filled()
+    };
     let mut texture_most = 0;
     if let Some(limit) = limit {
         // If a queued copy just dropped, read the live counters after its decrement.
@@ -2274,12 +2310,14 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
         return;
     }
     let pressure = most != u64::MAX;
+    let past_wall = || pressure && began.elapsed().as_micros() as u64 >= PRESSURE_WALL_US;
     let (budget_us, min_looked) = if pressure {
         (PRESSURE_BUDGET_US, 2048)
     } else {
         (RELAXED_BUDGET_US, 256)
     };
-    let now_frame = crate::frame::current();
+    let now = crate::host::moment();
+    let now_frame = now >> 32;
     let live_count = live.len();
     let mut evicted = Vec::new();
     let mut to_retire = Vec::new();
@@ -2287,28 +2325,47 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let mut dxgi_bytes = 0;
-    // With a limit, the longest idle first.
-    let mut by_age: Vec<(u64, usize)> = Vec::new();
+    let mut stop_reason = "done";
+    let mut by_age: Vec<IdleCandidate> = Vec::new();
     if pressure {
-        for &at in live.iter() {
+        let now_tick = now & 0xffff_ffff;
+        // moment's low word is in tenths of a second.
+        let idle_ticks = idle_ms.div_ceil(100);
+        for (i, &at) in live.iter().enumerate() {
+            if i & 31 == 0 && past_wall() {
+                stop_reason = "wall";
+                break;
+            }
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             if r.host.pinned_until.load(Relaxed) > now_frame {
                 continue;
             }
             let used = r.host.used.load(Relaxed);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
-                by_age.push((used & 0xffff_ffff, at));
+            let used_tick = used & 0xffff_ffff;
+            if used != 0
+                && now_frame.saturating_sub(used >> 32) >= IDLE_FRAMES
+                && now_tick.saturating_sub(used_tick) >= idle_ticks
+            {
+                let age_bucket = used_tick * 100 / 5_000;
+                let backing = r.host.backing_bytes.load(Relaxed);
+                by_age.push((age_bucket, std::cmp::Reverse(backing), at));
             }
         }
-        by_age.sort_unstable();
+        if stop_reason == "done" && !past_wall() {
+            by_age.sort_unstable();
+        }
+        if past_wall() {
+            stop_reason = "wall";
+        }
     }
-    let start = if by_age.is_empty() {
-        0
-    } else {
-        PRESSURE_CURSOR.load(Relaxed) % by_age.len()
-    };
-    let oldest = by_age[start..].iter().chain(&by_age[..start]).map(|&(_, at)| at);
+    let mut cursor = (pressure && stop_reason != "wall")
+        .then(|| PRESSURE_CURSOR.lock().unwrap_or_else(|e| e.into_inner()));
+    let start = cursor
+        .as_deref()
+        .and_then(|cursor| *cursor)
+        .map_or(0, |last| by_age.partition_point(|key| *key <= last));
+    let oldest = by_age[start..].iter().chain(&by_age[..start]).map(|&(_, _, at)| at);
     // Without one, while textures are kept for minutes, a part of them at
     // each look, the next one at the next.
     // (`VICTORY_TEXTURE_SWEEP=whole`: all each time, as before).
@@ -2324,21 +2381,34 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
         PART
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
-    let host_written = crate::texture::host_written_snapshot();
+    let host_written = if stop_reason == "wall" {
+        None
+    } else {
+        crate::texture::host_written_snapshot()
+    };
+    if past_wall() {
+        stop_reason = "wall";
+    }
     let mut looked = 0;
     let mut skipped_pinned = 0;
     let loop_began = std::time::Instant::now();
     for at in live.range(from..).take(part).copied().chain(oldest) {
-        if dxgi_bytes >= most && bytes >= texture_most {
+        if stop_reason == "wall" || past_wall() {
+            stop_reason = "wall";
             break;
         }
-        if looked & 31 == 0
-            && (went > 0 || looked >= min_looked)
-            && loop_began.elapsed().as_micros() as u64 >= budget_us
-        {
-            if pressure {
-                PRESSURE_CURSOR.store(start + looked, Relaxed);
-            } else if part == PART {
+        if dxgi_bytes >= most && bytes >= texture_most {
+            stop_reason = "target";
+            break;
+        }
+        let check_budget = if pressure {
+            bytes >= PRESSURE_MIN_BYTES || (went == 0 && looked >= min_looked)
+        } else {
+            looked & 31 == 0 && (went > 0 || looked >= min_looked)
+        };
+        if check_budget && loop_began.elapsed().as_micros() as u64 >= budget_us {
+            stop_reason = "budget";
+            if part == PART {
                 FROM.store(at, Relaxed);
             }
             break;
@@ -2363,9 +2433,7 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
         let gone = {
             let Ok(mut made) = r.host.made.try_lock() else { continue; };
             let Some((host, _)) = made.as_ref() else { continue; };
-            if !crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                || (pressure && host.card_bytes() == 0)
-            {
+            if !crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES) {
                 continue;
             }
             let unpinned = std::sync::Arc::strong_count(host) == 1
@@ -2375,17 +2443,22 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
                 skipped_pinned += 1;
                 continue;
             }
+            let backing = host.backing_bytes();
+            if pressure && backing == 0 {
+                continue;
+            }
             // Under the lock: the next use must not find the staging
             // state of the texture let go (it says "uploaded").
-            crate::texture::unstage(at as This);
+            let Ok(staging) = crate::texture::try_unstage_detach(at as This) else { continue; };
+            r.host.backing_bytes.store(0, Relaxed);
             r.host.wanted.store(u32::MAX, Relaxed);
             r.host.used.store(0, Relaxed);
             r.host.pinned_until.store(0, Relaxed);
             r.host.gone.store(true, Relaxed);
-            made.take()
+            (made.take(), staging, backing)
         };
-        if let Some((host, _)) = gone {
-            let backing = host.backing_bytes();
+        if let (Some(made), staging, backing) = gone {
+            let (host, _) = &made;
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(backing, Relaxed);
             went += 1;
@@ -2400,12 +2473,20 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
                 RetiringTextureBytes(backing)
             });
             // The host copy drops before its pending byte count.
-            to_retire.push((host, pending));
+            to_retire.push((made, staging, pending));
         }
     }
-    if pressure && looked == by_age.len() {
-        PRESSURE_CURSOR.store(0, Relaxed);
+    if stop_reason == "done" && dxgi_bytes >= most && bytes >= texture_most {
+        stop_reason = "target";
     }
+    if let Some(cursor) = cursor.as_deref_mut() {
+        if stop_reason == "done" || (looked > 0 && looked == by_age.len()) {
+            *cursor = None;
+        } else if looked > 0 {
+            *cursor = Some(by_age[(start + looked - 1) % by_age.len()]);
+        }
+    }
+    drop(cursor);
     // Churn may have removed every entry after the cursor.
     if part == PART && looked == 0 {
         FROM.store(0, Relaxed);
@@ -2414,14 +2495,14 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
         live.remove(&at);
     }
     drop(live);
-    for made in to_retire {
-        crate::host::retire(made);
+    if !to_retire.is_empty() {
+        crate::host::retire(to_retire);
     }
     let elapsed = began.elapsed().as_micros() as u64;
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(elapsed, Relaxed);
     SWEPT_US[2].fetch_max(elapsed, Relaxed);
-    if went > 0 || (pressure && (skipped_pinned > 0 || looked > 0)) {
+    if went > 0 || (pressure && (looked > 0 || stop_reason == "wall")) {
         // Offset the clock so the first qualifying sweep can log immediately.
         const LOG_INTERVAL_MS: u64 = 10_000;
         let now = crate::host::now_ms().saturating_add(LOG_INTERVAL_MS);
@@ -2438,6 +2519,7 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
                 looked,
                 live_filled = live_count,
                 sweep_us = elapsed,
+                stop_reason,
                 "texture idle sweep"
             );
         }
@@ -3014,6 +3096,7 @@ fn hand_out_resource(
         #[cfg(windows)]
         host: Hosted {
             made: std::sync::Mutex::new(None),
+            backing_bytes: std::sync::atomic::AtomicU64::new(0),
             state,
             // SAFETY: the title passes a whole clear value (the format,
             // then color or depth and stencil: 5 words) or null.
@@ -3646,6 +3729,23 @@ pub(crate) fn test_buffer(width: u64) -> This {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn texture_max_side_scales_down_for_8gb_cards() {
+        const GIB: u64 = 1 << 30;
+        let small = 8 * GIB;
+        let threshold = small * 88 / 100;
+        assert_eq!(default_texture_max_side(Some(small), 0), 512);
+        assert_eq!(default_texture_max_side(Some(small), threshold - 1), 512);
+        assert_eq!(default_texture_max_side(Some(small), threshold), 256);
+        assert_eq!(default_texture_max_side(Some(9 * GIB), 0), 512);
+        assert_eq!(default_texture_max_side(Some(9 * GIB + 1), 0), 1024);
+        let large = 16 * GIB;
+        assert_eq!(default_texture_max_side(Some(large), large * 91 / 100), 1024);
+        assert_eq!(default_texture_max_side(Some(large), (large * 92).div_ceil(100)), 512);
+        assert_eq!(default_texture_max_side(Some(large), (large * 97).div_ceil(100)), 256);
+        assert_eq!(default_texture_max_side(None, u64::MAX), 1024);
+    }
+
     use super::*;
     use crate::object::slot;
 
@@ -4088,7 +4188,7 @@ mod tests {
             crate::frame::test_advance();
         }
 
-        sweep_idle(0, 1 << 20, None);
+        sweep_idle(0, u64::MAX - 1, None);
         assert!(resource(idle).host.made.lock().unwrap().is_none());
         let deadlines = pinned.map(|title| {
             let host = &resource(title).host;
@@ -4118,6 +4218,41 @@ mod tests {
         for title in titles {
             slot::<Release>(title, 0x10)(title);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sweep_idle_evicts_larger_backing_first_in_same_age_bucket() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        if crate::host::host().is_none() {
+            eprintln!("large-first texture sweep test requires a D3D12 device");
+            return;
+        }
+        let _sweep = TEST_SWEEP.lock().unwrap_or_else(|e| e.into_inner());
+        *PRESSURE_CURSOR.lock().unwrap() = None;
+        let descs = [texture(4, 4, 28, 1), texture(1024, 1024, 28, 1)];
+        let sources = descs.map(|desc| vec![0; footprint(&desc).unwrap().size as usize]);
+        let [small, large] = std::array::from_fn(|i| create_test_texture(&descs[i], &sources[i]));
+        let small_bytes = hosted(small, true).unwrap().0.backing_bytes();
+        let large_bytes = hosted(large, true).unwrap().0.backing_bytes();
+        assert!(large_bytes > small_bytes && small_bytes > 0);
+        assert_eq!(resource(large).host.backing_bytes.load(Relaxed), large_bytes);
+        resource(small).host.used.store(1 << 32, Relaxed);
+        resource(large).host.used.store((1 << 32) + 1, Relaxed);
+        for _ in 0..=IDLE_FRAMES {
+            crate::frame::test_advance();
+        }
+
+        sweep_idle(0, 1, None);
+        assert!(resource(large).host.made.lock().unwrap().is_none());
+        assert_eq!(resource(large).host.backing_bytes.load(Relaxed), 0);
+        assert!(resource(small).host.made.lock().unwrap().is_some());
+        assert_eq!(resource(small).host.backing_bytes.load(Relaxed), small_bytes);
+        for title in [small, large] {
+            slot::<Release>(title, 0x10)(title);
+        }
+        *PRESSURE_CURSOR.lock().unwrap() = None;
     }
 
     #[cfg(windows)]
