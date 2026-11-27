@@ -208,7 +208,7 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - `<= 9 GiB` (8 GB cards): `(1, 896)` MiB so hot >= 1 MiB shader-written
+/// - `<= 9 GiB` (8 GB cards): `(1, 640)` MiB so hot >= 1 MiB shader-written
 ///   buffers stay in local VRAM instead of falling back to CPU-bus staging.
 /// - Unknown (`None`, e.g. WARP) or `> 9 GiB` and `<= 12 GiB`: `(16, 512)` MiB.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
@@ -225,7 +225,7 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= NINE_GIB_MB {
-        (1, 896)
+        (1, 640)
     } else if budget_mb <= TWELVE_GIB_MB {
         (16, 512)
     } else if budget_mb < TWENTY_GIB_MB {
@@ -255,7 +255,7 @@ fn resolve_card_limits(
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
 /// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
-/// `> 9 GiB` and `<= 12 GiB` budgets, 1 MiB / 896 MiB on `<= 9 GiB` budgets,
+/// `> 9 GiB` and `<= 12 GiB` budgets, 1 MiB / 640 MiB on `<= 9 GiB` budgets,
 /// 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
@@ -355,13 +355,28 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
+    card_room_kept_bytes(
+        card_limits().1,
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed),
+    )
+}
+
+fn card_room_kept_bytes(limit: u64, live: u64, refused: u64) -> u64 {
     // Not more than such copies came to in any session, whatever they may
     // come to: on a card of 24 GB a quarter of its budget was kept for them,
     // 5 GB that never came (941 MB in 97 copies after fifteen minutes), and
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    let cap = limit.min(SEEN);
+    let raw = cap.saturating_sub(live.saturating_add(refused));
+    if limit <= (704 << 20) && live >= (256 << 20) {
+        // The initial buffer burst has landed. Leave more room for textures.
+        raw.min(128 << 20)
+    } else {
+        raw
+    }
 }
 
 /// The live copies in the card's memory, for statistics and diagnostics.
@@ -3129,7 +3144,7 @@ fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
     }
     let pct = (u128::from(used) * 100) / u128::from(budget);
     if emergency || pct >= 93 {
-        let goal = (u128::from(budget) * 74 / 100) as u64;
+        let goal = (u128::from(budget) * 76 / 100) as u64;
         L0ReclaimPlan {
             target_bytes: used.saturating_sub(goal).max(512 * MIB),
             idle_ms: if emergency { 1_000 } else { 2_000 },
@@ -3138,20 +3153,20 @@ fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
             immediate_drop: true,
         }
     } else if pct >= 88 {
-        let goal = (u128::from(budget) * 78 / 100) as u64;
+        let goal = (u128::from(budget) * 80 / 100) as u64;
         L0ReclaimPlan {
-            target_bytes: used.saturating_sub(goal).min(384 * MIB),
-            idle_ms: 6_000,
-            idle_frames: 2,
+            target_bytes: used.saturating_sub(goal).min(256 * MIB),
+            idle_ms: 12_000,
+            idle_frames: 3,
             unmapped_cap_bytes: u64::MAX,
             immediate_drop: false,
         }
-    } else if pct >= 82 {
-        let goal = (u128::from(budget) * 78 / 100) as u64;
+    } else if pct >= 84 {
+        let goal = (u128::from(budget) * 80 / 100) as u64;
         L0ReclaimPlan {
-            target_bytes: used.saturating_sub(goal).min(128 * MIB),
-            idle_ms: 15_000,
-            idle_frames: 2,
+            target_bytes: used.saturating_sub(goal).min(96 * MIB),
+            idle_ms: 25_000,
+            idle_frames: 4,
             unmapped_cap_bytes: u64::MAX,
             immediate_drop: false,
         }
@@ -3172,6 +3187,16 @@ fn l0_reclaim_plan(vm: Option<[u64; 4]>, emergency: bool) -> L0ReclaimPlan {
             immediate_drop: false,
         }
     }
+}
+
+const COLD_RECLAIM_COOLDOWN_MS: u64 = 3_000;
+static LAST_COLD_RECLAIM_MS: AtomicU64 = AtomicU64::new(0);
+
+fn loose_window_reclaim_ready(unmapped: bool, immediate_drop: bool, now_ms: u64, last_ms: u64) -> bool {
+    unmapped
+        || immediate_drop
+        || last_ms == 0
+        || now_ms.saturating_sub(last_ms) >= COLD_RECLAIM_COOLDOWN_MS
 }
 
 #[derive(Clone, Copy)]
@@ -3237,7 +3262,7 @@ impl EvictableLooseWindows {
 
 /// Selects loose windows eligible for unpinning and L0 reclaim on this sweep:
 /// first windows whose asked guest memory is no longer committed (unmapped),
-/// then coldest idle windows when WDDM L0 shared usage crosses 72%.
+/// then coldest idle windows at 84% WDDM L0 shared usage or in an emergency.
 pub(crate) fn evictable_loose_windows(
     vm: Option<[u64; 4]>,
     emergency: bool,
@@ -3248,7 +3273,8 @@ pub(crate) fn evictable_loose_windows(
         return EvictableLooseWindows::default();
     }
     let min_idle_ms = plan.idle_ms.min(2_000);
-    let min_frames = plan.idle_frames;
+    // Keep the shorter snapshot threshold for unmapped windows.
+    let min_frames = plan.idle_frames.min(2);
     let snapshot: Vec<((u64, u64), usize, u64, u64, (u64, u64))> = {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
@@ -3286,8 +3312,16 @@ pub(crate) fn evictable_loose_windows(
     }
     let mut unmapped = Vec::new();
     let mut cold = Vec::new();
+    let cooldown = !emergency && !plan.immediate_drop && plan.target_bytes > 0;
+    // Offset the clock so zero represents a sweep with no prior cold reclaim.
+    let now_ms = if cooldown { crate::host::now_ms().saturating_add(1) } else { 0 };
+    let last_ms = if cooldown { LAST_COLD_RECLAIM_MS.load(Ordering::Relaxed) } else { 0 };
     for (key, raw, bytes, active, (probe_start, probe_len)) in snapshot {
-        if !crate::host::range_has_committed(probe_start, probe_len) {
+        let is_unmapped = !crate::host::range_has_committed(probe_start, probe_len);
+        if !loose_window_reclaim_ready(is_unmapped, plan.immediate_drop, now_ms, last_ms) {
+            continue;
+        }
+        if is_unmapped {
             unmapped.push((active, key, raw, bytes));
         } else if plan.target_bytes > 0
             && crate::host::long_ago(active, plan.idle_ms, plan.idle_frames)
@@ -3317,6 +3351,23 @@ pub(crate) fn evictable_loose_windows(
         targets.by_key.insert(key, entry);
         unmapped_bytes = unmapped_bytes.saturating_add(bytes);
         reclaimed = reclaimed.saturating_add(bytes);
+    }
+    if reclaimed >= plan.target_bytes || cold.is_empty() {
+        return targets;
+    }
+    // A cold victim is available and still needed. Claim the cooldown before
+    // inserting it so overlapping sweeps cannot both select cold victims.
+    if cooldown
+        && LAST_COLD_RECLAIM_MS
+            .compare_exchange(
+                last_ms,
+                crate::host::now_ms().saturating_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        return targets;
     }
     for (_, key, raw, bytes) in cold {
         if reclaimed >= plan.target_bytes {
@@ -6171,8 +6222,9 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        L0ReclaimPlan, WINDOW, cover, default_card_limits_mb, grid, holder, l0_reclaim_plan,
-        longest_tail, resolve_card_limits, tail_of, trim_pool_vec, window_of, window_victims,
+        L0ReclaimPlan, WINDOW, card_room_kept_bytes, cover, default_card_limits_mb, grid, holder,
+        l0_reclaim_plan, longest_tail, loose_window_reclaim_ready, resolve_card_limits, tail_of,
+        trim_pool_vec, window_of, window_victims,
     };
 
     #[test]
@@ -6206,7 +6258,7 @@ mod window_tests {
             }
         );
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 6400 * MIB]), false),
+            l0_reclaim_plan(Some([budget, 0, budget, 6719 * MIB]), false),
             L0ReclaimPlan {
                 target_bytes: 0,
                 idle_ms: 15_000,
@@ -6216,29 +6268,29 @@ mod window_tests {
             }
         );
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 6600 * MIB]), false),
+            l0_reclaim_plan(Some([budget, 0, budget, 6720 * MIB]), false),
             L0ReclaimPlan {
-                target_bytes: 128 * MIB,
-                idle_ms: 15_000,
-                idle_frames: 2,
+                target_bytes: 96 * MIB,
+                idle_ms: 25_000,
+                idle_frames: 4,
                 unmapped_cap_bytes: u64::MAX,
                 immediate_drop: false,
             }
         );
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 7100 * MIB]), false),
+            l0_reclaim_plan(Some([budget, 0, budget, 7040 * MIB]), false),
             L0ReclaimPlan {
-                target_bytes: 384 * MIB,
-                idle_ms: 6_000,
-                idle_frames: 2,
+                target_bytes: 256 * MIB,
+                idle_ms: 12_000,
+                idle_frames: 3,
                 unmapped_cap_bytes: u64::MAX,
                 immediate_drop: false,
             }
         );
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 7480 * MIB]), false),
+            l0_reclaim_plan(Some([budget, 0, budget, 7440 * MIB]), false),
             L0ReclaimPlan {
-                target_bytes: 1560 * MIB,
+                target_bytes: 1360 * MIB,
                 idle_ms: 2_000,
                 idle_frames: 1,
                 unmapped_cap_bytes: u64::MAX,
@@ -6246,15 +6298,31 @@ mod window_tests {
             }
         );
         assert_eq!(
-            l0_reclaim_plan(Some([budget, 0, budget, 7480 * MIB]), true),
+            l0_reclaim_plan(Some([budget, 0, budget, 6720 * MIB]), true),
             L0ReclaimPlan {
-                target_bytes: 1560 * MIB,
+                target_bytes: 640 * MIB,
                 idle_ms: 1_000,
                 idle_frames: 1,
                 unmapped_cap_bytes: u64::MAX,
                 immediate_drop: true,
             }
         );
+    }
+
+    #[test]
+    fn loose_window_reclaim_cooldown_only_gates_non_immediate_cold_windows() {
+        let last_ms = 10_000;
+        let budget = 1000;
+        let normal = l0_reclaim_plan(Some([budget, 0, budget, 929]), false);
+        assert!(loose_window_reclaim_ready(false, normal.immediate_drop, 1, 0));
+        assert!(!loose_window_reclaim_ready(false, normal.immediate_drop, 12_999, last_ms));
+        assert!(loose_window_reclaim_ready(false, normal.immediate_drop, 13_000, last_ms));
+        assert!(loose_window_reclaim_ready(true, normal.immediate_drop, last_ms, last_ms));
+
+        let high_pressure = l0_reclaim_plan(Some([budget, 0, budget, 930]), false);
+        let emergency = l0_reclaim_plan(Some([budget, 0, budget, 840]), true);
+        assert!(loose_window_reclaim_ready(false, high_pressure.immediate_drop, last_ms, last_ms));
+        assert!(loose_window_reclaim_ready(false, emergency.immediate_drop, last_ms, last_ms));
     }
 
     #[test]
@@ -6278,15 +6346,15 @@ mod window_tests {
     }
 
     #[test]
-    fn card_limits_scale_with_local_vram_budget() {
+    fn default_card_limits_scale_by_local_vram_budget() {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
         // Unknown (WARP / query failure) and >9..=12 GiB keep the 12 GB baseline;
-        // <= 9 GiB (8 GB cards) admit >= 1 MiB buffers up to 896 MiB.
+        // <= 9 GiB (8 GB cards) admit >= 1 MiB buffers up to 640 MiB.
         assert_eq!(default_card_limits_mb(None), (16, 512));
         for budget in [7, 8, 9] {
-            assert_eq!(resolve_card_limits(Some(budget * GIB), None, None), (1 << 20, 896 << 20));
+            assert_eq!(resolve_card_limits(Some(budget * GIB), None, None), (MIB, 640 * MIB));
         }
         assert_eq!(default_card_limits_mb(Some(10 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
@@ -6309,6 +6377,17 @@ mod window_tests {
         assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
         assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
         assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+    }
+
+    #[test]
+    fn card_room_kept_caps_phantom_reserve_after_initial_burst() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(card_room_kept_bytes(640 * MIB, 255 * MIB, 5 * MIB), 380 * MIB);
+        assert_eq!(card_room_kept_bytes(704 * MIB, 256 * MIB, 5 * MIB), 128 * MIB);
+        assert_eq!(card_room_kept_bytes(640 * MIB, 500 * MIB, 30 * MIB), 110 * MIB);
+        assert_eq!(card_room_kept_bytes(705 * MIB, 256 * MIB, 5 * MIB), 444 * MIB);
+        assert_eq!(card_room_kept_bytes(2048 * MIB, 256 * MIB, 5 * MIB), 763 * MIB);
+        assert_eq!(card_room_kept_bytes(640 * MIB, u64::MAX, 1), 0);
     }
 
     /// An ask that may take any window takes the longest that holds all of
