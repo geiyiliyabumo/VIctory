@@ -166,6 +166,20 @@ static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+const BACKS_MOST: usize = 64;
+
+pub(crate) fn trim_backs(keep: usize) {
+    let gone: Vec<usize> = {
+        let mut backs = held(&BACKS);
+        let n = backs.len().saturating_sub(keep);
+        backs.drain(..n).collect()
+    };
+    for ptr in gone {
+        // SAFETY: each entry in `BACKS` was allocated by `Box::into_raw(super::boxed(...))`
+        // and is uniquely owned once popped from `BACKS`.
+        unsafe { drop(Box::from_raw(ptr as *mut List)) };
+    }
+}
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
 /// recordings let go of in the middle.
@@ -277,7 +291,15 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let mut backs = held(&BACKS);
+            if backs.len() < BACKS_MOST {
+                backs.push(inner.back);
+            } else {
+                drop(backs);
+                // SAFETY: `inner.back` was allocated by `Box::into_raw(super::boxed(...))`
+                // and is no longer referenced once this `Recording` drops.
+                unsafe { drop(Box::from_raw(inner.back as *mut List)) };
+            }
         }
     }
 }

@@ -645,16 +645,33 @@ fn worker_count(asked: Option<usize>, processors: usize) -> usize {
     }
 }
 
+/// Caps automatic pipeline worker concurrency on RAM-constrained hosts so
+/// simultaneous driver shader compiles do not thrash the pagefile while the
+/// title loads into the world. Explicit `VICTORY_PIPELINE_WORKERS` still wins.
+fn worker_count_for_ram(asked: Option<usize>, processors: usize, total_ram_bytes: Option<u64>) -> usize {
+    let base = worker_count(asked, processors);
+    if asked.is_some() {
+        return base;
+    }
+    const GIB: u64 = 1 << 30;
+    match total_ram_bytes {
+        Some(ram) if ram <= 20 * GIB => base.min(4),
+        Some(ram) if ram <= 32 * GIB => base.min(6),
+        _ => base,
+    }
+}
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count(
+        let workers = worker_count_for_ram(
             std::env::var("VICTORY_PIPELINE_WORKERS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok()),
             std::thread::available_parallelism().map_or(2, |n| n.get()),
+            crate::residency::total_physical_ram(),
         );
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
@@ -743,6 +760,16 @@ mod tests {
         assert_eq!(worker_count(None, 64), 16);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
+    }
+
+    #[test]
+    fn worker_count_caps_automatically_on_constrained_ram_hosts() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(worker_count_for_ram(None, 12, Some(16 * GIB)), 4);
+        assert_eq!(worker_count_for_ram(None, 12, Some(32 * GIB)), 6);
+        assert_eq!(worker_count_for_ram(None, 12, Some(64 * GIB)), 8);
+        assert_eq!(worker_count_for_ram(Some(8), 12, Some(16 * GIB)), 8);
+        assert_eq!(worker_count_for_ram(None, 4, Some(16 * GIB)), 2);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

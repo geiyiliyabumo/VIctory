@@ -541,6 +541,7 @@ impl Shader {
         self.marked_heap_handle_at(block, index, false, true, props, bounded, true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn marked_heap_handle_at(
         &mut self,
         block: usize,

@@ -1,22 +1,23 @@
 //! Host-memory admission for speculative texture work and reusable upload storage.
 //!
 //! From codec-d/cool_fox (641835a4, fabb872a, c64fc9b4, 08e4574d, e94d277a; the
-//! values of the last). Only with `VICTORY_RESIDENCY=1` ([`on`]): the memory
-//! of the system is then asked once a second; below 3 GiB of free RAM or 4 GiB
-//! of commit (out again above 5 / 6) texture prefetch is limited to 64 MiB a
-//! frame and idle scratch and staging blocks are let go; below 1.5 GiB of
-//! commit to 16 MiB; the texture pass stops below 512 MiB of commit, new
-//! staging blocks for textures picked by index below 1 GiB. With 32 GiB of RAM
-//! or less (or `VICTORY_RESIDENCY_LIMITED=1`) the budgets of a smaller PC.
-//! Off, nothing here changes anything, except that for 500 ms after the card
-//! refused memory (E_OUTOFMEMORY) the texture pass stops ([`upload_refused`]).
+//! values of the last). The submission sweep samples free RAM and commit once
+//! a second. At or below 3 GiB of free RAM or 4 GiB of commit it trims idle
+//! scratch, upload, and list pools until both reach 5 GiB and 6 GiB again.
+//!
+//! With `VICTORY_RESIDENCY=1` ([`on`]), pressure also limits texture prefetch
+//! to 64 MiB per frame. Below 1.5 GiB of commit the limit is 16 MiB. The
+//! texture pass stops below 512 MiB of commit and new staging blocks for
+//! textures picked by index stop below 1 GiB. Hosts with up to 32 GiB of RAM
+//! (or `VICTORY_RESIDENCY_LIMITED=1`) use the smaller budgets.
+//! An E_OUTOFMEMORY always pauses the texture pass for 500 ms ([`upload_refused`]).
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 const MIB: u64 = 1 << 20;
 
-/// `VICTORY_RESIDENCY=1`: the memory budgets of this module (off by default).
+/// `VICTORY_RESIDENCY=1` enables the optional texture limits.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY").is_some_and(|v| v == "1"))
@@ -113,11 +114,16 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     has_growth_reserve(sample_commit(now), bake)
 }
 
+pub(crate) fn total_physical_ram() -> Option<u64> {
+    static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
+    *TOTAL.get_or_init(|| memory_status().map(|s| s.ullTotalPhys))
+}
+
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
     *LIMITED.get_or_init(|| {
         on() && (std::env::var_os("VICTORY_RESIDENCY_LIMITED").is_some_and(|v| v == "1")
-            || memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+            || total_physical_ram().is_some_and(|total| total <= 32 * GIB))
     })
 }
 
@@ -129,15 +135,15 @@ fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     }
 }
 
-/// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
-pub(crate) fn refresh() {
-    if !on() {
-        return;
-    }
-    let Some(status) = memory_status() else { return };
+/// Returns pressure for the idle pool sweep. A failed sample keeps the last state.
+pub(crate) fn refresh() -> bool {
+    let was = PRESSURED.load(Ordering::Relaxed);
+    let Some(status) = memory_status() else { return was };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
-    HEADROOM.store(physical.min(commit), Ordering::Relaxed);
-    let was = pressured();
+    let limit_prefetch = on();
+    if limit_prefetch {
+        HEADROOM.store(physical.min(commit), Ordering::Relaxed);
+    }
     let pressure = next_pressure(was, physical, commit);
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
@@ -151,12 +157,14 @@ pub(crate) fn refresh() {
                 texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
                 spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
                 game_filled_gpu_texture_mib = crate::resource::KINDS[1].load(Ordering::Relaxed) >> 20,
-                "host memory pressure: limiting texture prefetch and idle upload storage"
+                limit_prefetch,
+                "host memory pressure: reclaiming idle upload and list storage"
             );
         } else {
             tracing::info!(physical_free_mib = physical >> 20, available_commit_mib = commit >> 20, "host memory pressure cleared");
         }
     }
+    pressure
 }
 
 pub(crate) fn headroom() -> Option<u64> {
@@ -164,8 +172,9 @@ pub(crate) fn headroom() -> Option<u64> {
     (bytes != u64::MAX).then_some(bytes)
 }
 
+/// Pressure as seen by speculative texture work.
 pub(crate) fn pressured() -> bool {
-    PRESSURED.load(Ordering::Relaxed)
+    on() && PRESSURED.load(Ordering::Relaxed)
 }
 
 /// True when OS commit headroom is critically low (< 1.5 GiB) or an allocation

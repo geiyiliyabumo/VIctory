@@ -645,12 +645,16 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
-    crate::residency::refresh();
+    let host_pressure = crate::residency::refresh();
     update_l0_spill(vm);
-    if crate::residency::pressured() {
+    if host_pressure {
         trim_spare_chunks();
+        send::trim();
+        card_steps::trim();
+        crate::list::trim_idle(32);
+        crate::list::thin::trim_backs(16);
     }
-    crate::pool::room(vm);
+    crate::pool::room(vm, host_pressure);
     crate::pipeline::trim_library();
     let l0_targets = crate::shadow::evictable_loose_windows(vm, emergency);
     let unpinned_windows = crate::descriptor::unpin_loose_windows(&l0_targets);
@@ -1472,6 +1476,9 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// Number of resets this allocator has survived; high-water-mark command
+    /// allocators are retired periodically so their peak pages return to the OS.
+    resets: AtomicU32,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4418,6 +4425,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                resets: AtomicU32::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6694,9 +6702,14 @@ impl HostList {
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
     }
 
+    pub(crate) fn should_retire(&self) -> bool {
+        self.resets.load(Ordering::Relaxed) >= 256
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.resets.fetch_add(1, Ordering::Relaxed);
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
