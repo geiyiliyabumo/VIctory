@@ -127,6 +127,7 @@ fn build() -> [u8; 32] {
             "VICTORY_AMBIENT_FALLBACK",
             "VICTORY_BVH_BUILDER",
             "VICTORY_RAY_TRACING",
+            "VICTORY_THREAD_TICKET",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
