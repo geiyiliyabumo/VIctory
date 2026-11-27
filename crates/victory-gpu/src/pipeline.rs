@@ -254,7 +254,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// submission, on pointers that had become bounding-box bit patterns).
 ///
 /// So a builder dispatch runs only while every builder pipeline the title
-/// has created has a host pipeline; the first builder dispatch makes them
+/// has created has a host pipeline. The first builder dispatch makes them
 /// all on the spot instead of over the next frames (a stage "still being
 /// made" would be a dropped stage). While one cannot be made the builder
 /// is off; it is looked at again when the title creates another. A stage
@@ -275,6 +275,17 @@ struct Builder {
     off: usize,
     /// No stage runs before this frame.
     rests: u64,
+}
+
+#[cfg(windows)]
+impl Builder {
+    fn blocked_at(&self, frame: u64) -> bool {
+        self.off == self.pipelines.len() || frame < self.rests
+    }
+
+    fn whole_at(&self, frame: u64) -> bool {
+        self.whole && !self.blocked_at(frame)
+    }
 }
 
 #[cfg(windows)]
@@ -333,16 +344,32 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Whether the builder has a complete set of host pipelines and can run
+/// this frame. Checking this does not prepare any pipelines.
+#[cfg(windows)]
+pub(crate) fn builder_whole() -> bool {
+    builder_allowed()
+        && BUILDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .whole_at(crate::frame::current())
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
+    if b.blocked_at(crate::frame::current()) {
         return false;
     }
     if b.whole {
@@ -814,6 +841,27 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn builder_whole_requires_all_known_pipelines_and_observes_rest() {
+        let mut builder = Builder {
+            pipelines: vec![Arc::new(make::Pending::new(Vec::new(), None))],
+            whole: false,
+            off: 0,
+            rests: 0,
+        };
+        assert!(!builder.whole_at(10));
+
+        builder.whole = true;
+        builder.rests = 12;
+        assert!(!builder.whole_at(11));
+        assert!(builder.whole_at(12));
+
+        builder.pipelines.push(Arc::new(make::Pending::new(Vec::new(), None)));
+        builder.whole = false;
+        assert!(!builder.whole_at(12));
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
