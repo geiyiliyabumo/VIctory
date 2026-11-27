@@ -7,6 +7,18 @@ use std::sync::Arc;
 use super::*;
 use crate::shadow::Shadow;
 
+/// Whether this range includes a constant-buffer slot written after submission.
+pub(crate) fn is_late_cb(address: u64, len: u64) -> bool {
+    late::on() && len > 0 && late::written(address as usize, address.saturating_add(len) as usize)
+}
+
+impl HostList {
+    // Expose the query to draw code while the card_steps module stays private.
+    pub(crate) fn is_late_cb(address: u64, len: u64) -> bool {
+        is_late_cb(address, len)
+    }
+}
+
 /// The stage (`VICTORY_CARD_STEPS`; off by default): `1` constant buffers
 /// of descriptor tables (`Step::Fill` with a slot of its own), `2` the
 /// title's buffer copies (`Step::Copy`) too, with the steps of the same
@@ -1255,6 +1267,21 @@ mod tests {
         assert!(!late::written(page + 4096 + 512, page + 4096 + 576));
         late::forget_test_fill(changed, 240);
         drop(memory);
+    }
+
+    #[test]
+    fn late_cb_query_tracks_a_learned_slot_until_forgotten() {
+        let memory = vec![1u8; 1024];
+        let upload = [0u8; 256];
+        let slot = (memory.as_ptr() as usize).next_multiple_of(256) + 256;
+        late::landed_cpu(&[(upload.as_ptr() as usize, slot, upload.len())]);
+        assert_eq!(is_late_cb(slot as u64, 256), late::on());
+        assert_eq!(is_late_cb((slot + 255) as u64, 1), late::on());
+        assert!(!is_late_cb(slot as u64, 0));
+        assert!(!is_late_cb((slot - 1) as u64, 1));
+        assert!(!is_late_cb((slot + 256) as u64, 1));
+        late::forget_test_fill(slot, 256);
+        assert!(!is_late_cb(slot as u64, 256));
     }
 
     /// A fill the CPU did into upload memory, whose place the title wrote

@@ -4218,7 +4218,19 @@ impl State {
                                     }
                                     crate::port_cbv::copied(false);
                                 }
-                                None => crate::port_cbv::copied(true),
+                                None => {
+                                    let len = u64::from(size);
+                                    if address >= 1 << 32
+                                        && crate::port::late_cb_on()
+                                        && HostList::is_late_cb(address, len)
+                                        && let Some((buffer, gpu)) = crate::port::place_late_cb(address, len)
+                                        && host.constant_raw_at(index, &buffer, gpu, size)
+                                    {
+                                        crate::port_cbv::in_place(size);
+                                        continue;
+                                    }
+                                    crate::port_cbv::copied(true);
+                                }
                             }
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {

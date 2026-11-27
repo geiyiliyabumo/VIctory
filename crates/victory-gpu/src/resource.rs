@@ -1287,7 +1287,7 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
 fn default_texture_max_side(budget: Option<u64>, used: u64) -> u64 {
     let Some(budget) = budget else { return 1024 };
     if budget <= 9 << 30 {
-        return if used >= budget * 88 / 100 { 256 } else { 512 };
+        return if used >= budget * 91 / 100 { 256 } else { 512 };
     }
     match u128::from(used) * 100 / u128::from(budget) {
         0..92 => 1024,
@@ -1439,9 +1439,16 @@ pub(crate) static HELD: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::
 /// A view of the placed texture `this` that starts at level `first` is made
 /// or brought up to date: a host copy without that level is replaced by one
 /// with it (made and filled at the next use; the slots that show the old
-/// one go on showing it until that is done).
+/// one go on showing it until that is done). When the card currently has no
+/// room for new textures, keep the working lower-resolution copy intact so
+/// walking closer to a model never drops its texture to null/black.
 #[cfg(windows)]
 pub(crate) fn want_level(this: This, first: u32) {
+    want_level_with_room(this, first, room_lately() && crate::residency::admit_texture_pass(false));
+}
+
+#[cfg(windows)]
+fn want_level_with_room(this: This, first: u32, has_room: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     if this.is_null() || !held_only() {
         return;
@@ -1459,6 +1466,9 @@ pub(crate) fn want_level(this: This, first: u32) {
         return;
     };
     if host.base == 0 || host.base <= base_level(&r.desc, first) {
+        return;
+    }
+    if !has_room {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1512,16 +1522,17 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Title textures the title fills ([`fills`]) that have a live host copy.
-/// Lets the idle sweep skip evicted and unmade textures. Lock order is
-/// LIVE_FILLED before the resource's host.made. Never hold TEXTURES
-/// and LIVE_FILLED together.
+/// Title textures the title fills ([`fills`]) that have a live host copy,
+/// mapped to their cached backing bytes so pressure sweeps can prioritize large
+/// textures without dereferencing tens of thousands of tiny cold `Resource`
+/// structs. Lock order is LIVE_FILLED before the resource's host.made. Never
+/// hold TEXTURES and LIVE_FILLED together.
 #[cfg(windows)]
-static LIVE_FILLED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static LIVE_FILLED: std::sync::Mutex<std::collections::BTreeMap<usize, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(windows)]
-fn live_filled() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
+fn live_filled() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<usize, u64>> {
     LIVE_FILLED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -1797,8 +1808,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     if made_filled {
         let mut live = live_filled();
         // Mip growth can take the copy between dropping made and locking live.
-        if r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-            live.insert(this as usize);
+        if let Some((host, _)) = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            live.insert(this as usize, host.backing_bytes());
         }
     }
     out
@@ -2282,13 +2293,17 @@ static PRESSURE_CURSOR: std::sync::Mutex<Option<IdleCandidate>> = std::sync::Mut
 
 #[cfg(windows)]
 fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
     const RELAXED_BUDGET_US: u64 = 4_000;
+    const PRESSURE_SCAN_BUDGET_US: u64 = 4_000;
     const PRESSURE_BUDGET_US: u64 = 8_000;
     const PRESSURE_WALL_US: u64 = 12_000;
-    const PRESSURE_MIN_BYTES: u64 = 16 << 20;
+    const PRESSURE_MIN_BYTES: u64 = 32 << 20;
+    const LARGE_BACKING_BYTES: u64 = 128 << 10;
+    const SMALL_SCAN_LIMIT: usize = 4_096;
     static LAST_LOG: AtomicU64 = AtomicU64::new(0);
+    static PRESSURE_SMALL_FROM: AtomicUsize = AtomicUsize::new(0);
     let began = std::time::Instant::now();
     let mut live = if most != u64::MAX || limit.is_some() {
         match LIVE_FILLED.try_lock() {
@@ -2310,7 +2325,6 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
         return;
     }
     let pressure = most != u64::MAX;
-    let past_wall = || pressure && began.elapsed().as_micros() as u64 >= PRESSURE_WALL_US;
     let (budget_us, min_looked) = if pressure {
         (PRESSURE_BUDGET_US, 2048)
     } else {
@@ -2331,11 +2345,23 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
         let now_tick = now & 0xffff_ffff;
         // moment's low word is in tenths of a second.
         let idle_ticks = idle_ms.div_ceil(100);
-        for (i, &at) in live.iter().enumerate() {
-            if i & 31 == 0 && past_wall() {
-                stop_reason = "wall";
+        let scan_began = std::time::Instant::now();
+        let scan_over = || scan_began.elapsed().as_micros() as u64 >= PRESSURE_SCAN_BUDGET_US;
+        let mut cand_bytes = 0u64;
+        let mut derefs = 0usize;
+        let mut scan_stopped = false;
+        // Pass 1: inspect large textures (>= 128 KiB) first using the inline
+        // backing_bytes value so we avoid dereferencing tens of thousands of
+        // tiny cold `Resource` structs on 16 GB RAM hosts.
+        for (&at, &cached_backing) in live.iter() {
+            if cached_backing < LARGE_BACKING_BYTES {
+                continue;
+            }
+            if derefs & 63 == 0 && scan_over() {
+                scan_stopped = true;
                 break;
             }
+            derefs += 1;
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             if r.host.pinned_until.load(Relaxed) > now_frame {
@@ -2348,19 +2374,49 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
                 && now_tick.saturating_sub(used_tick) >= idle_ticks
             {
                 let age_bucket = used_tick * 100 / 5_000;
-                let backing = r.host.backing_bytes.load(Relaxed);
+                let backing = r.host.backing_bytes.load(Relaxed).max(cached_backing);
+                cand_bytes = cand_bytes.saturating_add(backing);
                 by_age.push((age_bucket, std::cmp::Reverse(backing), at));
             }
         }
-        if stop_reason == "done" && !past_wall() {
-            by_age.sort_unstable();
+        // Pass 2: if large candidates do not cover our target yet, inspect a
+        // bounded rotating slice of smaller textures (< 128 KiB).
+        let need_small = cand_bytes < most.min(PRESSURE_MIN_BYTES)
+            || cand_bytes < texture_most;
+        if need_small && !scan_stopped {
+            let small_from = PRESSURE_SMALL_FROM.load(Relaxed);
+            let mut small_checked = 0usize;
+            let mut next_small = 0usize;
+            for (&at, &cached_backing) in live.range(small_from..).chain(live.range(..small_from)) {
+                if cached_backing >= LARGE_BACKING_BYTES {
+                    continue;
+                }
+                if small_checked >= SMALL_SCAN_LIMIT || (small_checked & 63 == 0 && scan_over()) {
+                    next_small = at;
+                    break;
+                }
+                small_checked += 1;
+                // SAFETY: as below.
+                let r = unsafe { &*(at as *const Resource) };
+                if r.host.pinned_until.load(Relaxed) > now_frame {
+                    continue;
+                }
+                let used = r.host.used.load(Relaxed);
+                let used_tick = used & 0xffff_ffff;
+                if used != 0
+                    && now_frame.saturating_sub(used >> 32) >= IDLE_FRAMES
+                    && now_tick.saturating_sub(used_tick) >= idle_ticks
+                {
+                    let age_bucket = used_tick * 100 / 5_000;
+                    let backing = r.host.backing_bytes.load(Relaxed);
+                    by_age.push((age_bucket, std::cmp::Reverse(backing), at));
+                }
+            }
+            PRESSURE_SMALL_FROM.store(next_small, Relaxed);
         }
-        if past_wall() {
-            stop_reason = "wall";
-        }
+        by_age.sort_unstable();
     }
-    let mut cursor = (pressure && stop_reason != "wall")
-        .then(|| PRESSURE_CURSOR.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut cursor = pressure.then(|| PRESSURE_CURSOR.lock().unwrap_or_else(|e| e.into_inner()));
     let start = cursor
         .as_deref()
         .and_then(|cursor| *cursor)
@@ -2381,19 +2437,15 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
         PART
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
-    let host_written = if stop_reason == "wall" {
-        None
-    } else {
-        crate::texture::host_written_snapshot()
-    };
-    if past_wall() {
-        stop_reason = "wall";
-    }
+    let host_written = crate::texture::host_written_snapshot();
     let mut looked = 0;
     let mut skipped_pinned = 0;
+    // Measure eviction budget & wall cap from the eviction loop itself so an
+    // OS page-fault during candidate scanning never starves eviction to 0 MB.
     let loop_began = std::time::Instant::now();
-    for at in live.range(from..).take(part).copied().chain(oldest) {
-        if stop_reason == "wall" || past_wall() {
+    let past_evict_wall = || pressure && loop_began.elapsed().as_micros() as u64 >= PRESSURE_WALL_US;
+    for at in live.range(from..).take(part).map(|(&at, _)| at).chain(oldest) {
+        if past_evict_wall() {
             stop_reason = "wall";
             break;
         }
@@ -3733,7 +3785,7 @@ mod tests {
     fn texture_max_side_scales_down_for_8gb_cards() {
         const GIB: u64 = 1 << 30;
         let small = 8 * GIB;
-        let threshold = small * 88 / 100;
+        let threshold = small * 91 / 100;
         assert_eq!(default_texture_max_side(Some(small), 0), 512);
         assert_eq!(default_texture_max_side(Some(small), threshold - 1), 512);
         assert_eq!(default_texture_max_side(Some(small), threshold), 256);
@@ -4099,8 +4151,8 @@ mod tests {
         let target_at = target as usize;
         assert!(hosted(filled, true).is_some());
         assert!(hosted(target, true).is_some());
-        assert!(live_filled().contains(&filled_at));
-        assert!(!live_filled().contains(&target_at));
+        assert!(live_filled().contains_key(&filled_at));
+        assert!(!live_filled().contains_key(&target_at));
 
         // An old nonzero moment, even when this is the first frame in the test process.
         resource(filled).host.used.store(1 << 32, Relaxed);
@@ -4108,13 +4160,13 @@ mod tests {
             crate::frame::test_advance();
         }
         sweep_idle(0, u64::MAX, None);
-        assert!(!live_filled().contains(&filled_at));
+        assert!(!live_filled().contains_key(&filled_at));
         assert!(hosted(filled, false).is_none());
 
         assert!(hosted(filled, true).is_some());
-        assert!(live_filled().contains(&filled_at));
+        assert!(live_filled().contains_key(&filled_at));
         slot::<extern "system" fn(This) -> u32>(filled, 0x10)(filled);
-        assert!(!live_filled().contains(&filled_at));
+        assert!(!live_filled().contains_key(&filled_at));
         slot::<extern "system" fn(This) -> u32>(target, 0x10)(target);
     }
 
@@ -5332,5 +5384,35 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// When the card currently has no room, a closer view requesting a larger
+    /// mip must keep the existing working lower-resolution copy intact rather
+    /// than dropping it and leaving the surface unuploaded/black.
+    #[cfg(windows)]
+    #[test]
+    fn want_level_keeps_existing_copy_when_card_has_no_room() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() || !held_only() {
+            return;
+        }
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = placed_bytes(&desc).unwrap();
+        // SAFETY: test memory owned by this process for the test duration.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let texture = texture_at(at as u64, &desc).unwrap();
+        want_level_with_room(texture, 2, true);
+        let copy = host_copy(texture).unwrap();
+        assert_eq!(copy.base, 2);
+        // Without card room: keep the existing base=2 copy intact.
+        want_level_with_room(texture, 0, false);
+        let still = host_copy(texture).unwrap();
+        assert_eq!(still.serial, copy.serial);
+        assert_eq!(still.base, 2);
+        // Once card room returns: upgrade cleanly to base=0.
+        want_level_with_room(texture, 0, true);
+        let upgraded = host_copy(texture).unwrap();
+        assert_ne!(upgraded.serial, copy.serial);
+        assert_eq!(upgraded.base, 0);
     }
 }

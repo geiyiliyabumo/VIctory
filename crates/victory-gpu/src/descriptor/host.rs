@@ -733,11 +733,19 @@ impl Spans {
         let rule = self.rule;
         // The spans the view cannot be there with.
         let clashing: Vec<u64> = match rule {
-            Rule::Start => self
-                .by_start
-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
-                .map(|(at, _)| *at)
-                .collect(),
+            Rule::Start => {
+                // Cap each texture's protected head block to its own size so
+                // tiny packed palettes (< 4 KiB) do not falsely invalidate
+                // adjacent palettes living within 4 KiB of each other.
+                let my_head = start.saturating_add(HEAD.min(end.saturating_sub(start)));
+                self.by_start
+                    .range(start.saturating_sub(HEAD - 1)..my_head)
+                    .filter_map(|(&at, &(other_end, _))| {
+                        let other_head = at.saturating_add(HEAD.min(other_end.saturating_sub(at)));
+                        (at < my_head && start < other_head).then_some(at)
+                    })
+                    .collect()
+            }
             Rule::Overlap | Rule::Never => self.overlapping(start, end),
         };
         let mut stale = Vec::new();
@@ -7241,6 +7249,23 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert!(spans.note(8, at + 0x900, at + 0x2900, false).is_empty());
         assert_eq!(spans.by_slot.get(&8), None);
         assert_eq!(spans.by_slot.len(), 3);
+    }
+
+    /// Tiny packed textures/palettes (< 4 KiB) placed a few hundred bytes apart
+    /// must not invalidate each other under `Rule::Start`.
+    #[test]
+    fn packed_small_palettes_do_not_make_neighbours_stale() {
+        let mut spans = Spans::default();
+        let at = 0x8_0000_0000u64;
+        // Four adjacent 512-byte palettes inside a single 4 KiB block.
+        assert!(spans.note(10, at, at + 0x200, true).is_empty());
+        assert!(spans.note(11, at + 0x200, at + 0x400, true).is_empty());
+        assert!(spans.note(12, at + 0x400, at + 0x600, true).is_empty());
+        assert!(spans.note(13, at + 0x600, at + 0x800, true).is_empty());
+        assert_eq!(spans.by_slot.len(), 4);
+        // Overlapping the second palette replaces only slot 11.
+        assert_eq!(spans.note(14, at + 0x280, at + 0x380, true), [11]);
+        assert_eq!(spans.by_slot.len(), 4);
     }
 
     /// A slot written with another texture leaves its old span; the same
