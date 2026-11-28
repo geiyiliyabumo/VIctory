@@ -27,25 +27,32 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
-const BLOCK: u64 = 64 << 20;
+/// Tuned to 16 MiB (4x finer than 64 MiB) so evicted texture regions empty
+/// whole blocks back to DXGI instead of trapping 800+ MiB of fragmented holes
+/// on 8 GB VRAM / 16 GB RAM hosts.
+const BLOCK: u64 = 16 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
-/// The same while the card has room ([`room`]): 4 GiB of them on 12+ GiB cards.
+/// The same while the card has room ([`room`]): 1 GiB of them on 12+ GiB cards.
 const SPARE_KEPT: usize = 64;
-/// Spare empty texture blocks kept on <= 8 GiB VRAM cards (`256 MiB`) so idle
-/// blocks do not hold 1+ GiB of scarce local VRAM.
-const SPARE_KEPT_8GB: usize = 4;
-/// The same of blocks of staging buffers, which are the PC's memory: run
-/// crash-1 held 5.2 GB of them.
-const STAGING_KEPT: usize = 8;
+/// Spare empty texture blocks kept on <= 8 GiB VRAM cards (`32 MiB`) so idle
+/// blocks do not hold scarce local VRAM.
+const SPARE_KEPT_8GB: usize = 2;
+/// The same of blocks of staging buffers, which are the PC's memory (32 MiB).
+const STAGING_KEPT: usize = 2;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets the empty texture block limit and sweeps idle upload memory once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>, host_pressure: bool) {
     let residency = crate::residency::on();
+    let vram_high = memory.is_some_and(|[budget, used, ..]| budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 85);
     let keep_textures = crate::host::keep_freed() && !(residency && host_pressure);
-    let limit = spares(memory, keep_textures);
+    let limit = if residency && (host_pressure || vram_high) {
+        0
+    } else {
+        spares(memory, keep_textures)
+    };
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     if residency && let Ok(mut pool) = TEXTURES.try_lock() {
@@ -71,9 +78,9 @@ fn staging_spares(limit: usize, host_pressure: bool, critical_commit: bool, limi
     } else if host_pressure {
         limit.min(1)
     } else if limited_ram {
-        limit.min(4)
+        limit.min(STAGING_KEPT)
     } else {
-        limit
+        limit.min(8)
     }
 }
 
@@ -230,8 +237,21 @@ impl<B: Clone> Pool<B> {
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
+    #[cfg(test)]
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
-        self.take_ripe(len, align, now, Ripe::ALL, make)
+        self.take_ripe_capped(len, align, now, Ripe::ALL, usize::MAX, make)
+    }
+
+    /// As [`Pool::take`], refusing to allocate past `max_blocks` live blocks.
+    fn take_capped(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        max_blocks: usize,
+        make: impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
+        self.take_ripe_capped(len, align, now, Ripe::ALL, max_blocks, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
@@ -242,6 +262,18 @@ impl<B: Clone> Pool<B> {
         align: u64,
         now: u64,
         ripe: Ripe,
+        make: impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
+        self.take_ripe_capped(len, align, now, ripe, usize::MAX, make)
+    }
+
+    fn take_ripe_capped(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        ripe: Ripe,
+        max_blocks: usize,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
@@ -270,7 +302,7 @@ impl<B: Clone> Pool<B> {
         let (i, start) = match found {
             Some(found) => found,
             None => {
-                let memory = self.grow(now, &mut make)?;
+                let memory = self.grow_capped(now, max_blocks, &mut make)?;
                 let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
@@ -284,7 +316,7 @@ impl<B: Clone> Pool<B> {
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
             if empty < ripe.ahead
-                && let Some(memory) = self.grow(now, &mut make)
+                && let Some(memory) = self.grow_capped(now, max_blocks, &mut make)
             {
                 self.add(memory, ripe.started);
             }
@@ -295,11 +327,10 @@ impl<B: Clone> Pool<B> {
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
-    /// A new block from `make`, unless one was refused less than 500 ms ago
-    /// (codec-d/cool_fox 08e4574d: a refused 64 MiB block is not asked for
-    /// again for each small texture; the blocks there are still used).
-    fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
-        if now < self.retry_growth_at {
+    /// A new block from `make`, unless one was refused less than 500 ms ago or
+    /// `max_blocks` live blocks are already allocated.
+    fn grow_capped(&mut self, now: u64, max_blocks: usize, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
+        if now < self.retry_growth_at || self.blocks() >= max_blocks {
             return None;
         }
         let block = make();
@@ -413,6 +444,21 @@ impl Drop for SharedStagingPiece {
     }
 }
 
+/// Hard cap on live 16 MiB staging blocks in system RAM / GPU L0 shared memory
+/// so texture-streaming bursts cannot bloat WDDM L0 or exhaust 16 GB RAM.
+fn staging_max_blocks() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        if let Some(n) = std::env::var("VICTORY_STAGING_POOL_BLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            return n;
+        }
+        if crate::residency::limited_host_ram() { 4 } else { 16 }
+    })
+}
+
 /// `bytes` of shared L0 staging memory (512-byte aligned, writable by both CPU
 /// and GPU `CopyBufferRegion` for `VICTORY_CARD_STEPS=2`): the buffer it lies
 /// in, its offset, and its CPU mapping. `None`: not pooled.
@@ -423,8 +469,12 @@ pub(crate) fn shared_staging(
     if !on() {
         return None;
     }
+    let max_blocks = staging_max_blocks();
+    if max_blocks == 0 {
+        return None;
+    }
     let bytes = bytes.max(1).next_multiple_of(512);
-    let (piece, memory, _) = lock(&SHARED_STAGING).take(bytes, 512, now(), || {
+    let (piece, memory, _) = lock(&SHARED_STAGING).take_capped(bytes, 512, now(), max_blocks, || {
         let (buffer, data) = host.transient_shared_buffer(BLOCK)?;
         crate::host::name(&buffer, || "shared staging of list uploads (a block)".into());
         Some(Upload(buffer, data))
@@ -441,9 +491,13 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     if !on() {
         return None;
     }
+    let max_blocks = staging_max_blocks();
+    if max_blocks == 0 {
+        return None;
+    }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let (piece, memory, again) = lock(&STAGING).take_capped(bytes, 512, now(), max_blocks, || {
         // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
         // while commit is short; those a draw samples now still get one.)
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
@@ -796,7 +850,7 @@ mod tests {
 
     #[test]
     fn budget_tick_reclaims_idle_blocks_without_reusing_live_or_resting_pieces() {
-        let mut pool = Pool::new(STAGING_KEPT);
+        let mut pool = Pool::new(8);
         let (held, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
         let (resting, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(2)).unwrap();
         pool.give(resting, 0);
@@ -804,9 +858,9 @@ mod tests {
             pool.add(i, 0);
         }
         pool.reclaim(0, staging_spares(SPARE_KEPT, false, false, false), true);
-        assert_eq!(pool.blocks(), STAGING_KEPT + 1);
+        assert_eq!(pool.blocks(), 9);
         pool.reclaim(REST - 1, staging_spares(SPARE_KEPT, false, false, true), true);
-        assert_eq!(pool.blocks(), 5);
+        assert_eq!(pool.blocks(), STAGING_KEPT + 1);
         pool.reclaim(REST - 1, staging_spares(SPARE_KEPT, true, false, false), true);
         assert_eq!(pool.blocks(), 2);
         assert_eq!(pool.resting.len(), 1);
@@ -1020,5 +1074,27 @@ mod tests {
         drop(p1);
         drop(p2);
         lock(&SHARED_STAGING).rested(u64::MAX);
+    }
+
+    #[test]
+    fn take_capped_refuses_growth_past_max_blocks() {
+        let mut pool: Pool<u32> = Pool::new(2);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let (p1, _, _) = pool.take_capped(BLOCK / 2, 512, 0, 2, make).unwrap();
+        let (p2, _, _) = pool.take_capped(BLOCK / 2, 512, 0, 2, make).unwrap();
+        let (p3, _, _) = pool.take_capped(BLOCK / 2, 512, 0, 2, make).unwrap();
+        let (p4, _, _) = pool.take_capped(BLOCK / 2, 512, 0, 2, make).unwrap();
+        assert_eq!(pool.blocks(), 2);
+        assert!(pool.take_capped(BLOCK / 2, 512, 0, 2, make).is_none());
+        assert_eq!(made.get(), 2);
+        pool.give(p1, 1);
+        pool.give(p2, 1);
+        pool.give(p3, 1);
+        pool.give(p4, 1);
+        assert!(pool.take_capped(BLOCK / 2, 512, 1 + REST, 2, make).is_some());
     }
 }

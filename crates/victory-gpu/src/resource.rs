@@ -1287,11 +1287,7 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
 fn default_texture_max_side(budget: Option<u64>, used: u64) -> u64 {
     let Some(budget) = budget else { return 1024 };
     if budget <= 9 << 30 {
-        return match u128::from(used) * 100 / u128::from(budget) {
-            0..86 => 1024,
-            86..96 => 512,
-            _ => 256,
-        };
+        return if u128::from(used) * 100 >= u128::from(budget) * 93 { 256 } else { 512 };
     }
     match u128::from(used) * 100 / u128::from(budget) {
         0..92 => 1024,
@@ -2274,7 +2270,7 @@ pub(crate) fn let_go_idle() {
             let eff_used = used.saturating_sub(pool_free)
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            if pool_free >= (256 << 20) && used < budget / 100 * 88 {
+            if pool_free >= (256 << 20) && used < budget / 100 * 86 {
                 (600_000, u64::MAX)
             } else {
                 crate::host::vram_keep(budget, eff_used)
@@ -2307,13 +2303,13 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
     const RELAXED_BUDGET_US: u64 = 4_000;
     const PRESSURE_SCAN_BUDGET_US: u64 = 2_000;
     const PRESSURE_BUDGET_US: u64 = 5_000;
-    const PRESSURE_EVICT_WALL_US: u64 = 6_000;
-    const PRESSURE_EVICT_HARD_US: u64 = 8_000;
-    const PRESSURE_TOTAL_WALL_US: u64 = 12_000;
+    const PRESSURE_EVICT_WALL_US: u64 = 5_000;
+    const PRESSURE_TOTAL_WALL_US: u64 = 8_000;
     const PRESSURE_MIN_BYTES: u64 = 32 << 20;
     const LARGE_BACKING_BYTES: u64 = 128 << 10;
     const SMALL_SCAN_LIMIT: usize = 4_096;
     static LAST_LOG: AtomicU64 = AtomicU64::new(0);
+    static PRESSURE_SCAN_FROM: AtomicUsize = AtomicUsize::new(0);
     static PRESSURE_SMALL_FROM: AtomicUsize = AtomicUsize::new(0);
     let began = std::time::Instant::now();
     let mut live = if most != u64::MAX || limit.is_some() {
@@ -2373,15 +2369,18 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
     if pressure {
         let scan_began = std::time::Instant::now();
         let scan_over = || scan_began.elapsed().as_micros() as u64 >= PRESSURE_SCAN_BUDGET_US;
+        let scan_from = PRESSURE_SCAN_FROM.load(Relaxed);
+        let mut next_scan = 0usize;
         let mut derefs = 0usize;
-        // Pass 1: inspect large textures (>= 128 KiB) first using the inline
-        // backing_bytes value so we avoid dereferencing tens of thousands of
-        // tiny cold `Resource` structs on 16 GB RAM hosts.
-        for (&at, &cached_backing) in live.iter() {
+        // Pass 1: inspect large textures (>= 128 KiB) first using a rotating
+        // cursor so paged-out or pinned prefix entries never starve the rest
+        // of `LIVE_FILLED` on 16 GB RAM hosts.
+        for (&at, &cached_backing) in live.range(scan_from..).chain(live.range(..scan_from)) {
             if cached_backing < LARGE_BACKING_BYTES {
                 continue;
             }
             if derefs & 15 == 0 && scan_over() {
+                next_scan = at;
                 break;
             }
             derefs += 1;
@@ -2401,6 +2400,7 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
                 by_age.push((age_bucket, std::cmp::Reverse(backing), at));
             }
         }
+        PRESSURE_SCAN_FROM.store(next_scan, Relaxed);
         by_age.sort_unstable();
     }
     let mut cursor = pressure.then(|| PRESSURE_CURSOR.lock().unwrap_or_else(|e| e.into_inner()));
@@ -2425,21 +2425,13 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let host_written = crate::texture::host_written_snapshot();
     let mut pass1_looked = 0usize;
-    // Cap eviction loop wall time from `loop_began` (after Pass 1 scan + sort +
-    // snapshot) so paged-out scans never starve eviction down to `evicted=0`,
-    // while bounding total sweep wall time to `PRESSURE_TOTAL_WALL_US` (12 ms).
+    // Bound eviction loop wall time from `loop_began` and enforce a hard total
+    // ceiling from `began` (`PRESSURE_TOTAL_WALL_US` = 8 ms) so paged-out
+    // derefs on 16 GB RAM hosts can never cause 100+ ms sweep stalls.
     let loop_began = std::time::Instant::now();
-    let past_evict_wall = |acc: &SweepAcc| -> bool {
-        if !pressure {
-            return false;
-        }
-        let evict_us = loop_began.elapsed().as_micros() as u64;
-        if evict_us >= PRESSURE_EVICT_HARD_US {
-            return true;
-        }
-        let made_progress = acc.went >= 32 || acc.bytes >= (16 << 20);
-        made_progress
-            && (evict_us >= PRESSURE_EVICT_WALL_US
+    let past_evict_wall = |_acc: &SweepAcc| -> bool {
+        pressure
+            && (loop_began.elapsed().as_micros() as u64 >= PRESSURE_EVICT_WALL_US
                 || began.elapsed().as_micros() as u64 >= PRESSURE_TOTAL_WALL_US)
     };
     let mut try_evict = |acc: &mut SweepAcc, at: usize| -> bool {
@@ -2489,7 +2481,7 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
             let unpinned = std::sync::Arc::strong_count(host) == 1
                 && crate::host::references(&host.texture) == 1;
             if !unpinned {
-                r.host.pinned_until.store(now_frame.saturating_add(45), Relaxed);
+                r.host.pinned_until.store(now_frame.saturating_add(240), Relaxed);
                 acc.skipped_pinned += 1;
                 return true;
             }
@@ -3876,12 +3868,10 @@ mod tests {
     fn texture_max_side_scales_down_for_8gb_cards() {
         const GIB: u64 = 1 << 30;
         let small = 8 * GIB;
-        assert_eq!(default_texture_max_side(Some(small), 0), 1024);
-        assert_eq!(default_texture_max_side(Some(small), small * 85 / 100), 1024);
-        assert_eq!(default_texture_max_side(Some(small), (small * 86).div_ceil(100)), 512);
-        assert_eq!(default_texture_max_side(Some(small), small * 95 / 100), 512);
-        assert_eq!(default_texture_max_side(Some(small), (small * 96).div_ceil(100)), 256);
-        assert_eq!(default_texture_max_side(Some(9 * GIB), 0), 1024);
+        assert_eq!(default_texture_max_side(Some(small), 0), 512);
+        assert_eq!(default_texture_max_side(Some(small), small * 92 / 100), 512);
+        assert_eq!(default_texture_max_side(Some(small), (small * 93).div_ceil(100)), 256);
+        assert_eq!(default_texture_max_side(Some(9 * GIB), 0), 512);
         assert_eq!(default_texture_max_side(Some(9 * GIB + 1), 0), 1024);
         let large = 16 * GIB;
         assert_eq!(default_texture_max_side(Some(large), large * 91 / 100), 1024);
