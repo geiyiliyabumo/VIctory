@@ -534,6 +534,13 @@ fn skipped_compute_name(container: &[u8]) -> Option<&'static str> {
     match_skip_compute_name(container, patterns)
 }
 
+#[cfg(windows)]
+pub(super) fn is_skipped_compute(shaders: &[Arc<Shader>]) -> bool {
+    shaders.iter().any(|shader| {
+        shader.stage == "compute" && skipped_compute_name(&shader.container).is_some()
+    })
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

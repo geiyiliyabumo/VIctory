@@ -370,6 +370,112 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
     }
 }
 
+/// Summary of [`pack_library`].
+pub struct LibraryPack {
+    pub made: usize,
+    pub loaded: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub slow: usize,
+}
+
+/// Populates and saves `host-pipelines.bin` (`ID3D12PipelineLibrary`) for
+/// `which` already-warmed pipelines in `dir`, and replaces `slow-pipelines.txt`
+/// with only pipelines that remain slow (`>= 1000 ms`) with a warm driver cache.
+/// Compute pipelines matching `VICTORY_SKIP_COMPUTE_NAMES` are skipped.
+pub fn pack_library(dir: &Path, which: &[usize], threads: usize) -> LibraryPack {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    super::library::use_pipeline_cache(dir.to_path_buf());
+    let mut places = HashMap::new();
+    walk_shaders(dir, |stage, hash, at, len| {
+        let _ = places.insert(hash, (stage, at, len));
+    });
+    let wanted: HashSet<usize> = which.iter().copied().collect();
+    let mut entries = HashMap::new();
+    walk_pipelines(dir, |n, bytes| {
+        if wanted.contains(&n) {
+            entries.insert(n, bytes.to_vec());
+        }
+    });
+    let work: Vec<(String, Vec<u8>)> = which
+        .iter()
+        .filter_map(|n| {
+            let bytes = entries.remove(n)?;
+            let key: String = bytes
+                .get(..16)?
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            Some((key, bytes))
+        })
+        .collect();
+
+    let made_before = super::library::MADE.load(Ordering::Relaxed);
+    let loaded_before = super::library::LOADED.load(Ordering::Relaxed);
+    let next = AtomicUsize::new(0);
+    let skipped = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    let warm_slow: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
+    let workers = threads.clamp(1, 8).min(work.len().max(1));
+    let shaders_path = dir.join(SHADERS);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let Ok(mut file) = std::fs::File::open(&shaders_path) else {
+                    return;
+                };
+                let mut read = |hash: &[u8; 32]| {
+                    let &(_, at, len) = places.get(hash)?;
+                    let mut bytes = vec![0; len as usize];
+                    file.seek(SeekFrom::Start(at)).ok()?;
+                    file.read_exact(&mut bytes).ok()?;
+                    Some(bytes)
+                };
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((key, entry)) = work.get(i) else {
+                        break;
+                    };
+                    let Some((shaders, g)) = parse(entry, &mut read) else {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    if super::is_skipped_compute(&shaders) {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let began = std::time::Instant::now();
+                    if HostPipeline::new(&shaders, g.as_deref()).is_some() {
+                        let ms = began.elapsed().as_millis() as u64;
+                        if ms >= super::library::SLOW_MS {
+                            warm_slow
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(key.clone(), ms);
+                        }
+                    } else {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+
+    let slow_map = warm_slow.into_inner().unwrap_or_else(|e| e.into_inner());
+    let slow_count = slow_map.len();
+    super::library::replace_slow(slow_map);
+    super::library::save(true);
+    LibraryPack {
+        made: super::library::MADE.load(Ordering::Relaxed).saturating_sub(made_before) as usize,
+        loaded: super::library::LOADED.load(Ordering::Relaxed).saturating_sub(loaded_before) as usize,
+        skipped: skipped.load(Ordering::Relaxed),
+        failed: failed.load(Ordering::Relaxed),
+        slow: slow_count,
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn parse(
     entry: &[u8],

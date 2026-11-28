@@ -4753,6 +4753,7 @@ impl State {
                 return false;
             }
             self.mesh_scissor(list, true);
+            list.keep(&args.buffer);
             let record = crate::launch::Launch::Record(args.gpu(arguments));
             let ran = crate::launch::record(list, launch.roots, record);
             if ran {

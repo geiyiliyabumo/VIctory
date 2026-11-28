@@ -143,6 +143,9 @@ enum Command {
         /// Only the pipelines earlier runs drew with.
         #[arg(long)]
         used: bool,
+        /// Pack warmed pipelines into `host-pipelines.bin` and refresh `slow-pipelines.txt`.
+        #[arg(long)]
+        save_library: bool,
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
@@ -243,7 +246,9 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, save_library, these } => {
+            warm::run(jobs, limit, again, used, save_library, these)
+        }
         Command::Run {
             exe,
             unimplemented,

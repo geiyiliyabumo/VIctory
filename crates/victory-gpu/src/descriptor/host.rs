@@ -4068,7 +4068,7 @@ impl HostHeap {
             if kept.is_some() || !self.sampler {
                 self.put(index);
             }
-            self.twin_made(index, kept.is_some() && twinned(&view));
+            self.twin_made(index, !later && kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
             self.quick_is(index, if later { 0 } else { key });
             drop(held);

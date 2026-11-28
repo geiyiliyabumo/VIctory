@@ -49,7 +49,14 @@ fn select_pipelines(
     all
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+pub fn run(
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    again: bool,
+    used: bool,
+    save_library: bool,
+    these: Option<String>,
+) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
@@ -130,6 +137,51 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         times.last().copied().unwrap_or(0.0),
         times.iter().sum::<f64>() / 1e3
     );
+    drop(done_out);
+    drop(slow_out);
+    drop(bad_out);
+    if save_library {
+        let pack_began = Instant::now();
+        let listed_after = std::fs::read_to_string(&done_file).unwrap_or_default();
+        let mut done_after: HashSet<&str> = HashSet::new();
+        for line in listed_after.lines() {
+            if let Some((of, key)) = line.split_once(' ')
+                && of == fingerprint
+            {
+                done_after.insert(key);
+            }
+        }
+        let bad_after: HashSet<String> = if known::bad_list_disabled() {
+            HashSet::new()
+        } else {
+            let text = std::fs::read_to_string(&bad_file).unwrap_or_default();
+            known::parse_bad_keys(&text, &fingerprint)
+        };
+        let mut pack_indices: Vec<usize> = (0..keys.len())
+            .filter(|&n| {
+                let key = keys[n].as_str();
+                done_after.contains(key)
+                    && !bad_after.contains(key)
+                    && (!used || early.contains(key))
+            })
+            .collect();
+        pack_indices.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
+        pack_indices.truncate(limit.unwrap_or(usize::MAX));
+        println!(
+            "packing {} warmed pipelines into host-pipelines.bin ({jobs} threads) ...",
+            pack_indices.len()
+        );
+        let packed = known::pack_library(&dir, &pack_indices, jobs);
+        println!(
+            "library packed in {:.1} s: {} made, {} loaded, {} skipped, {} failed, {} warm-slow",
+            pack_began.elapsed().as_secs_f64(),
+            packed.made,
+            packed.loaded,
+            packed.skipped,
+            packed.failed,
+            packed.slow
+        );
+    }
     Ok(())
 }
 

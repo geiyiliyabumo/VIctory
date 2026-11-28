@@ -751,6 +751,15 @@ pub(crate) fn note_time(key: &str, ms: u64) {
     }
 }
 
+/// Replaces the slow-pipeline table with fresh warm timings (called after
+/// `victory warm --save-library` so stale cold-compile timings do not throttle
+/// warm pipelines into `queue.slow`).
+pub(super) fn replace_slow(times: std::collections::HashMap<String, u64>) {
+    let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+    *slow = Some(times);
+    USED_CHANGED.store(true, Ordering::Relaxed);
+}
+
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
