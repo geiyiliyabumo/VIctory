@@ -5,7 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub mod census;
 pub mod opt;
@@ -86,6 +86,11 @@ pub(crate) enum Bin {
     And = 10,
     Or = 11,
     Xor = 12,
+    // Distinct keys for the optimizer's common subexpression pass.
+    ExactAdd = 0x10,
+    ExactSub = 0x11,
+    ExactMul = 0x12,
+    Reciprocal = 0x14,
 }
 
 /// `atomicrmw` operations.
@@ -225,6 +230,8 @@ pub(crate) struct Module {
     funcs: Vec<Func>,
     func_ids: HashMap<String, u32>,
     insts: Vec<Inst>,
+    precise: HashSet<u32>,
+    arcp: HashSet<u32>,
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
@@ -423,6 +430,29 @@ impl Module {
     pub fn bin(&mut self, block: usize, op: Bin, a: V, b: V) -> V {
         let ty = self.type_of(a);
         self.push(block, ty, Op::Bin(op, a, b))
+    }
+    pub(crate) fn bin_exact(&mut self, block: usize, op: Bin, a: V, b: V) -> V {
+        let op = if super::fast_math() == 0 {
+            op
+        } else {
+            match op {
+                Bin::Add => Bin::ExactAdd,
+                Bin::Sub => Bin::ExactSub,
+                Bin::Mul => Bin::ExactMul,
+                _ => unreachable!("unsupported exact float operation"),
+            }
+        };
+        let v = self.bin(block, op, a, b);
+        let V::Inst(i) = v else { unreachable!() };
+        self.precise.insert(i);
+        v
+    }
+    pub(crate) fn bin_arcp(&mut self, block: usize, op: Bin, a: V, b: V) -> V {
+        assert_eq!(op, Bin::SDiv);
+        let v = self.bin(block, Bin::Reciprocal, a, b);
+        let V::Inst(i) = v else { unreachable!() };
+        self.arcp.insert(i);
+        v
     }
     pub fn cast(&mut self, block: usize, op: Cast, v: V, to: Ty) -> V {
         self.push(block, to, Op::Cast(op, v))
@@ -834,6 +864,7 @@ impl Module {
         let mut inst_id = base;
         // The operands of variable-length records, reused across them.
         let mut r: Vec<u64> = Vec::new();
+        let fast_math = super::fast_math();
         for b in layout.iter().map(|&b| &self.blocks[b]) {
             for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
                 let inst = &self.insts[i as usize];
@@ -843,7 +874,26 @@ impl Module {
                     u64::from(inst_id - a)
                 };
                 match &inst.op {
-                    Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
+                    Op::Bin(op, a, b) => {
+                        let is_float = matches!(
+                            self.types[inst.ty.0 as usize],
+                            TypeDef::Float | TypeDef::Double
+                        );
+                        let mut fmf = if is_float && !self.precise.contains(&i) {
+                            fast_math
+                        } else {
+                            0
+                        };
+                        if is_float && self.arcp.contains(&i) {
+                            fmf |= 0x10;
+                        }
+                        let opcode = *op as u64 & 0xf;
+                        if fmf != 0 {
+                            w.record(2, &[rel(*a), rel(*b), opcode, u64::from(fmf)]);
+                        } else {
+                            w.record(2, &[rel(*a), rel(*b), opcode]);
+                        }
+                    }
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
                     Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),
                     Op::Select(c, t, f) => w.record(29, &[rel(*t), rel(*f), rel(*c)]),
@@ -1044,6 +1094,65 @@ impl Writer {
     fn finish(mut self) -> Vec<u8> {
         self.align();
         self.words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+}
+
+/// Read unabbreviated records from a block written by `Writer`.
+#[cfg(all(test, windows))]
+pub(super) fn test_records(bytes: &[u8], block: u64) -> Vec<(u64, Vec<u64>)> {
+    fn bits(bytes: &[u8], at: &mut usize, count: usize) -> u64 {
+        let mut value = 0;
+        for shift in 0..count {
+            value |= u64::from(bytes[*at / 8] >> (*at % 8) & 1) << shift;
+            *at += 1;
+        }
+        value
+    }
+
+    fn vbr(bytes: &[u8], at: &mut usize, width: usize) -> u64 {
+        let high = 1 << (width - 1);
+        let mut value = 0;
+        for shift in (0..64).step_by(width - 1) {
+            let chunk = bits(bytes, at, width);
+            value |= (chunk & (high - 1)) << shift;
+            if chunk & high == 0 {
+                return value;
+            }
+        }
+        panic!("invalid VBR");
+    }
+
+    let mut at = 32;
+    let mut width = 2;
+    let mut active = false;
+    let mut records = Vec::new();
+    loop {
+        match bits(bytes, &mut at, width) {
+            0 => return records,
+            1 => {
+                let id = vbr(bytes, &mut at, 8);
+                let inner_width = vbr(bytes, &mut at, 4) as usize;
+                at = at.next_multiple_of(32);
+                let len = bits(bytes, &mut at, 32) as usize;
+                if id == MODULE_BLOCK || id == block {
+                    width = inner_width;
+                    active = id == block;
+                } else {
+                    at += len * 32;
+                }
+            }
+            3 => {
+                let record = vbr(bytes, &mut at, 6);
+                let count = vbr(bytes, &mut at, 6);
+                let operands = (0..count).map(|_| vbr(bytes, &mut at, 6));
+                if active {
+                    records.push((record, operands.collect()));
+                } else {
+                    operands.for_each(drop);
+                }
+            }
+            _ => panic!("unexpected abbreviation"),
+        }
     }
 }
 

@@ -379,7 +379,7 @@ mod tests {
         if !crate::pool::fresh(&copy.texture) {
             return;
         }
-        let held = super::super::STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let held = super::super::STAGING.write().unwrap_or_else(|e| e.into_inner());
         let raw = texture as usize;
         let taker = std::thread::spawn(move || match claim(raw as This, 0, u64::MAX) {
             Some(Taken::New(job)) => {

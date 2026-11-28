@@ -72,6 +72,8 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    #[cfg(test)]
+    pub early_depth: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1845,6 +1847,12 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let StageIo::Ps { db_shader_control, .. } = &x.native.io
+            && super::early_depth_of(*db_shader_control, &s.outputs, super::early_depth())
+                == super::EarlyDepth::Given
+        {
+            s.flags |= flags::EARLY_DEPTH_STENCIL;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -2920,6 +2928,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            early_depth: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4569,8 +4579,11 @@ impl<'a> Lower<'a> {
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        if super::fast_legacy() {
+            return self.s.m.bin(c, Bin::Mul, a, b);
+        }
         if host_rdna() & super::rdna::LEGACY != 0 {
-            let m = self.s.m.bin(c, Bin::Mul, a, b);
+            let m = self.s.m.bin_exact(c, Bin::Mul, a, b);
             let zero = self.s.m.f32(0);
             // A product is not 0 only where one factor is 0 and the other an
             // infinity or no number: never of a value with itself, nor of two
@@ -4591,7 +4604,7 @@ impl<'a> Lower<'a> {
             let z = self.s.m.cmp(c, pred::OEQ, asked, zero);
             return self.s.m.select(c, z, zero, m);
         }
-        let m = self.s.m.bin(c, Bin::Mul, a, b);
+        let m = self.s.m.bin_exact(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
@@ -9143,6 +9156,7 @@ impl<'a> Lower<'a> {
                 };
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
+                    _ if super::fast_legacy() => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
@@ -9156,12 +9170,16 @@ impl<'a> Lower<'a> {
             }
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
+                let r = if super::fast_legacy() {
+                    self.fmad(a, bb, cc)
                 } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
+                    let m = if name == "v_mad_legacy_f32" {
+                        self.legacy_mul(a, bb)
+                    } else {
+                        self.s.m.bin(c, Bin::Mul, a, bb)
+                    };
+                    self.s.m.bin(c, Bin::Add, m, cc)
                 };
-                let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
             }
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
@@ -9183,7 +9201,11 @@ impl<'a> Lower<'a> {
                 // shortcut: the hardware reciprocal is approximate (1 ULP); this divides.
                 let a = f(self, 0)?;
                 let one = self.s.m.f32(1.0f32.to_bits());
-                let r = self.s.m.bin(c, Bin::SDiv, one, a);
+                let r = if super::fast_rcp() {
+                    self.s.m.bin_arcp(c, Bin::SDiv, one, a)
+                } else {
+                    self.s.m.bin(c, Bin::SDiv, one, a)
+                };
                 float(self, r)
             }
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"

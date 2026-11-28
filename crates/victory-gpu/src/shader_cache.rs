@@ -144,6 +144,27 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        if victory_shader::emit::early_depth() {
+            tracing::info!("VICTORY_EARLY_DEPTH=1: eligible pixel shaders use early depth");
+            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1\0");
+        }
+        let fm = victory_shader::emit::fast_math();
+        if fm != 0 {
+            bytes.extend_from_slice(b"VICTORY_FAST_MATH=");
+            bytes.push(fm);
+        }
+        if victory_shader::emit::fast_legacy() {
+            bytes.extend_from_slice(b"VICTORY_FAST_LEGACY=1\0");
+        }
+        if victory_shader::emit::fast_rcp() {
+            bytes.extend_from_slice(b"VICTORY_FAST_RCP=1\0");
+        }
+        if victory_shader::emit::mesh_payload_bytes() != 0 {
+            bytes.extend_from_slice(b"VICTORY_MESH_LAUNCH=1\0");
+        }
+        if victory_shader::emit::bvh_no_hit() {
+            bytes.extend_from_slice(b"VICTORY_BVH_NO_HIT=1\0");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

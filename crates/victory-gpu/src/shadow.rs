@@ -358,11 +358,32 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_room_kept_bytes(
+    let live = CARD_BYTES[0].load(Ordering::Relaxed);
+    let kept = card_room_kept_bytes(
         card_limits().1,
-        CARD_BYTES[0].load(Ordering::Relaxed),
+        live,
         CARD_REFUSED[1].load(Ordering::Relaxed),
-    )
+    );
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    card_room_kept_for_memory(kept, live, memory)
+}
+
+/// Drops the residual buffer reserve once the initial card-buffer burst has
+/// landed and local VRAM is already >= 94% of the DXGI budget, so texture
+/// admission is not starved by phantom buffer headroom that `card_for` itself
+/// would decline to allocate.
+fn card_room_kept_for_memory(kept: u64, live: u64, memory: Option<[u64; 4]>) -> u64 {
+    if kept == 0 {
+        return 0;
+    }
+    if let Some([budget, used, ..]) = memory
+        && budget > 0
+        && live >= (256 << 20)
+        && u128::from(used) * 100 >= u128::from(budget) * 94
+    {
+        return 0;
+    }
+    kept
 }
 
 fn card_room_kept_bytes(limit: u64, live: u64, refused: u64) -> u64 {
@@ -6125,69 +6146,71 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
     };
     // Existing named, tail and holder windows all share the read lock.
-    {
+    let (start, len) = {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&pick(&map)) {
+        let key = pick(&map);
+        if let Some(shadow) = map.get(&key) {
             note(shadow);
             return Some(shadow.clone());
         }
-    }
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    let (start, len) = pick(&map);
-    if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
-        return Some(shadow.clone());
-    }
-    // In place, if asked for and the window's memory can be opened: the
-    // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
-        return Some(shadow);
-    }
-    // One buffer in the card's memory, filled by the CPU through the bus.
-    if let Some((buffer, data)) = window_mapped_for(len) {
+        key
+    };
+    // Allocate the new host window outside `LOOSE.write()` so D3D12 resource
+    // creation and in-place heap opening never stall concurrent `LOOSE.read()`
+    // lookups across the title's recording threads.
+    let candidate = if let Some(placed) =
+        crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true))
+    {
+        Arc::new(Shadow::placed(placed, start, len, true))
+    } else if let Some((buffer, data)) = window_mapped_for(len) {
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
         shadow.mapped = true;
-        let shadow = Arc::new(shadow);
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
-        return Some(shadow);
-    }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card::new(buffer, len);
-            (on_card, Some(card))
-        }
-        None => (buffer, None),
+        Arc::new(shadow)
+    } else {
+        let (buffer, data) = host()?.shared_buffer(len)?;
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+        // With room for windows on the card (`window_card_most`): shaders get a
+        // buffer there, and the one just made is the CPU's side.
+        let (buffer, card) = match window_card_for(len) {
+            Some(on_card) => {
+                crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+                let card = Card::new(buffer, len);
+                (on_card, Some(card))
+            }
+            None => (buffer, None),
+        };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory copied to the host"
+        );
+        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+        shadow.window = true;
+        shadow.card = card;
+        share(shadow)
     };
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
-    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
-    shadow.window = true;
-    shadow.card = card;
-    let shadow = share(shadow);
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
-    BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
-    Some(shadow)
+    let winner = {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let existing_key = pick(&map);
+        if let Some(existing) = map.get(&existing_key) {
+            note(existing);
+            existing.clone()
+        } else {
+            note(&candidate);
+            map.insert((start, len), candidate.clone());
+            BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+            candidate.clone()
+        }
+    };
+    // Drop any losing candidate outside `LOOSE.write()`.
+    drop(candidate);
+    Some(winner)
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
@@ -6441,6 +6464,12 @@ mod window_tests {
         assert_eq!(card_room_kept_bytes(705 * MIB, 256 * MIB, 5 * MIB), 444 * MIB);
         assert_eq!(card_room_kept_bytes(2048 * MIB, 256 * MIB, 5 * MIB), 763 * MIB);
         assert_eq!(card_room_kept_bytes(640 * MIB, u64::MAX, 1), 0);
+
+        let budget = 6_600 * MIB;
+        assert_eq!(super::card_room_kept_for_memory(128 * MIB, 256 * MIB, Some([budget, budget * 94 / 100, 0, 0])), 0);
+        assert_eq!(super::card_room_kept_for_memory(128 * MIB, 256 * MIB, Some([budget, budget * 90 / 100, 0, 0])), 128 * MIB);
+        assert_eq!(super::card_room_kept_for_memory(128 * MIB, 100 * MIB, Some([budget, budget * 98 / 100, 0, 0])), 128 * MIB);
+        assert_eq!(super::card_room_kept_for_memory(128 * MIB, 256 * MIB, None), 128 * MIB);
     }
 
     /// An ask that may take any window takes the longest that holds all of

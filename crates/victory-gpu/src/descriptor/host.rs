@@ -2783,9 +2783,10 @@ impl HostHeap {
             // (As `mirror`.)
             let stale = self.note_buffer(index, Some(&view), true);
             let old = view_at(shown as u32, (shown >> 32) as u32);
+            let has_room = crate::resource::room_lately() || crate::pool::texture_room() >= (128 << 20);
             let kept = old.is_some_and(|old| match kin(&old, &view) {
                 Kin::Same => true,
-                kin => crate::resource::room_lately() && kin.kept(keep_shown()),
+                kin => has_room && kin.kept(keep_shown()),
             });
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
@@ -3992,7 +3993,8 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = crate::resource::room_lately() && kin.kept(keep_shown());
+                    let has_room = crate::resource::room_lately() || crate::pool::texture_room() >= (128 << 20);
+                    let kept = has_room && kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
                         drop(held);
@@ -4048,8 +4050,15 @@ impl HostHeap {
             }
             self.quick_is(index, 0);
             self.made.set(index, if later { 0 } else { key });
+            // Queued 2D/2D-array texture slots get the 0x80 neutral stand-in
+            // instead of a zeroed null SRV so shaders never sample (0,0,0,0)
+            // black albedo or NaN-producing (0,0) BC5 normals while streaming.
             let kept = if later {
-                None
+                if !self.sampler && is_texture_view(&view) {
+                    Some(neutral_for(&view, self.at(index)))
+                } else {
+                    None
+                }
             } else {
                 make_twinned(&view, self.at(index), self.twin(index))
             };

@@ -131,6 +131,86 @@ pub use shader::{
 static EARLY_DEPTH_COUNTS: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+pub(crate) const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+const DEPTH_STENCIL_EXPORT: u32 = 0b111;
+
+#[cfg(test)]
+thread_local! {
+    static EARLY_DEPTH_FOR_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static FAST_MATH_FOR_TESTS: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    static FAST_RCP_FOR_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether eligible pixel shaders declare an early depth-stencil test.
+pub fn early_depth() -> bool {
+    #[cfg(test)]
+    if let Some(on) = EARLY_DEPTH_FOR_TESTS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_some_and(|v| v == "1"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EarlyDepth {
+    NotAsked,
+    Given,
+    Off,
+    Exports,
+}
+
+pub(crate) fn early_depth_of(
+    db_shader_control: u32,
+    outputs: &[container::SigElement],
+    on: bool,
+) -> EarlyDepth {
+    if db_shader_control & DEPTH_BEFORE_SHADER == 0 {
+        EarlyDepth::NotAsked
+    } else if db_shader_control & DEPTH_STENCIL_EXPORT != 0
+        || outputs.iter().any(|o| (17..=20).contains(&o.kind))
+    {
+        EarlyDepth::Exports
+    } else if on {
+        EarlyDepth::Given
+    } else {
+        EarlyDepth::Off
+    }
+}
+
+/// DXIL binary float flags: fast (1), nnan (2), ninf (4), nsz (8), arcp (16).
+pub fn fast_math() -> u8 {
+    #[cfg(test)]
+    if let Some(flags) = FAST_MATH_FOR_TESTS.get() {
+        return flags;
+    }
+    static FLAGS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *FLAGS.get_or_init(|| {
+        let value = std::env::var("VICTORY_FAST_MATH").ok();
+        parse_set(value.as_deref(), 0, 0x1f) as u8
+    })
+}
+
+/// Whether legacy float products and multiply-adds use the host operations.
+pub fn fast_legacy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_LEGACY").is_some_and(|v| v != "0"))
+}
+
+/// Whether console float reciprocals allow approximate division.
+pub fn fast_rcp() -> bool {
+    #[cfg(test)]
+    if let Some(on) = FAST_RCP_FOR_TESTS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_RCP").is_some_and(|v| v != "0"))
+}
+
+/// Whether BVH intersections always return a miss.
+pub fn bvh_no_hit() -> bool {
+    lower::intersect::no_hit()
+}
+
 /// Pixel programs translated since the start whose console code tests depth
 /// before them: given D3D12's early test, left with the late one because the
 /// switch is off, left with it because they write depth or stencil.
@@ -343,6 +423,10 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    if early_depth() {
+        out.extend_from_slice(b"VICTORY_EARLY_DEPTH=1\0");
+    }
+    out.extend([fast_math(), u8::from(fast_legacy()), u8::from(fast_rcp())]);
     out
 }
 
@@ -852,6 +936,12 @@ fn emit_program(
         }
         _ => 0,
     };
+    let early = match &native.io {
+        crate::native::StageIo::Ps { db_shader_control, .. } => {
+            early_depth_of(*db_shader_control, &outputs, early_depth())
+        }
+        _ => EarlyDepth::NotAsked,
+    };
     let l = lower::lower_with_ambient(
         &lower::Parts {
             native,
@@ -866,6 +956,17 @@ fn emit_program(
         },
         tiled_ambient(c, native),
     )?;
+    #[cfg(test)]
+    assert_eq!(l.early_depth, early == EarlyDepth::Given);
+    let count = match early {
+        EarlyDepth::Given => Some(0),
+        EarlyDepth::Off => Some(1),
+        EarlyDepth::Exports => Some(2),
+        EarlyDepth::NotAsked => None,
+    };
+    if let Some(i) = count {
+        EARLY_DEPTH_COUNTS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -1200,6 +1301,176 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    fn color_output() -> SigElement {
+        SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn early_depth_is_given_where_the_console_tests_before_the_program() {
+        let request = DEPTH_BEFORE_SHADER;
+        assert_eq!(early_depth_of(0, &[], true), EarlyDepth::NotAsked);
+        assert_eq!(early_depth_of(request, &[], false), EarlyDepth::Off);
+        assert_eq!(early_depth_of(request, &[color_output()], true), EarlyDepth::Given);
+        for bit in [1, 2, 4] {
+            assert_eq!(early_depth_of(request | bit, &[], false), EarlyDepth::Exports);
+        }
+        for kind in 17..=20 {
+            let output = SigElement { kind, ..color_output() };
+            assert_eq!(early_depth_of(request, &[output], true), EarlyDepth::Exports);
+        }
+    }
+
+    #[cfg(windows)]
+    fn emit_test_pixel(words: &[u32], db_shader_control: u32) -> HostShader {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 17,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = container::signature(&[color_output()], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        emit(&c, &native, &p, &st, &io, &res).unwrap()
+    }
+
+    #[cfg(windows)]
+    fn validate_test_dxil(dxil: &[u8]) {
+        let path = validator::Validator::default_path().expect("dxil.dll path");
+        validator::Validator::load(Some(&path))
+            .expect("load dxil.dll")
+            .validate(&mut dxil.to_vec())
+            .expect("DXIL validation");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_consoles_early_depth_test_is_declared_with_the_switch() {
+        let words = [0x7E00_02F2, 0xF800_180F, 0, 0xBF81_0000];
+        let off = emit_test_pixel(&words, DEPTH_BEFORE_SHADER).dxil;
+        EARLY_DEPTH_FOR_TESTS.set(Some(true));
+        let on = emit_test_pixel(&words, DEPTH_BEFORE_SHADER).dxil;
+        let unrequested = emit_test_pixel(&words, 0).dxil;
+        EARLY_DEPTH_FOR_TESTS.set(None);
+        assert_ne!(off, on);
+        assert_eq!(off, unrequested);
+        validate_test_dxil(&on);
+    }
+
+    #[cfg(windows)]
+    fn test_bitcode(dxil: &[u8]) -> &[u8] {
+        let container = Container::parse(dxil).unwrap();
+        let part = container.part(FourCC::DXIL).unwrap();
+        crate::dxil::DxilProgram::parse(part.data).unwrap().bitcode
+    }
+
+    #[cfg(windows)]
+    fn binary_records(dxil: &[u8]) -> Vec<Vec<u64>> {
+        bitcode::test_records(test_bitcode(dxil), 12)
+            .into_iter()
+            .filter_map(|(code, operands)| (code == 2).then_some(operands))
+            .collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fast_math_and_fast_rcp_emit_valid_dxil_flags() {
+        let words = [
+            0x7E00_02F4, // v_mov_b32 v0, 2.0
+            0x0600_00F2, // v_add_f32 v0, 1.0, v0
+            0x7E02_5500, // v_rcp_f32 v1, v0
+            0xF800_180F, 0x0101_0000, // exp mrt0 v0, v0, v1, v1 done vm
+            0xBF81_0000,
+        ];
+        assert_eq!(parse_set(Some("36"), 0, 0x1f), 4);
+        assert_eq!(parse_set(Some("0x24"), 0, 0x1f), 4);
+        let default = emit_test_pixel(&words, 0).dxil;
+        FAST_MATH_FOR_TESTS.set(Some(0));
+        FAST_RCP_FOR_TESTS.set(Some(false));
+        let off = emit_test_pixel(&words, 0).dxil;
+        assert_eq!(default, off);
+        let records = binary_records(&off);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.len() == 3));
+
+        FAST_MATH_FOR_TESTS.set(Some(0x04));
+        FAST_RCP_FOR_TESTS.set(Some(true));
+        let on = emit_test_pixel(&words, 0).dxil;
+        FAST_MATH_FOR_TESTS.set(None);
+        FAST_RCP_FOR_TESTS.set(None);
+        let records = binary_records(&on);
+        assert!(records.iter().any(|r| r.get(2..) == Some(&[0, 0x04])));
+        assert!(records.iter().any(|r| r.get(2..) == Some(&[4, 0x14])));
+        validate_test_dxil(&on);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bvh_no_hit_emits_miss_without_memory_reads() {
+        use lower::intersect::TEST_NO_HIT;
+
+        for pointer in [0, 4, 5, 6] {
+            let mov = |reg: u32, code: u32| 0x7E00_0200 | reg << 17 | code;
+            let mut words = vec![mov(1, 0x80 + pointer)];
+            words.extend((2..=12).map(|r| mov(r, 0x80)));
+            words.extend([
+                0xBE98_0380, 0xBE99_0B81, 0xBE9A_03C1, 0xBE9B_03FF, 0x8900_03FF,
+                0xF19C_9F07, 0x0006_0D01, 0x0504_0302, 0x0908_0706, 0x000C_0B0A,
+                0xF800_180F, 0x100F_0E0D, 0xBF81_0000,
+            ]);
+            let miss = if pointer & 6 == 4 {
+                [crate::bvh::NONE; 4]
+            } else {
+                crate::bvh::MISS.map(f32::to_bits)
+            };
+            assert!(!bvh_no_hit());
+            TEST_NO_HIT.set(true);
+            let shader = emit_test_pixel(&words, 0);
+            TEST_NO_HIT.set(false);
+            let bc = test_bitcode(&shader.dxil);
+            let records = bitcode::test_records(bc, 12);
+            assert_eq!(
+                records.iter().map(|(code, _)| *code).collect::<Vec<_>>(),
+                [1, 34, 34, 34, 34, 10],
+                "only four output writes and a return"
+            );
+            let constants: Vec<_> = bitcode::test_records(bc, 11)
+                .into_iter()
+                .filter(|(code, _)| *code != 1) // SETTYPE does not create a value.
+                .collect();
+            for ((_, call), bits) in records[1..5].iter().zip(miss) {
+                // The four void calls leave the relative value base unchanged.
+                let constant = |arg: usize| &constants[constants.len() - call[arg] as usize];
+                assert_eq!(*constant(4), (4, vec![10])); // Integer opcode 5: storeOutput.
+                assert_eq!(*constant(8), (6, vec![u64::from(bits)])); // Float bits.
+            }
+            validate_test_dxil(&shader.dxil);
+        }
+    }
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose

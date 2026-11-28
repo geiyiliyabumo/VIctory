@@ -2266,10 +2266,15 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
+            let pool_free = crate::pool::texture_room();
+            let eff_used = used.saturating_sub(pool_free)
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+            if pool_free >= (256 << 20) && used < budget {
+                (600_000, u64::MAX)
+            } else {
+                crate::host::vram_keep(budget, eff_used)
+            }
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
@@ -2296,9 +2301,9 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
     const RELAXED_BUDGET_US: u64 = 4_000;
-    const PRESSURE_SCAN_BUDGET_US: u64 = 4_000;
-    const PRESSURE_BUDGET_US: u64 = 8_000;
-    const PRESSURE_WALL_US: u64 = 12_000;
+    const PRESSURE_SCAN_BUDGET_US: u64 = 2_000;
+    const PRESSURE_BUDGET_US: u64 = 5_000;
+    const PRESSURE_WALL_US: u64 = 8_000;
     const PRESSURE_MIN_BYTES: u64 = 32 << 20;
     const LARGE_BACKING_BYTES: u64 = 128 << 10;
     const SMALL_SCAN_LIMIT: usize = 4_096;
@@ -2414,10 +2419,10 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let host_written = crate::texture::host_written_snapshot();
     let mut pass1_looked = 0usize;
-    // Measure eviction budget & wall cap from the eviction loop itself so an
-    // OS page-fault during candidate scanning never starves eviction to 0 MB.
+    // Cap total sweep wall time from `began` so scan + Pass 1 + Pass 2 never
+    // stall the submitting thread beyond `PRESSURE_WALL_US` (8 ms).
     let loop_began = std::time::Instant::now();
-    let past_evict_wall = || pressure && loop_began.elapsed().as_micros() as u64 >= PRESSURE_WALL_US;
+    let past_evict_wall = || pressure && began.elapsed().as_micros() as u64 >= PRESSURE_WALL_US;
     let mut try_evict = |acc: &mut SweepAcc, at: usize| -> bool {
         if past_evict_wall() {
             acc.stop_reason = "wall";
@@ -2530,7 +2535,8 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
                 }
                 if small_checked >= SMALL_SCAN_LIMIT
                     || (small_checked & 63 == 0
-                        && small_scan_began.elapsed().as_micros() as u64 >= PRESSURE_SCAN_BUDGET_US)
+                        && (small_scan_began.elapsed().as_micros() as u64 >= PRESSURE_SCAN_BUDGET_US
+                            || past_evict_wall()))
                 {
                     next_small = at;
                     break;

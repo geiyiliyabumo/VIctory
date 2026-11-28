@@ -31,12 +31,30 @@ use crate::resource::BvhNodes;
 
 #[cfg(test)]
 thread_local! {
+    pub(in crate::emit) static TEST_NO_HIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
     /// The tests' stand-in for title memory ([`Lower::bvh_memory`]): a
     /// heap slot holding a raw buffer, and the title address of its first
     /// byte. (The card tests have no host to keep copies of title memory
     /// and their directory.)
     pub(in crate::emit) static TEST_MEMORY: std::cell::Cell<Option<(u32, u64)>> =
         const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn no_hit() -> bool {
+    #[cfg(test)]
+    {
+        TEST_NO_HIT.get()
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("VICTORY_BVH_NO_HIT").is_none_or(|v| v != "0")
+                && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+        })
+    }
 }
 
 /// Where the instruction's node is.
@@ -117,6 +135,21 @@ impl<'a> Lower<'a> {
             return Err("a ray-tracing structure that returns triangle ids");
         }
         let guard = self.guard(b, i)?;
+        if no_hit() {
+            let pointer = inst.read(Reg::V(regs[0])).ok_or("an unread operand")?;
+            let pointer = self.i32_of(pointer)?;
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.into_iter().enumerate() {
+                let miss = self.s.m.i32(miss.to_bits());
+                let r = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let mut x = Vec::with_capacity(regs.len());
         for &r in &regs {
             let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
@@ -419,10 +452,10 @@ impl<'a> Lower<'a> {
             let bx = &coords[6 * n..6 * n + 6];
             let (mut near, mut far) = ([fzero; 3], [fzero; 3]);
             for a in 0..3 {
-                let low = self.s.m.bin(c, Bin::Sub, bx[a], ray.origin[a]);
-                let low = self.s.m.bin(c, Bin::Mul, low, inverse[a]);
-                let high = self.s.m.bin(c, Bin::Sub, bx[3 + a], ray.origin[a]);
-                let high = self.s.m.bin(c, Bin::Mul, high, inverse[a]);
+                let low = self.s.m.bin_exact(c, Bin::Sub, bx[a], ray.origin[a]);
+                let low = self.s.m.bin_exact(c, Bin::Mul, low, inverse[a]);
+                let high = self.s.m.bin_exact(c, Bin::Sub, bx[3 + a], ray.origin[a]);
+                let high = self.s.m.bin_exact(c, Bin::Mul, high, inverse[a]);
                 near[a] = self.binary(36, low, high);
                 far[a] = self.binary(35, low, high);
             }
@@ -501,7 +534,7 @@ impl<'a> Lower<'a> {
             let r: Vec<V> = (0..3)
                 .map(|a| {
                     let f = self.as_float(words[a]);
-                    self.s.m.bin(c, Bin::Sub, f, ray.origin[a])
+                    self.s.m.bin_exact(c, Bin::Sub, f, ray.origin[a])
                 })
                 .collect();
             p.push([r[0], r[1], r[2]]);
@@ -536,16 +569,16 @@ impl<'a> Lower<'a> {
         };
         let d = axes(self, ray.direction);
         let sz = pick(self, ray.inverse, 0);
-        let sx = self.s.m.bin(c, Bin::Mul, d[0], sz);
-        let sy = self.s.m.bin(c, Bin::Mul, d[1], sz);
+        let sx = self.s.m.bin_exact(c, Bin::Mul, d[0], sz);
+        let sy = self.s.m.bin_exact(c, Bin::Mul, d[1], sz);
         let mut sheared = Vec::with_capacity(3);
         for r in p {
             let r = axes(self, r);
-            let x = self.s.m.bin(c, Bin::Mul, sx, r[2]);
-            let x = self.s.m.bin(c, Bin::Sub, r[0], x);
-            let y = self.s.m.bin(c, Bin::Mul, sy, r[2]);
-            let y = self.s.m.bin(c, Bin::Sub, r[1], y);
-            let z = self.s.m.bin(c, Bin::Mul, sz, r[2]);
+            let x = self.s.m.bin_exact(c, Bin::Mul, sx, r[2]);
+            let x = self.s.m.bin_exact(c, Bin::Sub, r[0], x);
+            let y = self.s.m.bin_exact(c, Bin::Mul, sy, r[2]);
+            let y = self.s.m.bin_exact(c, Bin::Sub, r[1], y);
+            let z = self.s.m.bin_exact(c, Bin::Mul, sz, r[2]);
             sheared.push((x, y, z));
         }
         let [(ax, ay, az), (bx, by, bz), (cx, cy, cz)] = sheared[..] else {
@@ -553,9 +586,9 @@ impl<'a> Lower<'a> {
         };
         // p * q - r * s.
         let cross = |l: &mut Self, p: V, q: V, r: V, s: V| {
-            let a = l.s.m.bin(c, Bin::Mul, p, q);
-            let b = l.s.m.bin(c, Bin::Mul, r, s);
-            l.s.m.bin(c, Bin::Sub, a, b)
+            let a = l.s.m.bin_exact(c, Bin::Mul, p, q);
+            let b = l.s.m.bin_exact(c, Bin::Mul, r, s);
+            l.s.m.bin_exact(c, Bin::Sub, a, b)
         };
         let u = cross(self, cx, by, cy, bx);
         let v = cross(self, ax, cy, ay, cx);
@@ -571,13 +604,13 @@ impl<'a> Lower<'a> {
         let before = any(self, pred::OGT);
         let outside = self.s.m.bin(c, Bin::And, behind, before);
         let inside = self.s.m.bin(c, Bin::Xor, outside, on);
-        let det = self.s.m.bin(c, Bin::Add, v, w);
-        let det = self.s.m.bin(c, Bin::Add, u, det);
-        let t = self.s.m.bin(c, Bin::Mul, u, az);
-        let t2 = self.s.m.bin(c, Bin::Mul, v, bz);
-        let t = self.s.m.bin(c, Bin::Add, t, t2);
-        let t2 = self.s.m.bin(c, Bin::Mul, w, cz);
-        let t = self.s.m.bin(c, Bin::Add, t, t2);
+        let det = self.s.m.bin_exact(c, Bin::Add, v, w);
+        let det = self.s.m.bin_exact(c, Bin::Add, u, det);
+        let t = self.s.m.bin_exact(c, Bin::Mul, u, az);
+        let t2 = self.s.m.bin_exact(c, Bin::Mul, v, bz);
+        let t = self.s.m.bin_exact(c, Bin::Add, t, t2);
+        let t2 = self.s.m.bin_exact(c, Bin::Mul, w, cz);
+        let t = self.s.m.bin_exact(c, Bin::Add, t, t2);
         // The distance is not negative: the numerator has the
         // denominator's sign (or is 0). Ordered compares: a denominator
         // of 0 or a NaN is a miss.

@@ -970,6 +970,10 @@ extern "system" fn present(
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            let [given, off, exports] = victory_shader::emit::early_depth_counts();
+            if given + off + exports > 0 {
+                tracing::info!(given, off, exports, "early depth decisions so far");
+            }
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]

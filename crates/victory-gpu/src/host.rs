@@ -167,8 +167,8 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
-    const IDLE_MS: u64 = 5_000;
-    const SHORT_MS: u64 = 3_000;
+    const IDLE_MS: u64 = 10_000;
+    const SHORT_MS: u64 = 8_000;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
@@ -3711,6 +3711,11 @@ fn dynamic_wait_line(frames: f64) {
     );
 }
 
+fn land_aside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1"))
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -4179,7 +4184,7 @@ pub(crate) mod rec;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
-#[cfg(feature = "diagnostics")]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod spans;
 mod torn;
 #[cfg(feature = "diagnostics")]
@@ -5770,6 +5775,11 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
+        if land_aside() {
+            line().poke = true;
+            LINE_MOVED.notify_all();
+            return;
+        }
         let _landing = crate::timeline::span("landed lists reset and given back");
         land();
     }
@@ -6285,7 +6295,6 @@ impl Host {
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
-            #[cfg(feature = "diagnostics")]
             if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
@@ -9888,7 +9897,6 @@ impl Meter {
             card_clock_line(frames, ms);
             upq::line(frames);
             rec::line(frames);
-            #[cfg(feature = "diagnostics")]
             spans::line(frames);
             crate::shadow::back_line(frames);
             #[cfg(feature = "diagnostics")]
@@ -12077,10 +12085,10 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let gib = 1 << 30;
         assert_eq!(vram_keep(100 * gib, 84 * gib).0, 600_000);
         // Past it: the longest idle ones, enough to come down.
-        assert_eq!(vram_keep(100 * gib, 88 * gib), (5_000, 8 * gib));
-        assert_eq!(vram_keep(100 * gib, 95 * gib), (3_000, 11 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (3_000, 36 * gib));
-        assert_eq!(vram_keep(0, 7).0, 5_000);
+        assert_eq!(vram_keep(100 * gib, 88 * gib), (10_000, 8 * gib));
+        assert_eq!(vram_keep(100 * gib, 95 * gib), (8_000, 11 * gib));
+        assert_eq!(vram_keep(100 * gib, 120 * gib), (8_000, 36 * gib));
+        assert_eq!(vram_keep(0, 7).0, 10_000);
     }
 
     #[test]

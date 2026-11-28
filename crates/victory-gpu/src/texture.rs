@@ -132,7 +132,7 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+static STAGING: std::sync::RwLock<Option<HashMap<usize, Arc<Staging>>>> = std::sync::RwLock::new(None);
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -486,7 +486,7 @@ impl Drop for Staging {
 pub(crate) fn memory() -> [u64; 3] {
     use std::sync::atomic::Ordering::Relaxed;
     let kept = STAGING
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map_or(0, |map| map.len() as u64);
@@ -513,7 +513,7 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
     };
@@ -640,7 +640,7 @@ pub(crate) fn host_written_snapshot() -> Option<std::collections::HashSet<usize>
 
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
@@ -1567,13 +1567,13 @@ pub(crate) fn unstage(resource: This) {
 
 /// Detach the staging buffer so the caller can drop it after releasing its locks.
 pub(crate) fn unstage_detach(resource: This) -> Option<Arc<Staging>> {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
     map.as_mut()?.remove(&(resource as usize))
 }
 
 /// During an idle sweep, skip eviction if another thread is staging a texture.
 pub(crate) fn try_unstage_detach(resource: This) -> Result<Option<Arc<Staging>>, ()> {
-    let mut map = match STAGING.try_lock() {
+    let mut map = match STAGING.try_write() {
         Ok(map) => map,
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return Err(()),
@@ -1583,7 +1583,7 @@ pub(crate) fn try_unstage_detach(resource: This) -> Result<Option<Arc<Staging>>,
 
 /// Where a staged title texture's memory is: address and bytes.
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
     Some((at as u64, len as u64))
 }
@@ -1632,7 +1632,7 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     use std::sync::atomic::Ordering::Relaxed;
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     let staging = map.as_ref()?.get(&(resource as usize))?;
     Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
 }
@@ -1640,7 +1640,7 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
 /// The first level a title texture's staging buffer holds; `u32::MAX`
 /// without one.
 fn staged_from(resource: This) -> u32 {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
         .and_then(|map| map.get(&(resource as usize)))
         .map_or(u32::MAX, |s| s.first)
@@ -1691,7 +1691,7 @@ pub(crate) fn title_span(resource: This, first: u32) -> Option<(u64, u64)> {
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
@@ -1700,7 +1700,7 @@ pub(crate) fn is_staged(resource: This) -> bool {
 /// (Whether it is mapped is asked only if `ask`; else it counts as mapped.)
 pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
     let s = {
-        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     Some((s.read as u64, !ask || committed(s.memory, s.read)))
@@ -1874,14 +1874,18 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize))
-        && s.first <= first.max(copy.base)
-        && s.serial == copy.serial
+    let wanted_first = first.max(copy.base);
     {
-        return Some(s.clone());
+        let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = map.as_ref().and_then(|map| map.get(&(resource as usize)))
+            && s.first <= wanted_first
+            && s.serial == copy.serial
+        {
+            return Some(s.clone());
+        }
     }
+    // Allocate the staging buffer completely outside `STAGING.write()` so
+    // `pool::staging` / `upload_buffer` never blocks concurrent texture reads.
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1976,8 +1980,22 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
     });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    let winner = {
+        let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(HashMap::new);
+        if let Some(existing) = map.get(&(resource as usize))
+            && existing.first <= wanted_first
+            && existing.serial == copy.serial
+        {
+            existing.clone()
+        } else {
+            map.insert(resource as usize, s.clone());
+            s.clone()
+        }
+    };
+    // Drop any losing candidate outside `STAGING.write()`.
+    drop(s);
+    Some(winner)
 }
 
 #[cfg(test)]

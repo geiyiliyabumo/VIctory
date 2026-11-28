@@ -799,7 +799,16 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Passes after which every buffer slot of the heap was looked at again.
-const HEAP_ROUND: u64 = 16;
+const HEAP_ROUND: u32 = 16;
+
+fn heap_round() -> u32 {
+    static ROUND: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ROUND.get_or_init(|| match std::env::var("VICTORY_HEAP_ROUND").as_deref() {
+        Ok("32") => 32,
+        Ok("64") => 64,
+        _ => HEAP_ROUND,
+    })
+}
 
 /// Whether the slots looked at again for no write are a part of them at
 /// every pass, each slot at every sixteenth (`VICTORY_HEAP_SPREAD=0`: all of
@@ -816,8 +825,16 @@ fn heap_spread() -> bool {
 
 /// The host copy and range the buffer view of each of a heap's slots reads
 /// ([`State::heap_buffers`]), by slot.
-#[derive(Default)]
-struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
+struct HeapRanges<T> {
+    index: Vec<u32>,
+    entries: Vec<(u32, (T, u64, u64))>,
+}
+
+impl<T> Default for HeapRanges<T> {
+    fn default() -> Self {
+        Self { index: Vec::new(), entries: Vec::new() }
+    }
+}
 
 /// Whether the heap buffer pass runs once a frame for each view heap a list
 /// binds, not once for all of them, and a list holds each heap's table of
@@ -831,17 +848,12 @@ fn sweep_per_heap() -> bool {
 /// What the heap buffer pass keeps of a view heap, on the heap
 /// ([`crate::descriptor::host::HostHeap`]), so that a heap made where one was
 /// let go starts afresh (codec-d/cool_fox c64fc9b4).
+#[derive(Default)]
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
-}
-
-impl Default for BufferSweep {
-    fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
-    }
 }
 
 impl BufferSweep {
@@ -853,38 +865,75 @@ impl BufferSweep {
         mut matches: impl FnMut(&crate::shadow::Shadow) -> bool,
     ) -> Vec<u32> {
         let mut removed = Vec::new();
-        for (slot, entry) in self.ranges.0.iter_mut().enumerate() {
-            if let Some((shadow, _, _)) = entry
-                && matches(shadow)
-            {
-                *entry = None;
-                removed.push(slot as u32);
+        self.ranges.remove_where(|slot, (shadow, _, _)| {
+            if matches(shadow) {
+                removed.push(slot);
+                true
+            } else {
+                false
             }
-        }
+        });
         removed
     }
 }
 
 impl<T> HeapRanges<T> {
-    fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
-        let slot = slot as usize;
-        if range.is_none() && slot >= self.0.len() {
-            return;
-        }
-        if slot >= self.0.len() {
-            self.0.resize_with(slot + 1, || None);
-        }
-        self.0[slot] = range;
+    const EMPTY: u32 = u32::MAX;
+
+    fn clear(&mut self) {
+        self.index.clear();
+        self.entries.clear();
     }
 
-    /// Forgets the slots of one of `parts` parts
-    /// (`HostHeap::buffer_slots_of`).
+    #[cfg(test)]
+    fn get(&self, slot: u32) -> Option<&(T, u64, u64)> {
+        let i = *self.index.get(slot as usize)?;
+        self.entries.get(i as usize).map(|(_, range)| range)
+    }
+
+    fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
+        let key = slot as usize;
+        let i = self.index.get(key).copied().unwrap_or(Self::EMPTY);
+        match (i, range) {
+            (Self::EMPTY, Some(range)) => {
+                if key >= self.index.len() {
+                    self.index.resize(key + 1, Self::EMPTY);
+                }
+                self.index[key] = self.entries.len() as u32;
+                self.entries.push((slot, range));
+            }
+            (Self::EMPTY, None) => {}
+            (i, Some(range)) => self.entries[i as usize].1 = range,
+            (i, None) => self.remove_at(i as usize),
+        }
+    }
+
+    fn remove_at(&mut self, i: usize) {
+        let (slot, _) = self.entries.swap_remove(i);
+        self.index[slot as usize] = Self::EMPTY;
+        if let Some((moved, _)) = self.entries.get(i) {
+            self.index[*moved as usize] = i as u32;
+        }
+    }
+
+    fn remove_where(&mut self, mut remove: impl FnMut(u32, &(T, u64, u64)) -> bool) {
+        let mut i = 0;
+        while let Some((slot, range)) = self.entries.get(i) {
+            if remove(*slot, range) {
+                self.remove_at(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Forgets the slots of one of the heap's sweep partitions.
     fn forget_part(&mut self, part: u32, parts: u32) {
-        self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
+        self.remove_where(|slot, _| slot % parts == part);
     }
 
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
-        self.0.iter().flatten()
+        self.entries.iter().map(|(_, range)| range)
     }
 }
 
@@ -897,25 +946,32 @@ mod heap_range_tests {
     #[test]
     fn every_slot_is_looked_at_again_in_a_round() {
         const SLOTS: u32 = 1000;
-        let mut ranges = HeapRanges(Vec::new());
+        let mut ranges = HeapRanges::default();
         ranges.set(7, None);
         assert_eq!(ranges.ranges().count(), 0);
         for slot in (0..SLOTS).step_by(3) {
             ranges.set(slot, Some(((), 0, 1)));
         }
-        let parts = HEAP_ROUND as u32;
-        for pass in 1..=HEAP_ROUND {
-            let part = (pass % HEAP_ROUND) as u32;
+        let parts = HEAP_ROUND;
+        for pass in 1..=parts {
+            let part = pass % parts;
             ranges.forget_part(part, parts);
             for slot in (0..SLOTS).step_by(3).filter(|slot| slot % parts == part) {
-                assert!(ranges.0[slot as usize].is_none(), "slot {slot} not forgotten");
-                ranges.set(slot, Some(((), pass, pass)));
+                assert!(ranges.get(slot).is_none(), "slot {slot} not forgotten");
+                ranges.set(slot, Some(((), u64::from(pass), u64::from(pass))));
             }
             assert_eq!(ranges.ranges().count(), SLOTS.div_ceil(3) as usize);
         }
         assert!(ranges.ranges().all(|r| r.1 != 0), "a slot not looked at in a round");
         ranges.set(3, None);
         assert_eq!(ranges.ranges().count(), SLOTS.div_ceil(3) as usize - 1);
+        assert!(ranges.get(3).is_none());
+        assert!(ranges.get(6).is_some());
+        ranges.clear();
+        assert!(ranges.get(6).is_none());
+        assert_eq!(ranges.ranges().count(), 0);
+        ranges.set(6, Some(((), 0, 1)));
+        assert_eq!(ranges.get(6), Some(&((), 0, 1)));
     }
 
     /// The spans of 4,400 copies from the ranges of 72,000 slots, as a pass
@@ -927,7 +983,7 @@ mod heap_range_tests {
         use std::collections::HashMap;
         use std::sync::Arc;
         let copies: Vec<Arc<u64>> = (0..4400).map(Arc::new).collect();
-        let (mut table, mut slots) = (HashMap::new(), HeapRanges(Vec::new()));
+        let (mut table, mut slots) = (HashMap::new(), HeapRanges::default());
         for slot in 0..72_000u32 {
             let copy = &copies[slot as usize * 7919 % 4400];
             table.insert(slot, (copy.clone(), u64::from(slot), u64::from(slot) + 64));
@@ -1114,17 +1170,22 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // still held by an active draw are re-populated passively without marking
     // them active (which would otherwise poison cold-window eviction).
     changed.extend(host.take_rescan_buffers());
-    let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
+    let parts = heap_round();
+    let part = (*passes % u64::from(parts)) as u32;
+    let all = *passes == 0 || (part == 0 && !heap_spread());
     let slots = if all {
-        ranges.0.clear();
+        ranges.clear();
         let mut slots = host.buffer_slots();
         slots.extend(changed);
         slots
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
-        let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
         ranges.forget_part(part, parts);
-        let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
+        let mut slots = match parts {
+            32 => host.buffer_slots_of::<32>(part),
+            64 => host.buffer_slots_of::<64>(part),
+            _ => host.buffer_slots_of::<16>(part),
+        };
         slots.extend(changed);
         slots
     } else {
@@ -1874,13 +1935,7 @@ impl State {
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
-            // SAFETY: an open list and a live pipeline.
-            unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
-            // The title may release the pipeline before it submits the list.
-            list.bind_pipeline(&p.name, &p.pso, &p.root);
-        }
+        self.bind_pso(list, p, &p.pso);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -3770,38 +3825,72 @@ impl State {
         }
     }
 
+    fn bind_pso(&mut self, list: &HostList, p: &HostPipeline, pso: &ID3D12PipelineState) {
+        if self.host_pipeline != pso.as_raw() as usize {
+            // SAFETY: an open list and a live pipeline.
+            unsafe { list.list.SetPipelineState(pso) };
+            self.host_pipeline = pso.as_raw() as usize;
+            // Keep the pipeline alive through submission.
+            list.bind_pipeline(&p.name, pso, &p.root);
+        }
+    }
+
+    fn bind_plain_mesh(&mut self, list: &HostList, p: &HostPipeline) -> bool {
+        if let Some(launch) = &p.launch {
+            let Some(plain) = launch.plain() else {
+                return false;
+            };
+            self.bind_pso(list, p, plain);
+        }
+        true
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = mesh_test() != 1
-            && mesh_kept(self.pipeline)
-            && self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
-                Ok(l6) => {
-                    #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
-                    self.mesh_scissor(list, true);
-                    #[cfg(feature = "diagnostics")]
-                    if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
-                        list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
-                    }
-                    // (The host takes 65,535 groups in a dimension: more is
-                    // undefined there.)
-                    if x > 65_535 {
-                        once!(x, "a mesh dispatch of more groups than the host takes: cut");
-                    }
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
-                    self.mesh_scissor(list, false);
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
-                    true
-                }
-                Err(_) => false,
+        let ran = (|| {
+            if mesh_test() == 1 || !mesh_kept(self.pipeline) {
+                return false;
+            }
+            let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+                return false;
             };
+            if !self.prepare_for(list, false, true) {
+                return false;
+            }
+            let Ok(l6) = list.list.cast::<ID3D12GraphicsCommandList6>() else {
+                return false;
+            };
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("mesh {x}"), false));
+            #[cfg(feature = "diagnostics")]
+            list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
+            if x > 65_535 {
+                once!(x, "a mesh dispatch of more groups than the host takes: cut");
+            }
+            self.mesh_scissor(list, true);
+            let count = x.min(65_535);
+            let ran = if let Some(launch) = &p.launch
+                && crate::launch::now()
+            {
+                crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(count))
+            } else if self.bind_plain_mesh(list, p) {
+                // SAFETY: an open list with the plain mesh pipeline bound.
+                unsafe { l6.DispatchMesh(count, 1, 1) };
+                true
+            } else {
+                false
+            };
+            if ran {
+                self.drew(list, Some(p));
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            }
+            self.mesh_scissor(list, false);
+            ran
+        })();
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -4646,6 +4735,39 @@ impl State {
             },
             None => None,
         };
+        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+            why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
+            return false;
+        }
+        let offset = args.offset(arguments);
+        if kind == MESH && max == 1 && count.is_none() && stride >= 12
+            && offset.is_multiple_of(4)
+            && let Some(launch) = &p.launch
+            && crate::launch::now()
+        {
+            self.window = None;
+            self.batch = None;
+            args.refresh(list, arguments, len);
+            if !self.prepare_for(list, false, true) {
+                why("prepare failed");
+                return false;
+            }
+            self.mesh_scissor(list, true);
+            let record = crate::launch::Launch::Record(args.gpu(arguments));
+            let ran = crate::launch::record(list, launch.roots, record);
+            if ran {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("indirect mesh at {arguments:#x}"), false));
+                #[cfg(feature = "diagnostics")]
+                list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+                self.drew(list, Some(p));
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            }
+            self.mesh_scissor(list, false);
+            if ran {
+                return true;
+            }
+        }
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -4653,10 +4775,6 @@ impl State {
             why("no host signature");
             return false;
         };
-        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
-            why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
-            return false;
-        }
         // Renderer port 1: arguments (or their count) in the title's memory
         // read in place ([`in_place_order`]): clamped alone, right before
         // their execution, after a wait for every earlier shader write.
@@ -4691,7 +4809,6 @@ impl State {
         // buffer. Anything else ends the window: it uses the scratch buffer
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
-        let offset = args.offset(arguments);
         let windowed = windows()
             && !ordered
             && kind != DISPATCH
@@ -4785,6 +4902,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
         if kind == MESH {
+            if !self.bind_plain_mesh(list, p) {
+                why("plain mesh pipeline unavailable");
+                return false;
+            }
             self.mesh_scissor(list, true);
         }
         // SAFETY: an open list with everything set; the scratch buffer and
