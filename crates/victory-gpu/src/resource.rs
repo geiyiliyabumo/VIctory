@@ -1287,7 +1287,11 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
 fn default_texture_max_side(budget: Option<u64>, used: u64) -> u64 {
     let Some(budget) = budget else { return 1024 };
     if budget <= 9 << 30 {
-        return if used >= budget * 91 / 100 { 256 } else { 512 };
+        return match u128::from(used) * 100 / u128::from(budget) {
+            0..86 => 1024,
+            86..96 => 512,
+            _ => 256,
+        };
     }
     match u128::from(used) * 100 / u128::from(budget) {
         0..92 => 1024,
@@ -2270,7 +2274,7 @@ pub(crate) fn let_go_idle() {
             let eff_used = used.saturating_sub(pool_free)
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            if pool_free >= (256 << 20) && used < budget {
+            if pool_free >= (256 << 20) && used < budget / 100 * 88 {
                 (600_000, u64::MAX)
             } else {
                 crate::host::vram_keep(budget, eff_used)
@@ -2303,7 +2307,9 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
     const RELAXED_BUDGET_US: u64 = 4_000;
     const PRESSURE_SCAN_BUDGET_US: u64 = 2_000;
     const PRESSURE_BUDGET_US: u64 = 5_000;
-    const PRESSURE_WALL_US: u64 = 8_000;
+    const PRESSURE_EVICT_WALL_US: u64 = 6_000;
+    const PRESSURE_EVICT_HARD_US: u64 = 8_000;
+    const PRESSURE_TOTAL_WALL_US: u64 = 12_000;
     const PRESSURE_MIN_BYTES: u64 = 32 << 20;
     const LARGE_BACKING_BYTES: u64 = 128 << 10;
     const SMALL_SCAN_LIMIT: usize = 4_096;
@@ -2375,7 +2381,7 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
             if cached_backing < LARGE_BACKING_BYTES {
                 continue;
             }
-            if derefs & 63 == 0 && scan_over() {
+            if derefs & 15 == 0 && scan_over() {
                 break;
             }
             derefs += 1;
@@ -2419,12 +2425,25 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let host_written = crate::texture::host_written_snapshot();
     let mut pass1_looked = 0usize;
-    // Cap total sweep wall time from `began` so scan + Pass 1 + Pass 2 never
-    // stall the submitting thread beyond `PRESSURE_WALL_US` (8 ms).
+    // Cap eviction loop wall time from `loop_began` (after Pass 1 scan + sort +
+    // snapshot) so paged-out scans never starve eviction down to `evicted=0`,
+    // while bounding total sweep wall time to `PRESSURE_TOTAL_WALL_US` (12 ms).
     let loop_began = std::time::Instant::now();
-    let past_evict_wall = || pressure && began.elapsed().as_micros() as u64 >= PRESSURE_WALL_US;
+    let past_evict_wall = |acc: &SweepAcc| -> bool {
+        if !pressure {
+            return false;
+        }
+        let evict_us = loop_began.elapsed().as_micros() as u64;
+        if evict_us >= PRESSURE_EVICT_HARD_US {
+            return true;
+        }
+        let made_progress = acc.went >= 32 || acc.bytes >= (16 << 20);
+        made_progress
+            && (evict_us >= PRESSURE_EVICT_WALL_US
+                || began.elapsed().as_micros() as u64 >= PRESSURE_TOTAL_WALL_US)
+    };
     let mut try_evict = |acc: &mut SweepAcc, at: usize| -> bool {
-        if past_evict_wall() {
+        if past_evict_wall(acc) {
             acc.stop_reason = "wall";
             return false;
         }
@@ -2523,7 +2542,7 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
         let need_more = (acc.dxgi_bytes < most && acc.bytes < PRESSURE_MIN_BYTES)
             || acc.bytes < texture_most
             || acc.went == 0;
-        if acc.stop_reason == "done" && need_more && !past_evict_wall() {
+        if acc.stop_reason == "done" && need_more && !past_evict_wall(&acc) {
             let small_scan_began = std::time::Instant::now();
             let small_from = PRESSURE_SMALL_FROM.load(Relaxed);
             let mut small_checked = 0usize;
@@ -2534,9 +2553,9 @@ fn sweep_idle(mut idle_ms: u64, mut most: u64, limit: Option<u64>) {
                     continue;
                 }
                 if small_checked >= SMALL_SCAN_LIMIT
-                    || (small_checked & 63 == 0
+                    || (small_checked & 15 == 0
                         && (small_scan_began.elapsed().as_micros() as u64 >= PRESSURE_SCAN_BUDGET_US
-                            || past_evict_wall()))
+                            || past_evict_wall(&acc)))
                 {
                     next_small = at;
                     break;
@@ -3020,6 +3039,17 @@ fn host_texture_as(
         return Some(t);
     }
     let mut texture: Option<ID3D12Resource> = None;
+    // When `VICTORY_SHOW_AFTER=1` defers descriptor publication until the
+    // texture's upload list has executed, WDDM guarantees residency and VA
+    // mapping before that list starts: skip synchronous per-texture
+    // `MakeResident` + Copy-Queue `mapped()` stalls on pure sampled textures.
+    let sampled_only = (d.flags & 7) == 0;
+    let defer_resident = !reserved
+        && sampled_only
+        && crate::texture::PICKING.get().is_some()
+        && !crate::texture::BAKING.get()
+        && crate::descriptor::host::show_after()
+        && crate::host::defer_resident();
     let made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
@@ -3036,12 +3066,17 @@ fn host_texture_as(
             )
         }
     } else {
+        let heap_flags = if defer_resident {
+            D3D12_HEAP_FLAG_NONE
+        } else {
+            crate::host::not_resident()
+        };
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
         unsafe {
             host.device.CreateCommittedResource(
                 &heap,
-                crate::host::not_resident(),
+                heap_flags,
                 (&raw const d).cast(),
                 D3D12_RESOURCE_STATES(
                     crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
@@ -3057,6 +3092,7 @@ fn host_texture_as(
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if !reserved
+        && !defer_resident
         && made.is_ok()
         && let Some(t) = &texture
         && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
@@ -3840,11 +3876,12 @@ mod tests {
     fn texture_max_side_scales_down_for_8gb_cards() {
         const GIB: u64 = 1 << 30;
         let small = 8 * GIB;
-        let threshold = small * 91 / 100;
-        assert_eq!(default_texture_max_side(Some(small), 0), 512);
-        assert_eq!(default_texture_max_side(Some(small), threshold - 1), 512);
-        assert_eq!(default_texture_max_side(Some(small), threshold), 256);
-        assert_eq!(default_texture_max_side(Some(9 * GIB), 0), 512);
+        assert_eq!(default_texture_max_side(Some(small), 0), 1024);
+        assert_eq!(default_texture_max_side(Some(small), small * 85 / 100), 1024);
+        assert_eq!(default_texture_max_side(Some(small), (small * 86).div_ceil(100)), 512);
+        assert_eq!(default_texture_max_side(Some(small), small * 95 / 100), 512);
+        assert_eq!(default_texture_max_side(Some(small), (small * 96).div_ceil(100)), 256);
+        assert_eq!(default_texture_max_side(Some(9 * GIB), 0), 1024);
         assert_eq!(default_texture_max_side(Some(9 * GIB + 1), 0), 1024);
         let large = 16 * GIB;
         assert_eq!(default_texture_max_side(Some(large), large * 91 / 100), 1024);

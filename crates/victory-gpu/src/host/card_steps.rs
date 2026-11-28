@@ -1119,7 +1119,7 @@ impl Host {
             own.list.reset();
             return Some(own);
         }
-        let between = self.uav_buffer(BETWEEN)?;
+        let between = self.uav_buffer_deferred(BETWEEN)?;
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list().ok()?;
         let back = if late::on() { self.read_back_buffer(BETWEEN) } else { None };

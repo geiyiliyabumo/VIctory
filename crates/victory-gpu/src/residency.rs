@@ -148,6 +148,8 @@ pub(crate) fn refresh() -> bool {
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
+            crate::host::trim_send_spares();
+            crate::shadow::trim_shadow_pools();
             tracing::warn!(
                 pid = std::process::id(),
                 frame = crate::frame::current(),

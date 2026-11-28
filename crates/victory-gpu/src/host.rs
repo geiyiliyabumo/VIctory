@@ -168,17 +168,20 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 10_000;
-    const SHORT_MS: u64 = 8_000;
+    const FIRM_MS: u64 = 6_000;
+    const URGENT_MS: u64 = 4_000;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
     if used < share(85) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(93) {
-        (IDLE_MS, used - share(80))
+    } else if used < share(92) {
+        (IDLE_MS, used - share(81))
+    } else if used < share(96) {
+        (FIRM_MS, used - share(84))
     } else {
-        (SHORT_MS, used - share(84))
+        (URGENT_MS, used - share(85))
     }
 }
 
@@ -239,6 +242,16 @@ fn wait_resident() -> bool {
 /// The flag memory is made with that [`resident`] waits for.
 pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
+}
+
+/// Whether resources that are only referenced by command lists submitted *after*
+/// their creation (internal scratch/bounce/readback buffers, and sampled
+/// textures whose descriptor publication is deferred until after their upload
+/// list executes) skip synchronous `MakeResident` + Copy-Queue `mapped()` waits
+/// (`VICTORY_DEFER_RESIDENT=0` restores synchronous waits everywhere).
+pub(crate) fn defer_resident() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DEFER_RESIDENT").is_none_or(|v| v != "0"))
 }
 
 /// A queue of its own that new memory is waited for with ([`mapped`]).
@@ -1458,7 +1471,7 @@ fn take_batch_buffer(size: u64) -> Option<ID3D12Resource> {
     if let Some(BatchBuf(buf)) = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).pop() {
         return Some(buf);
     }
-    let made = host()?.uav_buffer(size)?;
+    let made = host()?.uav_buffer_deferred(size)?;
     name(&made, || format!("indirect batches {size:#x}"));
     Some(made)
 }
@@ -4145,6 +4158,7 @@ fn late_line(frames: f64) {
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
     crate::picked::log(frames);
+    crate::shadow::log_shadow_pool_if_due();
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
@@ -4183,7 +4197,7 @@ mod place;
 pub(crate) mod rec;
 mod send;
 mod upq;
-pub(crate) use send::{goes_as_words, words_under};
+pub(crate) use send::{goes_as_words, trim as trim_send_spares, words_under};
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod spans;
 mod torn;
@@ -4533,6 +4547,7 @@ impl Host {
         trim_spare_chunks();
         send::trim();
         card_steps::trim();
+        crate::shadow::drop_shadow_pools();
         crate::list::trim_idle(16);
         crate::list::thin::trim_backs(8);
         let _ = crate::shadow::let_go_unheld_emergency();
@@ -4734,7 +4749,7 @@ impl Host {
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        let (differs, data) = self.shared_upload_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -4811,7 +4826,7 @@ impl Host {
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
             if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+                let before = self.uav_buffer_deferred(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
                 Some(before)
             }) {
@@ -5271,7 +5286,7 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            f.buffer = self.shared_upload_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
@@ -5588,7 +5603,7 @@ impl Host {
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                work.fetched = self.shared_upload_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -7735,7 +7750,7 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.shared_upload_buffer(256)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -7779,7 +7794,7 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
+        let buffer = host()?.uav_buffer_deferred(256)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
     }
@@ -7860,7 +7875,7 @@ impl HostList {
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
+        let buffer = host()?.uav_buffer_deferred(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
@@ -10765,6 +10780,18 @@ impl Host {
         }
     }
 
+    /// A write-back L0 UAV buffer only referenced by command lists submitted
+    /// *after* creation (readbacks, compare results, list indirect budgets).
+    /// Skips synchronous `MakeResident` + Copy-Queue `mapped()` waits when
+    /// [`defer_resident`] is on.
+    pub(crate) fn shared_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if defer_resident() {
+            self.transient_shared_buffer(size)
+        } else {
+            self.shared_buffer(size)
+        }
+    }
+
     /// A mapped L0 `WRITE_BACK` buffer (`COMMON` state, `ALLOW_UNORDERED_ACCESS`)
     /// used strictly for transient list-local copies (`HostList::upload` and
     /// `pool::shared_staging`, never placed into persistent bindless descriptor
@@ -10923,6 +10950,18 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_inner(size, false)
+    }
+
+    /// A device-local UAV buffer only referenced by command lists submitted
+    /// *after* creation (indirect clamp/batch scratch, card-compare hash
+    /// buffers, bounce/alias scratch). Skips synchronous `MakeResident` +
+    /// Copy-Queue `mapped()` waits when [`defer_resident`] is on.
+    pub(crate) fn uav_buffer_deferred(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_inner(size, defer_resident())
+    }
+
+    fn uav_buffer_inner(&self, size: u64, defer: bool) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10944,11 +10983,12 @@ impl Host {
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
+        let heap_flags = if defer { D3D12_HEAP_FLAG_NONE } else { not_resident() };
         // SAFETY: plain creation of a device-local buffer.
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                heap_flags,
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -10959,7 +10999,12 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = if defer {
+            made
+        } else {
+            made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b)))
+                .and_then(|()| mapped(&self.device))
+        };
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -12085,9 +12130,10 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let gib = 1 << 30;
         assert_eq!(vram_keep(100 * gib, 84 * gib).0, 600_000);
         // Past it: the longest idle ones, enough to come down.
-        assert_eq!(vram_keep(100 * gib, 88 * gib), (10_000, 8 * gib));
-        assert_eq!(vram_keep(100 * gib, 95 * gib), (8_000, 11 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (8_000, 36 * gib));
+        assert_eq!(vram_keep(100 * gib, 88 * gib), (10_000, 7 * gib));
+        assert_eq!(vram_keep(100 * gib, 94 * gib), (6_000, 10 * gib));
+        assert_eq!(vram_keep(100 * gib, 97 * gib), (4_000, 12 * gib));
+        assert_eq!(vram_keep(100 * gib, 120 * gib), (4_000, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 10_000);
     }
 

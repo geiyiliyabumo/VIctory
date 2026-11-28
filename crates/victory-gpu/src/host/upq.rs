@@ -175,7 +175,7 @@ pub(super) unsafe fn send(
     if slot.bounce.as_ref().is_none_or(|b| b.1 < total) {
         let size = total.next_power_of_two().max(LEAST);
         slot.bounce = None;
-        let Some(made) = host.uav_buffer(size) else {
+        let Some(made) = host.uav_buffer_deferred(size) else {
             q.free.push(slot);
             STATS[3].fetch_add(1, Relaxed);
             return None;

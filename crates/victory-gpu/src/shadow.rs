@@ -103,6 +103,11 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// Exact allocated backing D3D12 buffer width in bytes (`0` for placed /
+    /// unbacked / non-recycled shadows) so [`Drop`] can recycle sole-owned
+    /// resident buffers back into [`SPARE_SHARED`]/[`SPARE_MAPPED_CARD`]/[`SPARE_UAV`]
+    /// without another `CreateCommittedResource` + `MakeResident` + `mapped()` round-trip.
+    alloc_size: u64,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -135,6 +140,10 @@ struct Card {
     owner: Option<Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// True when the owning `Shadow::buffer` is a device-local `uav_buffer`
+    /// (safe to recycle into [`SPARE_UAV`]), false when it fell back to a
+    /// `shared_buffer` (`card_all` / `windows_own`).
+    on_card: bool,
 }
 
 impl Card {
@@ -146,6 +155,7 @@ impl Card {
             sent: Mutex::default(),
             owner: None,
             size,
+            on_card: false,
         }
     }
 
@@ -492,11 +502,14 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// A buffer of `size` bytes in the card's memory for a title buffer's
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
-/// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = card_room_for(size);
-    if there.is_some() || !card_all() || size >= 1 << 30 {
-        return there;
+/// host has what it takes (`Host::card_ready`). Returns `(buffer, on_card)`
+/// where `on_card` is true for a device-local `uav_buffer`.
+fn card_for(size: u64) -> Option<(ID3D12Resource, bool)> {
+    if let Some(there) = card_room_for(size) {
+        return Some((there, true));
+    }
+    if !card_all() || size >= 1 << 30 {
+        return None;
     }
     // Two sides all the same, the card's in the PC's memory.
     let host = host()?;
@@ -505,7 +518,211 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let (buffer, _) = host.shared_buffer(size)?;
     CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
+    Some((buffer, false))
+}
+
+/// Whether retired/sole-owned shadow backing D3D12 buffers (`shared_buffer`,
+/// BAR `mapped_card_buffer`, and card `uav_buffer`) are recycled by exact size
+/// instead of destroyed and re-allocated through `CreateCommittedResource` +
+/// `MakeResident` + CopyQueue `mapped()` (`VICTORY_SHADOW_POOL=0` disables).
+fn shadow_pool_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADOW_POOL").is_none_or(|v| v != "0"))
+}
+
+struct SpareMapped {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+}
+// SAFETY: D3D12 resources are free-threaded; mappings are exclusively owned
+// while parked in the spare pool (refcount == 1, no GPU commands in flight).
+unsafe impl Send for SpareMapped {}
+
+struct SparePool<T> {
+    buckets: BTreeMap<u64, Vec<T>>,
+    bytes: u64,
+}
+
+impl<T> SparePool<T> {
+    const fn new() -> Self {
+        Self {
+            buckets: BTreeMap::new(),
+            bytes: 0,
+        }
+    }
+
+    fn take(&mut self, size: u64) -> Option<T> {
+        let bucket = self.buckets.get_mut(&size)?;
+        let item = bucket.pop()?;
+        self.bytes = self.bytes.saturating_sub(size);
+        if bucket.is_empty() {
+            self.buckets.remove(&size);
+        }
+        Some(item)
+    }
+
+    fn give(&mut self, size: u64, item: T, limit: u64) -> Vec<T> {
+        if size == 0 || size > limit {
+            return vec![item];
+        }
+        self.buckets.entry(size).or_default().push(item);
+        self.bytes = self.bytes.saturating_add(size);
+        self.trim_to(limit)
+    }
+
+    fn trim_to(&mut self, limit: u64) -> Vec<T> {
+        let mut dropped = Vec::new();
+        while self.bytes > limit {
+            let Some((&largest, _)) = self.buckets.iter().next_back() else {
+                self.bytes = 0;
+                break;
+            };
+            if let Some(bucket) = self.buckets.get_mut(&largest) {
+                if let Some(item) = bucket.pop() {
+                    self.bytes = self.bytes.saturating_sub(largest);
+                    dropped.push(item);
+                }
+                if bucket.is_empty() {
+                    self.buckets.remove(&largest);
+                }
+            }
+        }
+        dropped
+    }
+}
+
+static SPARE_SHARED: Mutex<SparePool<SpareMapped>> = Mutex::new(SparePool::new());
+static SPARE_MAPPED_CARD: Mutex<SparePool<SpareMapped>> = Mutex::new(SparePool::new());
+static SPARE_UAV: Mutex<SparePool<ID3D12Resource>> = Mutex::new(SparePool::new());
+/// `[shared_hit, shared_miss, mapped_hit, mapped_miss, uav_hit, uav_miss]`
+static POOL_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+fn shared_pool_limit() -> u64 {
+    if !shadow_pool_on() {
+        0
+    } else if crate::residency::pressured() {
+        16 << 20
+    } else if crate::residency::limited_host_ram() {
+        48 << 20
+    } else {
+        96 << 20
+    }
+}
+
+fn vram_pool_limit(default_bytes: u64) -> u64 {
+    if !shadow_pool_on() {
+        return 0;
+    }
+    let tight = host()
+        .and_then(|h| h.video_memory())
+        .is_some_and(|[budget, used, ..]| used.saturating_mul(100) >= budget.saturating_mul(86));
+    if tight { 0 } else { default_bytes }
+}
+
+fn take_shared_buffer(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if shadow_pool_on()
+        && let Some(spare) = SPARE_SHARED.lock().unwrap_or_else(|e| e.into_inner()).take(size)
+    {
+        // SAFETY: sole owner of a mapped write-back buffer of `size` bytes.
+        unsafe { std::ptr::write_bytes(spare.data, 0, size as usize) };
+        POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+        return Some((spare.buffer, spare.data));
+    }
+    POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+    host.shared_buffer(size)
+}
+
+fn give_shared_buffer(size: u64, buffer: ID3D12Resource, data: *mut u8) {
+    let limit = shared_pool_limit();
+    if limit == 0 || data.is_null() {
+        return;
+    }
+    let overflow = SPARE_SHARED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .give(size, SpareMapped { buffer, data }, limit);
+    drop(overflow);
+}
+
+fn take_mapped_card_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if !shadow_pool_on() {
+        return None;
+    }
+    let spare = SPARE_MAPPED_CARD.lock().unwrap_or_else(|e| e.into_inner()).take(size)?;
+    // SAFETY: sole owner of a mapped BAR GPU_UPLOAD buffer of `size` bytes.
+    unsafe { std::ptr::write_bytes(spare.data, 0, size as usize) };
+    POOL_STATS[2].fetch_add(1, Ordering::Relaxed);
+    Some((spare.buffer, spare.data))
+}
+
+fn give_mapped_card_buffer(size: u64, buffer: ID3D12Resource, data: *mut u8) {
+    let limit = vram_pool_limit(96 << 20);
+    if limit == 0 || data.is_null() {
+        return;
+    }
+    let overflow = SPARE_MAPPED_CARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .give(size, SpareMapped { buffer, data }, limit);
+    drop(overflow);
+}
+
+fn take_uav_buffer(size: u64) -> Option<ID3D12Resource> {
+    if !shadow_pool_on() {
+        return None;
+    }
+    let buf = SPARE_UAV.lock().unwrap_or_else(|e| e.into_inner()).take(size)?;
+    POOL_STATS[4].fetch_add(1, Ordering::Relaxed);
+    Some(buf)
+}
+
+fn give_uav_buffer(size: u64, buffer: ID3D12Resource) {
+    let limit = vram_pool_limit(64 << 20);
+    if limit == 0 {
+        return;
+    }
+    let overflow = SPARE_UAV
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .give(size, buffer, limit);
+    drop(overflow);
+}
+
+/// Trims idle recycled shadow buffers down to the active pressure cap.
+pub(crate) fn trim_shadow_pools() {
+    let a = SPARE_SHARED.lock().unwrap_or_else(|e| e.into_inner()).trim_to(shared_pool_limit());
+    let b = SPARE_MAPPED_CARD.lock().unwrap_or_else(|e| e.into_inner()).trim_to(vram_pool_limit(96 << 20));
+    let c = SPARE_UAV.lock().unwrap_or_else(|e| e.into_inner()).trim_to(vram_pool_limit(64 << 20));
+    drop((a, b, c));
+}
+
+/// Drops all recycled shadow buffers immediately during emergency L0 reclaim.
+pub(crate) fn drop_shadow_pools() {
+    let a = SPARE_SHARED.lock().unwrap_or_else(|e| e.into_inner()).trim_to(0);
+    let b = SPARE_MAPPED_CARD.lock().unwrap_or_else(|e| e.into_inner()).trim_to(0);
+    let c = SPARE_UAV.lock().unwrap_or_else(|e| e.into_inner()).trim_to(0);
+    drop((a, b, c));
+}
+
+pub(crate) fn log_shadow_pool_if_due() {
+    if !shadow_pool_on() {
+        return;
+    }
+    static TICK: AtomicU64 = AtomicU64::new(0);
+    if !TICK.fetch_add(1, Ordering::Relaxed).is_multiple_of(3) {
+        return;
+    }
+    let s: [u64; 6] = std::array::from_fn(|i| POOL_STATS[i].load(Ordering::Relaxed));
+    if s[0] + s[2] + s[4] == 0 {
+        return;
+    }
+    let sh_mb = SPARE_SHARED.lock().unwrap_or_else(|e| e.into_inner()).bytes >> 20;
+    let bar_mb = SPARE_MAPPED_CARD.lock().unwrap_or_else(|e| e.into_inner()).bytes >> 20;
+    let uav_mb = SPARE_UAV.lock().unwrap_or_else(|e| e.into_inner()).bytes >> 20;
+    tracing::info!(
+        "shadow buffer pool (VICTORY_SHADOW_POOL=1): shared hit={} miss={} ({sh_mb} MB), mapped_card hit={} miss={} ({bar_mb} MB), uav hit={} miss={} ({uav_mb} MB)",
+        s[0], s[1], s[2], s[3], s[4], s[5]
+    );
 }
 
 /// Whether every title buffer's copy has two sides, however small
@@ -535,6 +752,13 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
+    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    if let Some(reused) = take_uav_buffer(size) {
+        return Some(reused);
+    }
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
     // the world loads, before the textures fill the card; the texture
@@ -547,6 +771,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * hundredths
     {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         // Said, with the numbers it was decided by: run 193 made 31 copies
         // of 95 and no line named the others. The first 64, then every
         // 32nd.
@@ -569,10 +794,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         }
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
-    }
+    POOL_STATS[5].fetch_add(1, Ordering::Relaxed);
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
@@ -609,11 +831,13 @@ fn window_card_most() -> u64 {
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
-/// be there ([`window_card_most`]).
-fn window_card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = window_room_for(size);
-    if there.is_some() || !windows_own() || !cards() {
-        return there;
+/// be there ([`window_card_most`]). Returns `(buffer, on_card)`.
+fn window_card_for(size: u64) -> Option<(ID3D12Resource, bool)> {
+    if let Some(there) = window_room_for(size) {
+        return Some((there, true));
+    }
+    if !windows_own() || !cards() {
+        return None;
     }
     // Two sides all the same, the card's in the PC's memory.
     let host = host()?;
@@ -622,7 +846,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let (buffer, _) = host.shared_buffer(size)?;
     WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
+    Some((buffer, false))
 }
 
 /// The most bytes of windows outside buffers that lie in the card's memory
@@ -653,16 +877,24 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     if most == 0 {
         return None;
     }
-    let host = host()?;
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
-    }
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
+    if let Some(reused) = take_mapped_card_buffer(size) {
+        return Some(reused);
+    }
+    let Some(host) = host() else {
+        WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    };
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 10 * 8
+    {
+        WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    POOL_STATS[3].fetch_add(1, Ordering::Relaxed);
     let made = host.mapped_card_buffer(size, true);
     if made.is_none() {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
@@ -2804,6 +3036,20 @@ impl Drop for Shadow {
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
             }
+            if self.alloc_size > 0 && shadow_pool_on() {
+                if card.on_card && crate::host::references(&self.buffer) == 1 {
+                    give_uav_buffer(self.alloc_size, self.buffer.clone());
+                }
+                if !self.data.is_null() && crate::host::references(&card.staging) == 1 {
+                    give_shared_buffer(self.alloc_size, card.staging.clone(), self.data);
+                }
+            }
+        } else if self.alloc_size > 0 && shadow_pool_on() && crate::host::references(&self.buffer) == 1 {
+            if self.mapped {
+                give_mapped_card_buffer(self.alloc_size, self.buffer.clone(), self.data);
+            } else {
+                give_shared_buffer(self.alloc_size, self.buffer.clone(), self.data);
+            }
         }
     }
 }
@@ -3777,6 +4023,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            alloc_size: 0,
             place: None,
         }
     }
@@ -5866,19 +6113,20 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
+        let (buffer, data) = take_shared_buffer(host()?, size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
         let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
+            Some((on_card, is_uav)) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
-                let card = Card::new(buffer, size);
+                let mut card = Card::new(buffer, size);
+                card.on_card = is_uav;
                 (on_card, Some(card))
             }
             None => (buffer, None),
@@ -5899,6 +6147,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             );
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+        shadow.alloc_size = size;
         shadow.card = card;
         entry.shadow = Some(share(shadow));
     }
@@ -6169,16 +6418,18 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
         shadow.mapped = true;
+        shadow.alloc_size = len;
         Arc::new(shadow)
     } else {
-        let (buffer, data) = host()?.shared_buffer(len)?;
+        let (buffer, data) = take_shared_buffer(host()?, len)?;
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
         // With room for windows on the card (`window_card_most`): shaders get a
         // buffer there, and the one just made is the CPU's side.
         let (buffer, card) = match window_card_for(len) {
-            Some(on_card) => {
+            Some((on_card, is_uav)) => {
                 crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-                let card = Card::new(buffer, len);
+                let mut card = Card::new(buffer, len);
+                card.on_card = is_uav;
                 (on_card, Some(card))
             }
             None => (buffer, None),
@@ -6192,6 +6443,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         );
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
+        shadow.alloc_size = len;
         shadow.card = card;
         share(shadow)
     };
@@ -6572,6 +6824,26 @@ mod window_tests {
             assert!(start % g == 0 && len % g == 0);
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn spare_pool_recycles_exact_size_and_trims_largest_first() {
+    let mut pool: SparePool<&'static str> = SparePool::new();
+    assert!(pool.give(64, "a", 200).is_empty());
+    assert!(pool.give(128, "b", 200).is_empty());
+    assert_eq!(pool.bytes, 192);
+    // Giving another 64 crosses 200 and trims the largest bucket (128) first.
+    let dropped = pool.give(64, "c", 200);
+    assert_eq!(dropped, vec!["b"]);
+    assert_eq!(pool.bytes, 128);
+    assert_eq!(pool.take(128), None);
+    assert_eq!(pool.take(64), Some("c"));
+    assert_eq!(pool.take(64), Some("a"));
+    assert_eq!(pool.bytes, 0);
+    // Oversized item is returned immediately for dropping outside the lock.
+    assert_eq!(pool.give(256, "big", 200), vec!["big"]);
+    assert_eq!(pool.bytes, 0);
 }
 
 #[cfg(test)]

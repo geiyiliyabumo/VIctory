@@ -175,7 +175,7 @@ pub(super) fn give_back(memory: Memory) {
     }
 }
 
-pub(super) fn trim() {
+pub(crate) fn trim() {
     let dropped = std::mem::take(&mut *SPARE.lock().unwrap_or_else(|e| e.into_inner()));
     drop(dropped);
 }
